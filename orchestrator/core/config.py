@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 
 class Config:
     def __init__(self, env_path: str = ".env", yaml_path: str = "orchestrator/config.yaml") -> None:
-        base = Path(__file__).resolve().parents[3]  # корень проекта
+        base = Path(__file__).resolve().parents[2]  # корень проекта
         load_dotenv(base / env_path, override=False)
 
         with open(base / yaml_path, "r") as f:
@@ -33,7 +33,10 @@ class Config:
     @property
     def github_app_id(self) -> int | None:
         v = self._env("GITHUB_APP_ID")
-        return int(v) if v else None
+        try:
+            return int(v) if v else None
+        except (ValueError, TypeError):
+            return None
 
     @property
     def github_private_key_path(self) -> str | None:
@@ -42,7 +45,18 @@ class Config:
     @property
     def github_installation_id(self) -> int | None:
         v = self._env("GITHUB_APP_INSTALLATION_ID")
-        return int(v) if v else None
+        try:
+            return int(v) if v else None
+        except (ValueError, TypeError):
+            return None
+
+    @property
+    def github_configured(self) -> bool:
+        return bool(
+            self.github_app_id
+            and self.github_private_key_path
+            and self.github_installation_id
+        )
 
     @property
     def github_repo(self) -> str:

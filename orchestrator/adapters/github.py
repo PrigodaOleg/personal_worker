@@ -10,7 +10,7 @@ from typing import Optional
 
 import jwt
 from github import Github, GithubException
-from github.Auth import AppAuth, InstallationAuth
+from github.Auth import AppAuth, AppInstallationAuth
 
 from orchestrator.core.task import Task, TaskSource, TaskStatus
 
@@ -44,25 +44,14 @@ class GitHubAdapter:
         if self._auth_token and now < self._token_expires_at - 60:
             return
         private_key = self._load_private_key()
-        # JWT на 10 минут
-        payload = {
-            "iat": int(now) - 60,
-            "exp": int(now) + 600,
-            "iss": self.app_id,
-        }
-        token = jwt.encode(payload, private_key, algorithm="RS256")
         app_auth = AppAuth(app_id=self.app_id, private_key=private_key)
-        installation_auth = app_auth.get_installation_auth(
+        installation_auth: AppInstallationAuth = app_auth.get_installation_auth(
             installation_id=self.installation_id
         )
         self._auth_token = installation_auth.token
         # installation token живёт 1 час
         self._token_expires_at = now + 3600
-        self._gh = Github(auth=InstallationAuth(
-            app_id=self.app_id,
-            private_key=private_key,
-            installation_id=self.installation_id,
-        ))
+        self._gh = Github(auth=installation_auth)
         self._repo = self._gh.get_repo(self.repo_full_name)
 
     def fetch_open_issues(self) -> list[dict]:
