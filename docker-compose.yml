@@ -1,0 +1,28 @@
+services:
+  # OpenHands runtime — агент, который пишет код и запускает команды
+  openhands:
+    image: docker.all-hands.dev/all-hands-ai/openhands:0.35
+    container_name: openhands
+    ports:
+      - "3000:3000"
+    environment:
+      - LLM_API_KEY=${OPENHANDS_LLM_API_KEY}
+      - LLM_MODEL=${OPENHANDS_LLM_MODEL}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - openhands_workspace:/opt/openhands/workspace
+    restart: unless-stopped
+
+  # Вспомогательный контейнер со Flutter SDK (Linux/Web/Android сборки)
+  flutter-builder:
+    image: cirrusci/flutter:stable
+    container_name: flutter-builder
+    volumes:
+      - /mnt/ssd/personal_worker/workspaces:/workspace
+    working_dir: /workspace
+    tty: true
+    stdin_open: true
+    restart: unless-stopped
+
+volumes:
+  openhands_workspace:

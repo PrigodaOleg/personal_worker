@@ -1,0 +1,35 @@
+# Пример конфигурации personal_worker
+# Скопируйте в orchestrator/config.yaml и заполните TODO-значения
+
+scheduler:
+  poll_interval_seconds: 30
+
+github:
+  token: TODO_GITHUB_PAT
+  repo: TODO_OWNER/REPO
+  webhook_secret: TODO_WEBHOOK_SECRET
+
+telegram:
+  bot_token: TODO_BOT_TOKEN
+  admin_chat_id: TODO_CHAT_ID
+  allowed_chat_ids: []
+    # - TODO_ALLOWED_CHAT_ID
+
+openhands:
+  base_url: http://localhost:3000
+  api_key: TODO_OPENHANDS_API_KEY
+  llm_model: TODO_MODEL
+  llm_api_key: TODO_LLM_API_KEY
+
+imac:
+  host: TODO_IMAC_IP_OR_HOSTNAME
+  user: TODO_IMAC_USERNAME
+  ssh_key: ~/.ssh/id_ed25519
+  work_dir: /Users/TODO_IMAC_USERNAME/personal_worker
+
+paths:
+  work_dir: /mnt/ssd/personal_worker/workspaces
+  state_db: /mnt/ssd/personal_worker/state/orchestrator.sqlite
+
+flutter:
+  sdk_path: TODO_FLUTTER_SDK_PATH  # оставьте пустым, если SDK только в Docker
