@@ -39,6 +39,7 @@ Thumbs.db
 
 # Config with secrets
 orchestrator/config.yaml
+config/
 
 # State / logs
 *.db

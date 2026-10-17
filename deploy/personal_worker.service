@@ -1,0 +1,21 @@
+[Unit]
+Description=personal_worker — Flutter task orchestrator
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+User=oleg
+WorkingDirectory=/mnt/ssd/personal_worker
+EnvironmentFile=/mnt/ssd/personal_worker/.env
+ExecStartPre=/usr/bin/docker compose up -d
+ExecStart=/usr/bin/python3 -m orchestrator.main --env .env --config orchestrator/config.yaml
+ExecStopPost=/usr/bin/docker compose down
+Restart=always
+RestartSec=10
+# При перезагрузке ОС — поднимаемся автоматически и продолжаем с того места (SQLite состояние)
+StartLimitBurst=0
+
+[Install]
+WantedBy=multi-user.target

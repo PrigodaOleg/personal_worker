@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+import ast
 from pathlib import Path
 
 from orchestrator.core.task import Task, TaskSource, TaskStatus
@@ -78,6 +79,13 @@ class StateStore:
     def _row_to_task(self, row: tuple) -> Task:
         import datetime as _dt
 
+        log_list = []
+        if row[10]:
+            try:
+                log_list = ast.literal_eval(row[10])
+            except (ValueError, SyntaxError):
+                log_list = []
+
         return Task(
             id=row[0],
             source=TaskSource(row[1]),
@@ -89,7 +97,7 @@ class StateStore:
             clarification_answer=row[7],
             created_at=_dt.datetime.fromisoformat(row[8]),
             pr_url=row[9],
-            log=eval(row[10]) if row[10] else [],
+            log=log_list,
         )
 
     def close(self) -> None:

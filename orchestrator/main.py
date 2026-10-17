@@ -8,9 +8,17 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
 import sys
 
+from orchestrator.core.config import Config
 from orchestrator.core.scheduler import Scheduler
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger("personal_worker")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -18,16 +26,14 @@ def build_parser() -> argparse.ArgumentParser:
         description="personal_worker — orchestrator for Flutter tasks"
     )
     parser.add_argument(
-        "--source",
-        choices=["telegram", "github", "all"],
-        default="all",
-        help="Источник задач (по умолчанию все)",
+        "--config",
+        default="orchestrator/config.yaml",
+        help="Путь к config.yaml",
     )
     parser.add_argument(
-        "--poll-interval",
-        type=int,
-        default=30,
-        help="Интервал опроса в секундах (по умолчанию 30)",
+        "--env",
+        default=".env",
+        help="Путь к .env",
     )
     return parser
 
@@ -36,10 +42,9 @@ async def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
 
-    scheduler = Scheduler(
-        sources=args.source.split(","),
-        poll_interval=args.poll_interval,
-    )
+    config = Config(env_path=args.env, yaml_path=args.config)
+    scheduler = Scheduler(config)
+
     await scheduler.run()
     return 0
 

@@ -1,5 +1,6 @@
 services:
   # OpenHands runtime — агент, который пишет код и запускает команды
+  # LLM через провайдера provod.ai (OpenAI-совместимый API)
   openhands:
     image: docker.all-hands.dev/all-hands-ai/openhands:0.35
     container_name: openhands
@@ -7,22 +8,31 @@ services:
       - "3000:3000"
     environment:
       - LLM_API_KEY=${OPENHANDS_LLM_API_KEY}
+      - LLM_BASE_URL=${OPENHANDS_LLM_BASE_URL}
       - LLM_MODEL=${OPENHANDS_LLM_MODEL}
+      - LLM_API_VERSION=v1
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - openhands_workspace:/opt/openhands/workspace
-    restart: unless-stopped
+      - ${WORK_DIR}:/opt/openhands/workspace
+      - openhands_state:/home/openhands/.local/share/openhands
+    restart: always
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
   # Вспомогательный контейнер со Flutter SDK (Linux/Web/Android сборки)
   flutter-builder:
-    image: cirrusci/flutter:stable
+    image: ${FLUTTER_IMAGE}
     container_name: flutter-builder
     volumes:
-      - /mnt/ssd/personal_worker/workspaces:/workspace
+      - ${WORK_DIR}:/workspace
     working_dir: /workspace
     tty: true
     stdin_open: true
-    restart: unless-stopped
+    restart: always
+    command: ["sleep", "infinity"]
 
 volumes:
-  openhands_workspace:
+  openhands_state:
