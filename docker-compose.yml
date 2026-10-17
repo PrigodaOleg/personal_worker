@@ -1,9 +1,11 @@
 services:
-  # OpenHands runtime — агент, который пишет код и запускает команды
-  # LLM через провайдера provod.ai (OpenAI-совместимый API)
+  # OpenHands + Flutter SDK в одном контейнере.
+  # Агент сам выполняет flutter test / flutter build внутри контейнера.
   openhands:
-    image: docker.all-hands.dev/all-hands-ai/openhands:0.35
-    container_name: openhands
+    build:
+      context: .
+      dockerfile: docker/openhands-flutter/Dockerfile
+    container_name: openhands-flutter
     ports:
       - "3000:3000"
     environment:
@@ -21,18 +23,6 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
-
-  # Вспомогательный контейнер со Flutter SDK (Linux/Web/Android сборки)
-  flutter-builder:
-    image: ${FLUTTER_IMAGE}
-    container_name: flutter-builder
-    volumes:
-      - ${WORK_DIR}:/workspace
-    working_dir: /workspace
-    tty: true
-    stdin_open: true
-    restart: always
-    command: ["sleep", "infinity"]
 
 volumes:
   openhands_state:

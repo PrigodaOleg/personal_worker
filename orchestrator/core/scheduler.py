@@ -1,10 +1,14 @@
-"""Планировщик задач: приём, уточнения, OpenHands, сборки, PR, уведомления.
+"""Планировщик задач: приём, уточнения, OpenHands (сборки внутри контейнера),
+iOS на iMac, PR и уведомления.
 
 Жизненный цикл задачи:
   NEW -> CLARIFYING (если не хватает информации) -> READY -> RUNNING (OpenHands)
     -> (OpenHands может вернуть вопрос -> CLARIFYING) -> DONE/FAILED
-  После RUNNING: сборки/тесты Linux/Web/Android (локально), iOS (iMac по SSH)
-  Успех -> PR в GitHub -> уведомление автору
+  После успешного OpenHands: iOS на iMac (по SSH) -> PR в GitHub -> уведомление автору.
+
+Сборки Linux / Web / Android запускаются не на хосте, а внутри контейнера
+OpenHands (там же установлен Flutter SDK). Агент сам выполняет
+flutter test / flutter build linux / flutter build web / flutter build apk.
 """
 
 from __future__ import annotations
@@ -13,7 +17,6 @@ import asyncio
 import hashlib
 import logging
 import os
-import shutil
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -24,10 +27,7 @@ from orchestrator.adapters.telegram import TelegramAdapter
 from orchestrator.core.config import Config
 from orchestrator.core.state import StateStore
 from orchestrator.core.task import Task, TaskSource, TaskStatus
-from orchestrator.runners.android import AndroidRunner
 from orchestrator.runners.ios import IOSRunner
-from orchestrator.runners.linux import LinuxRunner
-from orchestrator.runners.web import WebRunner
 
 logger = logging.getLogger("personal_worker")
 
@@ -63,25 +63,9 @@ class Scheduler:
             ssh_key=config.imac_ssh_key,
             work_dir=config.imac_work_dir,
         )
-        self.linux_runner = LinuxRunner(
-            container_name="flutter-builder",
-            project_subpath=config.flutter_project_subpath,
-            work_dir=config.work_dir,
-        )
-        self.web_runner = WebRunner(
-            container_name="flutter-builder",
-            project_subpath=config.flutter_project_subpath,
-            work_dir=config.work_dir,
-        )
-        self.android_runner = AndroidRunner(
-            container_name="flutter-builder",
-            project_subpath=config.flutter_project_subpath,
-            work_dir=config.work_dir,
-        )
         self.ios_runner = IOSRunner(imac=self.imac)
 
         self._pending_clarifications: dict[str, dict] = {}
-        self._telegram_answer_futures: dict[str, asyncio.Future] = {}
 
     # ------------------------------------------------------------------ #
     # Вспомогательные
@@ -101,7 +85,6 @@ class Scheduler:
     def _notify_author(self, task: Task, text: str) -> None:
         """Отправить уведомление автору задачи в исходном канале."""
         if task.source == TaskSource.GITHUB:
-            # task.source_id — номер issue
             try:
                 num = int(task.source_id)
                 self.github.create_comment(num, text)
@@ -109,7 +92,6 @@ class Scheduler:
             except Exception as exc:
                 logger.error("[notify] github comment failed: %s", exc)
         elif task.source == TaskSource.TELEGRAM:
-            # source_id — chat_id пользователя
             try:
                 chat_id = int(task.source_id)
                 asyncio.create_task(self.telegram.send_message(chat_id, text))
@@ -201,7 +183,6 @@ class Scheduler:
     async def _process_task(self, task: Task) -> None:
         logger.info("[task] %s status=%s", task.id, task.status.value)
 
-        # 1. Проверка достаточности информации
         if task.status == TaskStatus.NEW:
             if not self._has_enough_info(task):
                 question = (
@@ -218,18 +199,14 @@ class Scheduler:
             task.status = TaskStatus.READY
             self.state.save(task)
 
-        # 2. Если есть неотвеченное уточнение — ждём
         if task.status == TaskStatus.CLARIFYING:
             await self._wait_for_clarification(task)
             return
 
-        # 3. Готово к выполнению — OpenHands
         if task.status == TaskStatus.READY:
             await self._run_openhands(task)
-            return
 
     def _has_enough_info(self, task: Task) -> bool:
-        """Проверка, достаточно ли информации для запуска OpenHands."""
         desc = (task.description or "").strip()
         title = (task.title or "").strip()
         if not title or not desc:
@@ -246,13 +223,12 @@ class Scheduler:
         if task.source == TaskSource.TELEGRAM:
             chat_id = int(task.source_id)
             fut = asyncio.get_event_loop().create_future()
-            self._telegram_answer_futures[str(chat_id)] = fut
-            await self.telegram.send_message(chat_id, f"❓ {question}")
             self._pending_clarifications[task.id] = {
                 "task": task,
                 "future": fut,
                 "asked_at": datetime.utcnow(),
             }
+            await self.telegram.send_message(chat_id, f"❓ {question}")
         elif task.source == TaskSource.GITHUB:
             try:
                 num = int(task.source_id)
@@ -289,7 +265,6 @@ class Scheduler:
             self._pending_clarifications.pop(task.id, None)
             return
 
-        # Проверяем, не пришёл ли ответ
         if task.clarification_answer:
             answer = task.clarification_answer
             task.description += f"\n\nУточнение пользователя: {answer}"
@@ -299,9 +274,7 @@ class Scheduler:
             await self._run_openhands(task)
             return
 
-        # Для Telegram ждём future
         if info["future"] and not info["future"].done():
-            # Не блокируем вечно — проверяем через poll_interval
             try:
                 answer = await asyncio.wait_for(
                     info["future"], timeout=self.config.clarification_poll_seconds
@@ -313,12 +286,9 @@ class Scheduler:
                 self._pending_clarifications.pop(task.id, None)
                 await self._run_openhands(task)
             except asyncio.TimeoutError:
-                pass  # продолжим ожидание на следующем тике
-        # Для GitHub — ответ придёт как комментарий, будем отслеживать отдельно
-        # (пока упрощённо: ждём следующего тика polling)
+                pass
 
     def resolve_telegram_answer(self, chat_id: str, answer: str) -> None:
-        """Вызывается извне, когда Telegram Adapter получает ответ."""
         for tid, info in self._pending_clarifications.items():
             task = info["task"]
             if task.source == TaskSource.TELEGRAM and task.source_id == chat_id:
@@ -330,17 +300,17 @@ class Scheduler:
                 break
 
     # ------------------------------------------------------------------ #
-    # OpenHands
+    # OpenHands — сборки внутри контейнера
     # ------------------------------------------------------------------ #
     async def _run_openhands(self, task: Task) -> None:
         task.status = TaskStatus.RUNNING
         self.state.save(task)
 
         ws = self._ensure_workspace(task)
+        client_dir = os.path.join(ws, "social_mind")
         repo_url = f"https://github.com/{self.config.github_repo}.git"
 
-        # Клонируем репозиторий в рабочую директорию
-        client_dir = os.path.join(ws, "social_mind")
+        # Клонируем репозиторий в рабочую директорию (видимую из контейнера OpenHands)
         if not os.path.exists(os.path.join(client_dir, ".git")):
             proc = await asyncio.create_subprocess_exec(
                 "git", "clone", "--depth", "1", repo_url, client_dir,
@@ -349,7 +319,21 @@ class Scheduler:
             )
             await proc.communicate()
 
-        instruction = task.description
+        # Инструкция для агента: внести изменения + запустить тесты и сборки внутри контейнера
+        instruction = (
+            f"{task.description}\n\n"
+            "ТРЕБОВАНИЯ:\n"
+            "1. Работа в папке /opt/openhands/workspace/social_mind/domains/client\n"
+            "2. После внесения изменений запусти:\n"
+            "   - flutter test\n"
+            "   - flutter build linux\n"
+            "   - flutter build web --release\n"
+            "   - flutter build apk --release --split-per-abi\n"
+            "3. Если какие-либо команды завершаются с ошибкой — исправь код и запусти снова.\n"
+            "4. Сообщи, когда все проверки пройдены успешно.\n"
+            "Не создавай PR — это сделает оркестратор отдельно."
+        )
+
         result = await self.openhands.start_task(
             instruction=instruction,
             work_dir=client_dir,
@@ -368,7 +352,7 @@ class Scheduler:
         await self._monitor_openhands(task, session_id, client_dir)
 
     async def _monitor_openhands(self, task: Task, session_id: str, client_dir: str) -> None:
-        """Мониторит сессию OpenHands, обрабатывает уточнения и завершение."""
+        """Мониторит сессию OpenHands: уточнения, завершение, ошибки."""
         while True:
             status = await self.openhands.get_status(session_id)
             state_val = status.get("status", "unknown")
@@ -384,59 +368,43 @@ class Scheduler:
             if state_val in ("completed", "done", "success"):
                 task.status = TaskStatus.DONE
                 self.state.save(task)
-                await self._build_and_test(task, client_dir)
+                task.add_log("OpenHands completed successfully")
+                await self._build_ios_and_create_pr(task, client_dir)
                 return
 
             if state_val in ("failed", "error"):
                 task.status = TaskStatus.FAILED
                 self.state.save(task)
-                self._notify_author(task, f"❌ OpenHands завершился с ошибкой: {status.get('error', '')}")
+                self._notify_author(
+                    task,
+                    f"❌ OpenHands завершился с ошибкой: {status.get('error', '')}",
+                )
                 return
 
             await asyncio.sleep(self.config.clarification_poll_seconds)
 
     # ------------------------------------------------------------------ #
-    # Сборки и тесты
+    # iOS (на iMac) + PR
     # ------------------------------------------------------------------ #
-    async def _build_and_test(self, task: Task, client_dir: str) -> None:
-        results = {}
-
-        # Linux
-        res = await self.linux_runner.build_and_test(client_dir)
-        results["linux"] = res
-
-        # Web
-        res = await self.web_runner.build_and_test(client_dir)
-        results["web"] = res
-
-        # Android
-        res = await self.android_runner.build_and_test(client_dir)
-        results["android"] = res
-
-        # iOS (на iMac, если настроен)
+    async def _build_ios_and_create_pr(self, task: Task, client_dir: str) -> None:
+        # iOS на iMac, если настроен
         if self.config.imac_host and self.config.imac_user:
-            res = await self.ios_runner.build_and_test(client_dir)
-            results["ios"] = res
+            task.add_log("Starting iOS build+test on iMac")
+            ios_res = await self.ios_runner.build_and_test(client_dir)
+            task.add_log(f"iOS result: {ios_res.get('status')}")
+            if ios_res.get("status") not in ("ok", "skipped"):
+                task.status = TaskStatus.FAILED
+                self.state.save(task)
+                self._notify_author(
+                    task,
+                    f"❌ iOS сборка/тесты не прошли: {ios_res.get('error', '')}",
+                )
+                return
         else:
-            results["ios"] = {"status": "skipped", "reason": "iMac not configured"}
             task.add_log("iOS skipped: iMac not configured")
 
-        all_ok = all(r.get("status") == "ok" or r.get("status") == "skipped" for r in results.values())
-
-        if all_ok:
-            await self._create_pr(task, client_dir)
-        else:
-            task.status = TaskStatus.FAILED
-            self.state.save(task)
-            failed = [k for k, v in results.items() if v.get("status") not in ("ok", "skipped")]
-            self._notify_author(
-                task,
-                f"❌ Сборки/тесты не прошли: {', '.join(failed)}",
-            )
-
-    async def _create_pr(self, task: Task, client_dir: str) -> None:
+        # Создаём ветку, коммит, пуш, PR
         branch = f"ai-task-{task.id}"
-        # Создаём ветку и коммитим изменения
         await asyncio.create_subprocess_exec(
             "git", "-C", client_dir, "checkout", "-b", branch,
         )
@@ -456,7 +424,7 @@ class Scheduler:
             title=f"[AI] {task.title}",
             body=f"Автосоздано personal_worker для задачи:\n\n{task.description}\n\n"
                  f"Источник: {task.source.value}\n"
-                 f"Статус: все сборки и тесты пройдены.",
+                 f"Все сборки и тесты пройдены (Linux/Web/Android внутри OpenHands, iOS на iMac).",
         )
         task.pr_url = pr_url
         task.status = TaskStatus.DONE
@@ -473,7 +441,6 @@ class Scheduler:
         logger.info("[scheduler] starting (poll_interval=%ds)", self.config.poll_interval_seconds)
         await self.telegram.start_polling()
 
-        # Восстанавливаем недоделанные уточнения из БД
         for task in self.state.list_by_status(TaskStatus.CLARIFYING):
             self._pending_clarifications[task.id] = {
                 "task": task,
