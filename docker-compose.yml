@@ -13,6 +13,7 @@ services:
       - LLM_BASE_URL=${OPENHANDS_LLM_BASE_URL}
       - LLM_MODEL=${OPENHANDS_LLM_MODEL}
       - LLM_API_VERSION=v1
+      - OPENHANDS_API_KEY=${OPENHANDS_API_KEY}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ${WORK_DIR}:/opt/openhands/workspace
