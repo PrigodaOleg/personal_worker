@@ -71,7 +71,7 @@ class TelegramAdapter:
             .build()
         )
         self._app.add_handler(
-            MessageHandler(filters.TEXT & ~filters.COMMAND, self._handler)
+            MessageHandler(filters.TEXT, self._handler)
         )
         await self._app.initialize()
         await self._app.start()
