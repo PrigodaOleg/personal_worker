@@ -15,6 +15,8 @@ services:
       - OPENHANDS_API_KEY=${OPENHANDS_API_KEY}
       - SANDBOX_URL=http://192.168.88.15:3000
       - APP_URL=http://192.168.88.15:3000
+      - SANDBOX_HOST=localhost
+      - USE_HOST_NETWORK=true
     dns:
       - 8.8.8.8
       - 1.1.1.1
