@@ -9,6 +9,11 @@ iOS на iMac, PR и уведомления.
 Сборки Linux / Web / Android запускаются не на хосте, а внутри контейнера
 OpenHands (там же установлен Flutter SDK). Агент сам выполняет
 flutter test / flutter build linux / flutter build web / flutter build apk.
+
+Архитектура выполнения:
+- _on_telegram_message / poll_github только сохраняют задачу и возвращаются
+- Основной цикл run() обрабатывает задачи из состояния
+- Мониторинг OpenHands происходит в фоне (не блокирует Telegram)
 """
 
 from __future__ import annotations
@@ -70,6 +75,7 @@ class Scheduler:
 
         self._pending_clarifications: dict[str, dict] = {}
         self._llm_configured: bool = False
+        self._running_tasks: set[str] = set()  # задачи, которые выполняются в фоне
 
     # ------------------------------------------------------------------ #
     # Вспомогательные
@@ -159,7 +165,7 @@ class Scheduler:
             )
             task.add_log(f"issue #{number} by {author}: {title}")
             self.state.save(task)
-            await self._process_task(task)
+            asyncio.create_task(self._process_task(task))
 
     # ------------------------------------------------------------------ #
     # Приём задач из Telegram
@@ -170,7 +176,7 @@ class Scheduler:
             return
         chat_id = str(msg["chat_id"])
 
-        # Команды бота
+        # Команды бота — обрабатываем синхронно, не блокируем
         if text.startswith("/"):
             await self._handle_telegram_command(chat_id, text)
             return
@@ -200,6 +206,8 @@ class Scheduler:
                 )
             except Exception as exc:
                 logger.error("[telegram] failed to send clarification confirmation: %s", exc)
+            # Запускаем обработку задачи в фоне
+            asyncio.create_task(self._process_task(task))
             return
 
         # 2. Проверяем, есть ли уже активная задача у этого пользователя
@@ -247,7 +255,8 @@ class Scheduler:
                 f"✅ Задача получена: «{task.title[:50]}…\"\n"
                 f"Обработка начата. Я сообщу, когда будет результат или возникнут вопросы.",
             )
-        await self._process_task(task)
+        # Запускаем обработку задачи в фоне — не блокируем Telegram
+        asyncio.create_task(self._process_task(task))
 
     async def _handle_telegram_command(self, chat_id: str, text: str) -> None:
         """Обработка команд бота: /status, /cancel, /help."""
@@ -325,7 +334,7 @@ class Scheduler:
         )
 
     # ------------------------------------------------------------------ #
-    # Основная обработка задачи
+    # Основная обработка задачи (вызывается в фоне через create_task)
     # ------------------------------------------------------------------ #
     async def _process_task(self, task: Task) -> None:
         logger.info("[task] %s status=%s", task.id, task.status.value)
@@ -513,7 +522,7 @@ class Scheduler:
                 self._llm_configured = True
                 logger.info("[openhands] LLM configured successfully")
 
-        # Настраиваем GitHub provider tokens в OpenHands (требуется для доступа к репозиторию)
+        # Настраиваем GitHub provider tokens в OpenHands
         provider_result = await self.openhands.configure_github_provider()
         if provider_result.get("status") == "error":
             logger.warning("[openhands] GitHub provider config warning: %s", provider_result.get("error"))
@@ -558,14 +567,9 @@ class Scheduler:
         start_result = await self.openhands.start_conversation(conversation_id)
         if start_result.get("status") == "error":
             error_msg = start_result.get('error', 'неизвестная ошибка')
-            logger.error("[openhands] start_conversation failed: %s", error_msg)
-            task.status = TaskStatus.FAILED
+            logger.warning("[openhands] start_conversation returned error: %s, but will try to monitor anyway", error_msg)
+            task.add_log(f"OpenHands start_conversation warning: {error_msg}")
             self.state.save(task)
-            self._notify_author(
-                task,
-                f"❌ OpenHands не запустил агента.\n\nОшибка: {error_msg}",
-            )
-            return
 
         await self._monitor_openhands(task, conversation_id, client_dir)
 
@@ -686,6 +690,7 @@ class Scheduler:
         # Запуск Telegram polling с retry при сетевых сбоях
         await self._start_telegram_with_retry()
 
+        # Восстанавливаем ожидающие уточнения из БД
         for task in self.state.list_by_status(TaskStatus.CLARIFYING):
             self._pending_clarifications[task.id] = {
                 "task": task,
@@ -708,20 +713,21 @@ class Scheduler:
 
             await asyncio.sleep(self.config.poll_interval_seconds)
 
-    async def _start_telegram_with_retry(self, max_retries: int = 10) -> None:
-        """Запуск Telegram polling с повторными попытками при таймауте."""
+    async def _start_telegram_with_retry(self) -> None:
+        """Запуск Telegram polling с бесконечными повторными попытками при таймауте."""
         import asyncio as _asyncio
 
-        for attempt in range(1, max_retries + 1):
+        attempt = 0
+        while True:
+            attempt += 1
             try:
                 await self.telegram.start_polling()
                 logger.info("[telegram] polling started on attempt %d", attempt)
                 return
             except Exception as exc:
-                wait = min(2 ** attempt, 30)
+                wait = min(2 ** attempt, 60)
                 logger.warning(
                     "[telegram] start attempt %d failed: %s. Retrying in %ds...",
                     attempt, exc, wait,
                 )
                 await _asyncio.sleep(wait)
-        raise RuntimeError("Telegram polling failed after max retries")

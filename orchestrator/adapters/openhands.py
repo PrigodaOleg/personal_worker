@@ -168,10 +168,13 @@ class OpenHandsAdapter:
                 json=payload,
                 headers=self._headers(),
             )
+            logger.info("[openhands] start_conversation status=%s body=%s", r.status_code, r.text[:500])
             r.raise_for_status()
             return r.json()
         except httpx.HTTPError as exc:
-            logger.error("[openhands] start_conversation failed: %s", exc)
+            logger.error("[openhands] start_conversation failed: status=%s body=%s", 
+                        getattr(exc, 'response', None) and getattr(exc.response, 'status_code', '?'),
+                        getattr(exc, 'response', None) and getattr(exc.response, 'text', 'no body')[:500])
             return {"status": "error", "error": str(exc)}
 
     async def get_status(self, conversation_id: str) -> dict:
