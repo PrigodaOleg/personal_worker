@@ -157,6 +157,15 @@ class Scheduler:
             if fut and not fut.done():
                 fut.set_result(text)
             logger.info("[telegram] clarification answer for task %s", tid)
+            # Подтверждаем получение уточнения
+            try:
+                chat_id_int = int(chat_id)
+                await self.telegram.send_message(
+                    chat_id_int,
+                    f"✅ Уточнение принято. Начинаю обработку задачи: «{task.title[:50]}…»",
+                )
+            except Exception as exc:
+                logger.error("[telegram] failed to send clarification confirmation: %s", exc)
             return
 
         # 2. Иначе — новая задача
@@ -284,6 +293,15 @@ class Scheduler:
             task.status = TaskStatus.READY
             self.state.save(task)
             self._pending_clarifications.pop(task.id, None)
+            if task.source == TaskSource.TELEGRAM:
+                try:
+                    chat_id_int = int(task.source_id)
+                    await self.telegram.send_message(
+                        chat_id_int,
+                        f"✅ Уточнение принято. Начинаю обработку задачи: «{task.title[:50]}…»",
+                    )
+                except Exception as exc:
+                    logger.error("[telegram] failed to send clarification confirmation: %s", exc)
             await self._run_openhands(task)
             return
 
@@ -297,6 +315,15 @@ class Scheduler:
                 task.status = TaskStatus.READY
                 self.state.save(task)
                 self._pending_clarifications.pop(task.id, None)
+                if task.source == TaskSource.TELEGRAM:
+                    try:
+                        chat_id_int = int(task.source_id)
+                        await self.telegram.send_message(
+                            chat_id_int,
+                            f"✅ Уточнение принято. Начинаю обработку задачи: «{task.title[:50]}…»",
+                        )
+                    except Exception as exc:
+                        logger.error("[telegram] failed to send clarification confirmation: %s", exc)
                 await self._run_openhands(task)
             except asyncio.TimeoutError:
                 pass
