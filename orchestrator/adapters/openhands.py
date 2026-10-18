@@ -12,9 +12,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import subprocess
+import time
 from typing import Optional
 
 import httpx
+import jwt
 
 logger = logging.getLogger(__name__)
 
@@ -27,19 +30,83 @@ class OpenHandsAdapter:
         llm_base_url: Optional[str] = None,
         llm_api_key: Optional[str] = None,
         llm_model: Optional[str] = None,
+        github_app_id: Optional[int] = None,
+        github_private_key_path: Optional[str] = None,
+        github_installation_id: Optional[int] = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.llm_base_url = llm_base_url
         self.llm_api_key = llm_api_key
         self.llm_model = llm_model
+        self.github_app_id = github_app_id
+        self.github_private_key_path = github_private_key_path
+        self.github_installation_id = github_installation_id
         self._client = httpx.AsyncClient(timeout=httpx.Timeout(30.0))
+        self._providers_configured: bool = False
 
     def _headers(self) -> dict:
         headers = {}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
         return headers
+
+    def _get_github_installation_token(self) -> Optional[str]:
+        """Получить свежий installation token от GitHub App."""
+        if not all([self.github_app_id, self.github_private_key_path, self.github_installation_id]):
+            return None
+        try:
+            private_key = open(self.github_private_key_path).read()
+            now = int(time.time())
+            payload = {
+                "iat": now - 60,
+                "exp": now + 600,
+                "iss": self.github_app_id,
+            }
+            jwt_token = jwt.encode(payload, private_key, algorithm="RS256")
+            result = subprocess.run(
+                [
+                    "curl", "-s", "-m", "10", "-X", "POST",
+                    f"https://api.github.com/app/installations/{self.github_installation_id}/access_tokens",
+                    "-H", f"Authorization: Bearer {jwt_token}",
+                    "-H", "Accept: application/vnd.github+json",
+                ],
+                capture_output=True, text=True, timeout=15,
+            )
+            import json
+            resp = json.loads(result.stdout)
+            return resp.get("token")
+        except Exception as exc:
+            logger.error("[openhands] failed to get installation token: %s", exc)
+            return None
+
+    async def configure_github_provider(self) -> dict:
+        """Настроить GitHub provider tokens в OpenHands."""
+        token = self._get_github_installation_token()
+        if not token:
+            return {"status": "error", "error": "no GitHub installation token"}
+
+        payload = {
+            "provider_tokens": {
+                "github": {
+                    "token": token,
+                    "user_id": str(self.github_installation_id),
+                    "host": "github.com",
+                }
+            }
+        }
+        try:
+            r = await self._client.post(
+                f"{self.base_url}/api/add-git-providers",
+                json=payload,
+                headers=self._headers(),
+            )
+            r.raise_for_status()
+            self._providers_configured = True
+            return r.json()
+        except httpx.HTTPError as exc:
+            logger.error("[openhands] configure_github_provider failed: %s", exc)
+            return {"status": "error", "error": str(exc)}
 
     async def health(self) -> bool:
         try:

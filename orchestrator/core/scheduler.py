@@ -56,6 +56,9 @@ class Scheduler:
             llm_base_url=config.openhands_llm_base_url,
             llm_api_key=config.openhands_llm_api_key,
             llm_model=config.openhands_llm_model,
+            github_app_id=config.github_app_id,
+            github_private_key_path=config.github_private_key_path,
+            github_installation_id=config.github_installation_id,
         )
         self.imac = IMacAdapter(
             host=config.imac_host or "",
@@ -509,6 +512,13 @@ class Scheduler:
             else:
                 self._llm_configured = True
                 logger.info("[openhands] LLM configured successfully")
+
+        # Настраиваем GitHub provider tokens в OpenHands (требуется для доступа к репозиторию)
+        provider_result = await self.openhands.configure_github_provider()
+        if provider_result.get("status") == "error":
+            logger.warning("[openhands] GitHub provider config warning: %s", provider_result.get("error"))
+        else:
+            logger.info("[openhands] GitHub provider configured successfully")
 
         # Создаём разговор в OpenHands
         result = await self.openhands.create_conversation(
