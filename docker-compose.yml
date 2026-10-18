@@ -6,7 +6,8 @@ services:
       context: .
       dockerfile: docker/openhands-flutter/Dockerfile
     container_name: openhands-flutter
-    network_mode: host
+    ports:
+      - "3000:3000"
     environment:
       - LLM_API_KEY=${OPENHANDS_LLM_API_KEY}
       - LLM_BASE_URL=${OPENHANDS_LLM_BASE_URL}
@@ -15,6 +16,7 @@ services:
       - OPENHANDS_API_KEY=${OPENHANDS_API_KEY}
       - SANDBOX_URL=http://192.168.88.15:3000
       - APP_URL=http://192.168.88.15:3000
+      - SANDBOX_NETWORK=personal_worker_default
     dns:
       - 8.8.8.8
       - 1.1.1.1
