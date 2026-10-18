@@ -161,7 +161,12 @@ class Scheduler:
 
         # 2. Иначе — новая задача
         task_id = self._task_id(TaskSource.TELEGRAM, chat_id + ":" + text[:40])
-        if self.state.get(task_id):
+        existing = self.state.get(task_id)
+        if existing:
+            await self.telegram.send_message(
+                int(chat_id),
+                f"⚠️ Задача «{existing.title[:50]}…» уже обрабатывается (статус: {existing.status.value}).",
+            )
             return
 
         task = Task(
@@ -175,6 +180,14 @@ class Scheduler:
         task.add_log(f"telegram from chat {chat_id}")
         self.state.save(task)
         logger.info("[telegram] new task from chat %s", chat_id)
+        # Подтверждаем получение задачи
+        chat_id_int = int(chat_id)
+        if task.status == TaskStatus.NEW:
+            await self.telegram.send_message(
+                chat_id_int,
+                f"✅ Задача получена: «{task.title[:50]}…\"\n"
+                f"Обработка начата. Я сообщу, когда будет результат или возникнут вопросы.",
+            )
         await self._process_task(task)
 
     # ------------------------------------------------------------------ #
