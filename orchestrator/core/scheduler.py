@@ -339,7 +339,8 @@ class Scheduler:
                 task.clarification_question = question
                 self.state.save(task)
                 await self._ask_clarification(task)
-                return
+                # Не возвращаемся — продолжаем в _wait_for_clarification,
+                # который будет ждать ответа пользователя
 
             task.status = TaskStatus.READY
             self.state.save(task)
