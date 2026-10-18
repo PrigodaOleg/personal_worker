@@ -1,22 +1,22 @@
 services:
-  # OpenHands + Flutter SDK в одном контейнере.
+  # OpenHands + Flask SDK в одном контейнере.
   # Агент сам выполняет flutter test / flutter build внутри контейнера.
   openhands:
     build:
       context: .
       dockerfile: docker/openhands-flutter/Dockerfile
     container_name: openhands-flutter
-    networks:
-      - oh-network
+    ports:
+      - "3000:3000"
     environment:
       - LLM_API_KEY=${OPENHANDS_LLM_API_KEY}
       - LLM_BASE_URL=${OPENHANDS_LLM_BASE_URL}
       - LLM_MODEL=${OPENHANDS_LLM_MODEL}
       - LLM_API_VERSION=v1
       - OPENHANDS_API_KEY=${OPENHANDS_API_KEY}
-      - SANDBOX_URL=http://192.168.88.15:3000
-      - APP_URL=http://192.168.88.15:3000
-      - SANDBOX_NETWORK=oh-network
+      - SANDBOX_URL=http://openhands-flutter:3000
+      - APP_URL=http://openhands-flutter:3000
+      - SANDBOX_NETWORK=personal_worker_default
     dns:
       - 8.8.8.8
       - 1.1.1.1
@@ -32,8 +32,9 @@ services:
       retries: 3
 
 networks:
-  oh-network:
+  default:
     driver: bridge
+    name: personal_worker_default
 
 volumes:
   openhands_state:
