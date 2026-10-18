@@ -248,8 +248,9 @@ class Scheduler:
 
     async def _handle_telegram_command(self, chat_id: str, text: str) -> None:
         """Обработка команд бота: /status, /cancel, /help."""
-        cmd = text.lower().split()[0]
+        cmd = text.lower().split()[0] if text.split() else ""
         chat_id_int = int(chat_id)
+        logger.info("[telegram] command from %s: %s", chat_id, text)
 
         if cmd == "/help":
             await self.telegram.send_message(
@@ -631,7 +632,9 @@ class Scheduler:
     # ------------------------------------------------------------------ #
     async def run(self) -> None:
         logger.info("[scheduler] starting (poll_interval=%ds)", self.config.poll_interval_seconds)
-        await self.telegram.start_polling()
+
+        # Запуск Telegram polling с retry при сетевых сбоях
+        await self._start_telegram_with_retry()
 
         for task in self.state.list_by_status(TaskStatus.CLARIFYING):
             self._pending_clarifications[task.id] = {
@@ -647,3 +650,21 @@ class Scheduler:
                 logger.error("[loop] github poll error: %s", exc)
 
             await asyncio.sleep(self.config.poll_interval_seconds)
+
+    async def _start_telegram_with_retry(self, max_retries: int = 10) -> None:
+        """Запуск Telegram polling с повторными попытками при таймауте."""
+        import asyncio as _asyncio
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                await self.telegram.start_polling()
+                logger.info("[telegram] polling started on attempt %d", attempt)
+                return
+            except Exception as exc:
+                wait = min(2 ** attempt, 30)
+                logger.warning(
+                    "[telegram] start attempt %d failed: %s. Retrying in %ds...",
+                    attempt, exc, wait,
+                )
+                await _asyncio.sleep(wait)
+        raise RuntimeError("Telegram polling failed after max retries")
