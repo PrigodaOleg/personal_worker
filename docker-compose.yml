@@ -14,6 +14,8 @@ services:
       - LLM_MODEL=${OPENHANDS_LLM_MODEL}
       - LLM_API_VERSION=v1
       - OPENHANDS_API_KEY=${OPENHANDS_API_KEY}
+      - SANDBOX_URL=http://192.168.88.15:3000
+      - APP_URL=http://192.168.88.15:3000
     dns:
       - 8.8.8.8
       - 1.1.1.1
