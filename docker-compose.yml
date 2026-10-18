@@ -6,8 +6,7 @@ services:
       context: .
       dockerfile: docker/openhands-flutter/Dockerfile
     container_name: openhands-flutter
-    ports:
-      - "3000:3000"
+    network_mode: host
     environment:
       - LLM_API_KEY=${OPENHANDS_LLM_API_KEY}
       - LLM_BASE_URL=${OPENHANDS_LLM_BASE_URL}
