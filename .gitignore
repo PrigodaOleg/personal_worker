@@ -48,6 +48,9 @@ config/
 *.log
 state/
 
+# Workspaces (cloned repositories - should not be committed)
+workspaces/
+
 # Flutter / build artifacts
 .android/
 .flutter/
