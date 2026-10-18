@@ -66,6 +66,7 @@ class Scheduler:
         self.ios_runner = IOSRunner(imac=self.imac)
 
         self._pending_clarifications: dict[str, dict] = {}
+        self._llm_configured: bool = False
 
     # ------------------------------------------------------------------ #
     # Вспомогательные
@@ -216,7 +217,6 @@ class Scheduler:
         task_id = self._task_id(TaskSource.TELEGRAM, chat_id + ":" + text[:40])
         existing = self.state.get(task_id)
         if existing and existing.status in (TaskStatus.DONE, TaskStatus.FAILED, TaskStatus.CANCELLED):
-            # Позволяем создать новую задачу с таким же текстом
             pass
         elif existing:
             await self.telegram.send_message(
@@ -248,7 +248,8 @@ class Scheduler:
 
     async def _handle_telegram_command(self, chat_id: str, text: str) -> None:
         """Обработка команд бота: /status, /cancel, /help."""
-        cmd = text.lower().split()[0] if text.split() else ""
+        parts = text.split()
+        cmd = parts[0].lower() if parts else ""
         chat_id_int = int(chat_id)
         logger.info("[telegram] command from %s: %s", chat_id, text)
 
@@ -266,7 +267,6 @@ class Scheduler:
         if cmd == "/status":
             active = self._get_active_task_for_chat(chat_id)
             if not active:
-                # Показываем последнюю задачу
                 all_tasks = (
                     self.state.list_by_status(TaskStatus.DONE)
                     + self.state.list_by_status(TaskStatus.FAILED)
@@ -309,7 +309,6 @@ class Scheduler:
             active.status = TaskStatus.CANCELLED
             active.add_log("Отменено пользователем через /cancel")
             self.state.save(active)
-            # Убираем из ожидающих уточнений
             self._pending_clarifications.pop(active.id, None)
             await self.telegram.send_message(
                 chat_id_int,
@@ -339,7 +338,7 @@ class Scheduler:
                 task.clarification_question = question
                 self.state.save(task)
                 await self._ask_clarification(task)
-                return  # Важно: иначе статус перезапишется на READY ниже
+                return
 
             task.status = TaskStatus.READY
             self.state.save(task)
@@ -502,33 +501,68 @@ class Scheduler:
             "Не создавай PR — это сделает оркестратор отдельно."
         )
 
-        result = await self.openhands.start_task(
+        # Настраиваем LLM провайдера (provod.ai) один раз
+        if not self._llm_configured:
+            llm_result = await self.openhands.configure_llm()
+            if llm_result.get("status") == "error":
+                logger.warning("[openhands] LLM config warning: %s", llm_result.get("error"))
+            else:
+                self._llm_configured = True
+                logger.info("[openhands] LLM configured successfully")
+
+        # Создаём разговор в OpenHands
+        result = await self.openhands.create_conversation(
             instruction=instruction,
-            work_dir=client_dir,
-            repo_url=repo_url,
+            repository=self.config.github_repo,
             branch="main",
         )
 
         if result.get("status") == "error":
             error_msg = result.get('error', 'неизвестная ошибка')
-            logger.error("[openhands] start failed: %s", error_msg)
+            logger.error("[openhands] create_conversation failed: %s", error_msg)
             task.status = TaskStatus.FAILED
             self.state.save(task)
             log_text = "\n".join(task.log[-10:]) if task.log else ""
             self._notify_author(
                 task,
-                f"❌ OpenHands не запустился.\n\nОшибка: {error_msg}\n\n"
+                f"❌ OpenHands не создал разговор.\n\nОшибка: {error_msg}\n\n"
                 f"Полный лог задачи:\n{log_text}",
             )
             return
 
-        session_id = result.get("session_id") or result.get("id") or task.id
-        await self._monitor_openhands(task, session_id, client_dir)
+        conversation_id = result.get("conversation_id")
+        if not conversation_id:
+            logger.error("[openhands] no conversation_id in response: %s", result)
+            task.status = TaskStatus.FAILED
+            self.state.save(task)
+            self._notify_author(
+                task,
+                f"❌ OpenHands не вернул conversation_id.\n\nОтвет: {result}",
+            )
+            return
 
-    async def _monitor_openhands(self, task: Task, session_id: str, client_dir: str) -> None:
+        task.add_log(f"OpenHands conversation created: {conversation_id}")
+        self.state.save(task)
+
+        # Запускаем agente loop
+        start_result = await self.openhands.start_conversation(conversation_id)
+        if start_result.get("status") == "error":
+            error_msg = start_result.get('error', 'неизвестная ошибка')
+            logger.error("[openhands] start_conversation failed: %s", error_msg)
+            task.status = TaskStatus.FAILED
+            self.state.save(task)
+            self._notify_author(
+                task,
+                f"❌ OpenHands не запустил агента.\n\nОшибка: {error_msg}",
+            )
+            return
+
+        await self._monitor_openhands(task, conversation_id, client_dir)
+
+    async def _monitor_openhands(self, task: Task, conversation_id: str, client_dir: str) -> None:
         """Мониторит сессию OpenHands: уточнения, завершение, ошибки."""
         while True:
-            status = await self.openhands.get_status(session_id)
+            status = await self.openhands.get_status(conversation_id)
             state_val = status.get("status", "unknown")
 
             if state_val == "awaiting_clarification":
@@ -545,8 +579,9 @@ class Scheduler:
                 task.add_log("OpenHands completed successfully")
                 await self._build_ios_and_create_pr(task, client_dir)
                 return
+            # RUNNING — продолжаем мониторить
 
-            if state_val in ("failed", "error"):
+            if state_val in ("failed", "error", "STOPPED", "ARCHIVED", "ERROR"):
                 error_msg = status.get('error', 'неизвестная ошибка')
                 task.status = TaskStatus.FAILED
                 self.state.save(task)
