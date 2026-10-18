@@ -1,10 +1,16 @@
 .PHONY: install run up down lint test fmt
 
+VENV := .venv
+PIP := $(VENV)/bin/pip
+PYTHON := $(VENV)/bin/python
+
 install:
-	pip install -r requirements.txt
+	python3 -m venv $(VENV)
+	$(PIP) install --upgrade pip
+	$(PIP) install -r requirements.txt
 
 run:
-	python -m orchestrator.main
+	$(PYTHON) -m orchestrator.main
 
 up:
 	docker compose up -d
@@ -13,10 +19,10 @@ down:
 	docker compose down
 
 lint:
-	ruff check orchestrator tests 2>/dev/null || echo "ruff not installed"
+	$(PIP) install ruff 2>/dev/null; $(VENV)/bin/ruff check orchestrator tests 2>/dev/null || echo "ruff not installed"
 
 fmt:
-	ruff format orchestrator tests 2>/dev/null || echo "ruff not installed"
+	$(VENV)/bin/ruff format orchestrator tests 2>/dev/null || echo "ruff not installed"
 
 test:
-	pytest tests
+	$(VENV)/bin/pytest tests
