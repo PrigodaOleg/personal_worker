@@ -5,12 +5,10 @@
 
 from __future__ import annotations
 
-import time
 from typing import Optional
 
-import jwt
-from github import Github, GithubException
-from github.Auth import AppAuth, AppInstallationAuth
+from github import Github
+from github.Auth import AppAuth
 
 from orchestrator.core.task import Task, TaskSource, TaskStatus
 
@@ -39,18 +37,14 @@ class GitHubAdapter:
             return f.read()
 
     def _ensure_auth(self) -> None:
-        """Обновляет installation token если нужно (живёт 1 час)."""
-        now = time.time()
-        if self._auth_token and now < self._token_expires_at - 60:
+        """Создаёт GitHub клиент с GitHub App аутентификацией."""
+        if self._gh is not None and self._repo is not None:
             return
         private_key = self._load_private_key()
         app_auth = AppAuth(app_id=self.app_id, private_key=private_key)
-        installation_auth: AppInstallationAuth = app_auth.get_installation_auth(
+        installation_auth = app_auth.get_installation_auth(
             installation_id=self.installation_id
         )
-        self._auth_token = installation_auth.token
-        # installation token живёт 1 час
-        self._token_expires_at = now + 3600
         self._gh = Github(auth=installation_auth)
         self._repo = self._gh.get_repo(self.repo_full_name)
 
