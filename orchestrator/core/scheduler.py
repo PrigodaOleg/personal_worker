@@ -339,8 +339,7 @@ class Scheduler:
                 task.clarification_question = question
                 self.state.save(task)
                 await self._ask_clarification(task)
-                # Не возвращаемся — продолжаем в _wait_for_clarification,
-                # который будет ждать ответа пользователя
+                return  # Важно: иначе статус перезапишется на READY ниже
 
             task.status = TaskStatus.READY
             self.state.save(task)
@@ -426,14 +425,17 @@ class Scheduler:
                     )
                 except Exception as exc:
                     logger.error("[telegram] failed to send clarification confirmation: %s", exc)
+            logger.info("[clarify] task %s calling _run_openhands (answer already set)", task.id)
             await self._run_openhands(task)
             return
 
         if info["future"] and not info["future"].done():
+            logger.info("[clarify] task %s waiting for future (poll=%ds)", task.id, self.config.clarification_poll_seconds)
             try:
                 answer = await asyncio.wait_for(
                     info["future"], timeout=self.config.clarification_poll_seconds
                 )
+                logger.info("[clarify] task %s future resolved with answer: %s", task.id, answer[:50])
                 task.clarification_answer = answer
                 task.description += f"\n\nУточнение пользователя: {answer}"
                 task.status = TaskStatus.READY
@@ -448,8 +450,10 @@ class Scheduler:
                         )
                     except Exception as exc:
                         logger.error("[telegram] failed to send clarification confirmation: %s", exc)
+                logger.info("[clarify] task %s calling _run_openhands", task.id)
                 await self._run_openhands(task)
             except asyncio.TimeoutError:
+                logger.info("[clarify] task %s future timeout, will retry on next tick", task.id)
                 pass
 
     def resolve_telegram_answer(self, chat_id: str, answer: str) -> None:
@@ -649,6 +653,13 @@ class Scheduler:
                 await self.poll_github()
             except Exception as exc:
                 logger.error("[loop] github poll error: %s", exc)
+
+            # Обрабатываем задачи в статусе CLARIFYING (ожидание уточнений)
+            for task in self.state.list_by_status(TaskStatus.CLARIFYING):
+                try:
+                    await self._wait_for_clarification(task)
+                except Exception as exc:
+                    logger.error("[loop] clarification wait error for task %s: %s", task.id, exc)
 
             await asyncio.sleep(self.config.poll_interval_seconds)
 
