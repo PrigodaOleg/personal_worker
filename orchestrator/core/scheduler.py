@@ -3,7 +3,7 @@ iOS на iMac, PR и уведомления.
 
 Жизненный цикл задачи:
   NEW -> CLARIFYING (если не хватает информации) -> READY -> RUNNING (OpenHands)
-    -> (OpenHands может вернуть вопрос -> CLARIFYING) -> DONE/FAILED
+    -> (OpenHands может вернуть вопрос -> CLARIFYING) -> DONE/FAILED/CANCELLED
   После успешного OpenHands: iOS на iMac (по SSH) -> PR в GitHub -> уведомление автору.
 
 Сборки Linux / Web / Android запускаются не на хосте, а внутри контейнера
@@ -99,6 +99,31 @@ class Scheduler:
             except Exception as exc:
                 logger.error("[notify] telegram send failed: %s", exc)
 
+    def _get_active_task_for_chat(self, chat_id: str) -> Optional[Task]:
+        """Найти активную (не завершённую) задачу для этого chat_id."""
+        active_statuses = [
+            TaskStatus.NEW,
+            TaskStatus.CLARIFYING,
+            TaskStatus.READY,
+            TaskStatus.RUNNING,
+        ]
+        for status in active_statuses:
+            for task in self.state.list_by_status(status):
+                if task.source == TaskSource.TELEGRAM and task.source_id == chat_id:
+                    return task
+        return None
+
+    def _task_status_emoji(self, status: TaskStatus) -> str:
+        return {
+            TaskStatus.NEW: "🆕",
+            TaskStatus.CLARIFYING: "❓",
+            TaskStatus.READY: "⏳",
+            TaskStatus.RUNNING: "🔄",
+            TaskStatus.DONE: "✅",
+            TaskStatus.FAILED: "❌",
+            TaskStatus.CANCELLED: "🚫",
+        }.get(status, "➖")
+
     # ------------------------------------------------------------------ #
     # Приём задач из GitHub
     # ------------------------------------------------------------------ #
@@ -141,6 +166,11 @@ class Scheduler:
             return
         chat_id = str(msg["chat_id"])
 
+        # Команды бота
+        if text.startswith("/"):
+            await self._handle_telegram_command(chat_id, text)
+            return
+
         # 1. Если есть ожидающееся уточнение для этого чата — это ответ
         pending = [
             (tid, info)
@@ -168,13 +198,30 @@ class Scheduler:
                 logger.error("[telegram] failed to send clarification confirmation: %s", exc)
             return
 
-        # 2. Иначе — новая задача
-        task_id = self._task_id(TaskSource.TELEGRAM, chat_id + ":" + text[:40])
-        existing = self.state.get(task_id)
-        if existing:
+        # 2. Проверяем, есть ли уже активная задача у этого пользователя
+        active = self._get_active_task_for_chat(chat_id)
+        if active:
+            emoji = self._task_status_emoji(active.status)
+            progress = "\n".join(active.log[-5:]) if active.log else ""
             await self.telegram.send_message(
                 int(chat_id),
-                f"⚠️ Задача «{existing.title[:50]}…» уже обрабатывается (статус: {existing.status.value}).",
+                f"{emoji} Я уже занят задачей «{active.title[:50]}…»\n"
+                f"Статус: {active.status.value}\n"
+                f"Подождите завершения или отправьте /cancel для отмены.\n"
+                f"Текущий прогресс:\n{progress}",
+            )
+            return
+
+        # 3. Иначе — новая задача
+        task_id = self._task_id(TaskSource.TELEGRAM, chat_id + ":" + text[:40])
+        existing = self.state.get(task_id)
+        if existing and existing.status in (TaskStatus.DONE, TaskStatus.FAILED, TaskStatus.CANCELLED):
+            # Позволяем создать новую задачу с таким же текстом
+            pass
+        elif existing:
+            await self.telegram.send_message(
+                int(chat_id),
+                f"⚠️ Задача «{existing.title[:50]}…» уже существует (статус: {existing.status.value}).",
             )
             return
 
@@ -198,6 +245,81 @@ class Scheduler:
                 f"Обработка начата. Я сообщу, когда будет результат или возникнут вопросы.",
             )
         await self._process_task(task)
+
+    async def _handle_telegram_command(self, chat_id: str, text: str) -> None:
+        """Обработка команд бота: /status, /cancel, /help."""
+        cmd = text.lower().split()[0]
+        chat_id_int = int(chat_id)
+
+        if cmd == "/help":
+            await self.telegram.send_message(
+                chat_id_int,
+                "🤖 Доступные команды:\n"
+                "/status — текущее состояние задачи\n"
+                "/cancel — отменить текущую задачу\n"
+                "/help — эта справка\n"
+                "\nПросто напишите задачу в свободной форме, и я начну её выполнять.",
+            )
+            return
+
+        if cmd == "/status":
+            active = self._get_active_task_for_chat(chat_id)
+            if not active:
+                # Показываем последнюю задачу
+                all_tasks = (
+                    self.state.list_by_status(TaskStatus.DONE)
+                    + self.state.list_by_status(TaskStatus.FAILED)
+                    + self.state.list_by_status(TaskStatus.CANCELLED)
+                )
+                recent = [t for t in all_tasks if t.source == TaskSource.TELEGRAM and t.source_id == chat_id]
+                if recent:
+                    last = recent[-1]
+                    emoji = self._task_status_emoji(last.status)
+                    await self.telegram.send_message(
+                        chat_id_int,
+                        f"{emoji} Последняя задача: «{last.title[:50]}…»\n"
+                        f"Статус: {last.status.value}\n"
+                        f"PR: {last.pr_url or '—'}",
+                    )
+                else:
+                    await self.telegram.send_message(
+                        chat_id_int,
+                        "🆕 У вас нет активных задач. Напишите мне задачу — и я начну.",
+                    )
+            else:
+                emoji = self._task_status_emoji(active.status)
+                progress = "\n".join(active.log[-5:]) if active.log else ""
+                await self.telegram.send_message(
+                    chat_id_int,
+                    f"{emoji} Текущая задача: «{active.title[:50]}…»\n"
+                    f"Статус: {active.status.value}\n"
+                    f"Прогресс:\n{progress}",
+                )
+            return
+
+        if cmd == "/cancel":
+            active = self._get_active_task_for_chat(chat_id)
+            if not active:
+                await self.telegram.send_message(
+                    chat_id_int,
+                    "🆕 Нет активных задач для отмены.",
+                )
+                return
+            active.status = TaskStatus.CANCELLED
+            active.add_log("Отменено пользователем через /cancel")
+            self.state.save(active)
+            # Убираем из ожидающих уточнений
+            self._pending_clarifications.pop(active.id, None)
+            await self.telegram.send_message(
+                chat_id_int,
+                f"🚫 Задача «{active.title[:50]}…» отменена.",
+            )
+            return
+
+        await self.telegram.send_message(
+            chat_id_int,
+            "❓ Неизвестная команда. Используйте /help для справки.",
+        )
 
     # ------------------------------------------------------------------ #
     # Основная обработка задачи
@@ -382,10 +504,16 @@ class Scheduler:
         )
 
         if result.get("status") == "error":
-            logger.error("[openhands] start failed: %s", result.get("error"))
+            error_msg = result.get('error', 'неизвестная ошибка')
+            logger.error("[openhands] start failed: %s", error_msg)
             task.status = TaskStatus.FAILED
             self.state.save(task)
-            self._notify_author(task, f"❌ OpenHands не запустился: {result.get('error')}")
+            log_text = "\n".join(task.log[-10:]) if task.log else ""
+            self._notify_author(
+                task,
+                f"❌ OpenHands не запустился.\n\nОшибка: {error_msg}\n\n"
+                f"Полный лог задачи:\n{log_text}",
+            )
             return
 
         session_id = result.get("session_id") or result.get("id") or task.id
@@ -413,11 +541,16 @@ class Scheduler:
                 return
 
             if state_val in ("failed", "error"):
+                error_msg = status.get('error', 'неизвестная ошибка')
                 task.status = TaskStatus.FAILED
                 self.state.save(task)
+                task.add_log(f"OpenHands failed: {error_msg}")
+                log_text = "\n".join(task.log[-15:]) if task.log else ""
                 self._notify_author(
                     task,
-                    f"❌ OpenHands завершился с ошибкой: {status.get('error', '')}",
+                    f"❌ OpenHands завершился с ошибкой.\n\n"
+                    f"Ошибка: {error_msg}\n\n"
+                    f"Лог выполнения:\n{log_text}",
                 )
                 return
 
@@ -433,11 +566,16 @@ class Scheduler:
             ios_res = await self.ios_runner.build_and_test(client_dir)
             task.add_log(f"iOS result: {ios_res.get('status')}")
             if ios_res.get("status") not in ("ok", "skipped"):
+                error_msg = ios_res.get('error', 'неизвестная ошибка')
                 task.status = TaskStatus.FAILED
                 self.state.save(task)
+                task.add_log(f"iOS failed: {error_msg}")
+                log_text = "\n".join(task.log[-15:]) if task.log else ""
                 self._notify_author(
                     task,
-                    f"❌ iOS сборка/тесты не прошли: {ios_res.get('error', '')}",
+                    f"❌ iOS сборка/тесты не прошли.\n\n"
+                    f"Ошибка: {error_msg}\n\n"
+                    f"Лог выполнения:\n{log_text}",
                 )
                 return
         else:
@@ -445,18 +583,32 @@ class Scheduler:
 
         # Создаём ветку, коммит, пуш, PR
         branch = f"ai-task-{task.id}"
-        await asyncio.create_subprocess_exec(
-            "git", "-C", client_dir, "checkout", "-b", branch,
-        )
-        await asyncio.create_subprocess_exec(
-            "git", "-C", client_dir, "add", "-A",
-        )
-        await asyncio.create_subprocess_exec(
-            "git", "-C", client_dir, "commit", "-m", f"AI task: {task.title}",
-        )
-        await asyncio.create_subprocess_exec(
-            "git", "-C", client_dir, "push", "origin", branch,
-        )
+        try:
+            await asyncio.create_subprocess_exec(
+                "git", "-C", client_dir, "checkout", "-b", branch,
+            )
+            await asyncio.create_subprocess_exec(
+                "git", "-C", client_dir, "add", "-A",
+            )
+            await asyncio.create_subprocess_exec(
+                "git", "-C", client_dir, "commit", "-m", f"AI task: {task.title}",
+            )
+            await asyncio.create_subprocess_exec(
+                "git", "-C", client_dir, "push", "origin", branch,
+            )
+        except Exception as exc:
+            error_msg = str(exc)
+            task.status = TaskStatus.FAILED
+            self.state.save(task)
+            task.add_log(f"git/push failed: {error_msg}")
+            log_text = "\n".join(task.log[-15:]) if task.log else ""
+            self._notify_author(
+                task,
+                f"❌ Ошибка при создании ветки/пуша.\n\n"
+                f"Ошибка: {error_msg}\n\n"
+                f"Лог выполнения:\n{log_text}",
+            )
+            return
 
         pr_url = await self.github.create_pr(
             branch=branch,
