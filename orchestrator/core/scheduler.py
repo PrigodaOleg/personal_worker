@@ -513,14 +513,12 @@ class Scheduler:
             "Не создавай PR — это сделает оркестратор отдельно."
         )
 
-        # Настраиваем LLM провайдера (provod.ai) один раз
-        if not self._llm_configured:
-            llm_result = await self.openhands.configure_llm()
-            if llm_result.get("status") == "error":
-                logger.warning("[openhands] LLM config warning: %s", llm_result.get("error"))
-            else:
-                self._llm_configured = True
-                logger.info("[openhands] LLM configured successfully")
+        # Настраиваем LLM провайдера (provod.ai) перед каждым разговором
+        llm_result = await self.openhands.configure_llm()
+        if llm_result.get("status") == "error":
+            logger.warning("[openhands] LLM config warning: %s", llm_result.get("error"))
+        else:
+            logger.info("[openhands] LLM configured successfully")
 
         # Настраиваем GitHub provider tokens в OpenHands
         provider_result = await self.openhands.configure_github_provider()
@@ -577,6 +575,11 @@ class Scheduler:
         """Мониторит сессию OpenHands: уточнения, завершение, ошибки."""
         while True:
             status = await self.openhands.get_status(conversation_id)
+            if status is None:
+                logger.warning("[openhands] get_status returned None for %s, retrying", conversation_id)
+                await asyncio.sleep(self.config.clarification_poll_seconds)
+                continue
+
             state_val = status.get("status", "unknown")
 
             if state_val == "awaiting_clarification":
