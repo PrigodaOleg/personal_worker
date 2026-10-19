@@ -81,6 +81,9 @@ class Scheduler:
         self.openhands_container: str = os.getenv(
             "OPENHANDS_CONTAINER", "openhands-flutter"
         )
+        # Сколько опросов подряд терпеть недоступное состояние агента,
+        # прежде чем считать задачу упавшей.
+        self.max_state_misses: int = int(os.getenv("OPENHANDS_MAX_STATE_MISSES", "10"))
 
     # ------------------------------------------------------------------ #
     # Вспомогательные
@@ -643,37 +646,74 @@ class Scheduler:
         await self._monitor_openhands(task, conversation_id, client_dir)
 
     async def _monitor_openhands(self, task: Task, conversation_id: str, client_dir: str) -> None:
-        """Мониторит сессию OpenHands: уточнения, завершение, ошибки."""
+        """Мониторит сессию OpenHands: уточнения, завершение, ошибки.
+
+        Ориентируемся на состояние агента (AgentState), а не на статус
+        разговора: разговор переходит в STOPPED и при успехе, и при ошибке,
+        поэтому по нему результат не определить.
+        """
+        state_misses = 0
         while True:
-            status = await self.openhands.get_status(conversation_id)
-            if status is None:
-                logger.warning("[openhands] get_status returned None for %s, retrying", conversation_id)
+            info = await self.openhands.get_agent_state(conversation_id)
+            state_val = info.get("agent_state")
+
+            if state_val is None:
+                state_misses += 1
+                if state_misses >= self.max_state_misses:
+                    task.status = TaskStatus.FAILED
+                    task.add_log(
+                        f"OpenHands: состояние агента недоступно "
+                        f"({info.get('error')})"
+                    )
+                    self.state.save(task)
+                    log_text = "\n".join(task.log[-15:]) if task.log else ""
+                    self._notify_author(
+                        task,
+                        "❌ Не удалось получить состояние агента OpenHands.\n\n"
+                        f"Ошибка: {info.get('error')}\n\n"
+                        f"Лог выполнения:\n{log_text}",
+                    )
+                    return
+                logger.warning(
+                    "[openhands] agent state not available for %s (%s), retry %d/%d",
+                    conversation_id, info.get("error"),
+                    state_misses, self.max_state_misses,
+                )
                 await asyncio.sleep(self.config.clarification_poll_seconds)
                 continue
 
-            state_val = status.get("status", "unknown")
+            state_misses = 0
 
-            if state_val == "awaiting_clarification":
-                question = status.get("question", "Нужно уточнение от пользователя.")
-                task.status = TaskStatus.CLARIFYING
-                task.clarification_question = question
-                self.state.save(task)
-                await self._ask_clarification(task)
-                return
-
-            if state_val in ("completed", "done", "success"):
+            # Агент ждёт ответа пользователя — либо задача выполнена, либо
+            # задан вопрос. Различаем по последнему сообщению агента.
+            if state_val == "awaiting_user_input":
+                message = (info.get("message") or "").strip()
+                if self._looks_like_clarification(message):
+                    task.status = TaskStatus.CLARIFYING
+                    task.clarification_question = message
+                    self.state.save(task)
+                    await self._ask_clarification(task)
+                    return
                 task.status = TaskStatus.DONE
                 self.state.save(task)
                 task.add_log("OpenHands completed successfully")
+                self.state.save(task)
                 await self._build_ios_and_create_pr(task, client_dir)
                 return
-            # RUNNING — продолжаем мониторить
 
-            if state_val in ("failed", "error", "STOPPED", "ARCHIVED", "ERROR"):
-                error_msg = status.get('error', 'неизвестная ошибка')
-                task.status = TaskStatus.FAILED
+            if state_val == "finished":
+                task.status = TaskStatus.DONE
                 self.state.save(task)
+                task.add_log("OpenHands finished")
+                self.state.save(task)
+                await self._build_ios_and_create_pr(task, client_dir)
+                return
+
+            if state_val in ("error", "rejected"):
+                error_msg = (info.get("message") or f"агент в состоянии {state_val}")
+                task.status = TaskStatus.FAILED
                 task.add_log(f"OpenHands failed: {error_msg}")
+                self.state.save(task)
                 log_text = "\n".join(task.log[-15:]) if task.log else ""
                 self._notify_author(
                     task,
@@ -683,7 +723,43 @@ class Scheduler:
                 )
                 return
 
+            # stopped — разговор погашен: либо агент уже отчитался, либо
+            # задачу оборвали. Остальные состояния (loading / running /
+            # paused) означают, что работа ещё идёт.
+            if state_val == "stopped":
+                # Остановка после отчёта агента — штатное завершение
+                # (OpenHands гасит простаивающий разговор).
+                if info.get("completed"):
+                    task.status = TaskStatus.DONE
+                    self.state.save(task)
+                    task.add_log("OpenHands completed (conversation stopped after report)")
+                    self.state.save(task)
+                    await self._build_ios_and_create_pr(task, client_dir)
+                    return
+                task.status = TaskStatus.FAILED
+                task.add_log("OpenHands stopped before completion")
+                self.state.save(task)
+                log_text = "\n".join(task.log[-15:]) if task.log else ""
+                self._notify_author(
+                    task,
+                    f"❌ OpenHands остановлен до завершения задачи.\n\n"
+                    f"Лог выполнения:\n{log_text}",
+                )
+                return
+
             await asyncio.sleep(self.config.clarification_poll_seconds)
+
+    @staticmethod
+    def _looks_like_clarification(message: str) -> bool:
+        """Агент спрашивает пользователя, а не отчитывается о результате."""
+        if not message:
+            return False
+        lowered = message.lower()
+        question_markers = (
+            "уточн", "не хватает данных", "какой вариант", "что выбрать",
+            "нужно уточнение", "clarif",
+        )
+        return message.endswith("?") or any(m in lowered for m in question_markers)
 
     # ------------------------------------------------------------------ #
     # iOS (на iMac) + PR

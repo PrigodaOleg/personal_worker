@@ -203,6 +203,54 @@ class OpenHandsAdapter:
             logger.error("[openhands] get_trajectory failed: %s", exc)
             return {"status": "error", "error": str(exc)}
 
+    async def get_agent_state(self, conversation_id: str) -> dict:
+        """Состояние агента и его последнее сообщение.
+
+        Статус разговора (get_status) показывает жизнь runtime-контейнера,
+        а не результат работы агента: после успешного завершения разговор
+        переходит в STOPPED. Реальное состояние агента видно только в
+        траектории — в событиях agent_state_changed (см. AgentState).
+        """
+        traj = await self.get_trajectory(conversation_id)
+        if traj.get("status") == "error":
+            return {
+                "agent_state": None,
+                "message": None,
+                "completed": False,
+                "error": traj.get("error"),
+            }
+
+        events = traj.get("trajectory") or traj.get("events") or traj
+        if not isinstance(events, list):
+            return {
+                "agent_state": None,
+                "message": None,
+                "completed": False,
+                "error": "нет событий в траектории",
+            }
+
+        agent_state = None
+        message = None
+        completed = False
+        for event in events:
+            if event.get("observation") == "agent_state_changed":
+                extras = event.get("extras") or {}
+                if extras.get("agent_state"):
+                    agent_state = extras["agent_state"]
+                    if agent_state in ("awaiting_user_input", "finished"):
+                        # Агент отчитался — дальше разговор просто простаивает,
+                        # пока OpenHands его не остановит.
+                        completed = True
+            if event.get("source") == "agent" and event.get("action") == "message":
+                message = event.get("message")
+
+        return {
+            "agent_state": agent_state,
+            "message": message,
+            "completed": completed,
+            "error": None,
+        }
+
     async def send_message(self, conversation_id: str, message: str) -> dict:
         """Отправить сообщение в разговор (ответ на уточнение)."""
         payload = {"message": message}
