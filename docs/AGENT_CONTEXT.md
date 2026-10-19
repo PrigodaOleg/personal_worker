@@ -22,14 +22,40 @@ Telegram), запускает её через OpenHands, собирает iOS н
 ## Текущее состояние
 
 Работает сквозной прогон: задача → агент в runtime-контейнере → `flutter
-pub get` / `test` / `build linux` / `build web` (все зелёные).
+pub get` / `test` / `build linux` / `build web` / `build apk` (все зелёные;
+APK собирается долго — Gradle гоняет Kotlin-компилятор по 9 минут).
+
+Шаг PR прогнан в dry-run (`deploy/e2e_run.py`, см. ниже): синхронизация правок
+из контейнера → `git commit` → `git push --dry-run` — всё зелёное. Реальный PR
+в `social_mind` пока не создавался.
 
 Не проверено на реальном прогоне:
 
-- `flutter build apk` на новом образе (toolchain доустановлен, подтверждён
-  только `flutter doctor`);
-- создание PR в `social_mind` и уведомление в Telegram;
-- путь iOS — `deploy/setup_imac.sh` ещё не запускался на iMac `192.168.88.20`.
+- создание настоящего PR в `social_mind` и уведомление в Telegram (dry-run
+  выключен — задайте `PR_DRY_RUN=0`/уберите переменную, чтобы PR создавались);
+- путь iOS — `deploy/setup_imac.sh` ещё не запускался на iMac `192.168.88.20`,
+  в `.env` стоят заглушки `TODO_IMAC_USER`, поэтому iOS-шаг честно пропускается.
+
+### Как прогнать пайплайн без создания PR
+
+```bash
+PR_DRY_RUN=1 .venv/bin/python deploy/e2e_run.py
+```
+
+Скрипт прогоняет задачу целиком (агент в runtime → sync → git), но пуш делает
+`--dry-run` и PR не создаёт. Умеет отправлять уведомление в Telegram (бот
+поднимается на отправку без поллинга).
+
+### Как правки агента попадают в PR
+
+Агент работает в `/workspace/social_mind` внутри runtime-контейнера, а шаг PR
+смотрит рабочую копию на хосте `workspaces/<task_id>/social_mind`. Контейнер
+ничего не монтирует, поэтому `_sync_changes_from_runtime` вручную переносит
+файлы: список берётся как `git diff --name-only origin/main` (правки агента
+могут быть уже закоммичены им внутри контейнера — `git status` их не покажет!)
+плюс `git ls-files --others`. При копировании сохраняются переводы строк
+исходного файла (`_match_line_endings`): агент часто переписывает CRLF в LF, и
+без этого весь файл попадает в diff.
 
 ## Грабли, на которые уже наступали
 
