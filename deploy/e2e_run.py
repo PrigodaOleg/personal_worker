@@ -29,7 +29,8 @@ logger = logging.getLogger("e2e")
 DESCRIPTION = (
     "Внеси минимальную правку: добавь в самый конец файла "
     "domains/client/lib/main.dart одну строку-комментарий "
-    "// AI-TASK-E2E-RUN и больше ничего в коде не меняй."
+    "// AI-TASK-E2E-RUN и больше ничего в коде не меняй. "
+    "Никакие команды сборки/анализа не запускай — только правка файла."
 )
 
 
@@ -38,24 +39,39 @@ async def main() -> int:
     logger.info("PR_DRY_RUN = %s", config.pr_dry_run)
 
     scheduler = Scheduler(config)
-    # Поднимаем бота на отправку, чтобы уведомление о результате реально ушло.
+    # Только на отправку: автономный прогон без поллинга.
     await scheduler.telegram.connect()
 
     task = Task(
-        id="e2e-dryrun",
+        id="e2e-clean",
         source=TaskSource.TELEGRAM,
         source_id="91741245",
-        title="Сквозной прогон (dry-run)",
+        title="Сквозной прогон (dry-run, чистый)",
         description=DESCRIPTION,
         status=TaskStatus.NEW,
     )
     scheduler.state.save(task)
 
+    async def auto_answer() -> None:
+        """Автоматически отвечать на вопросы агента, чтобы прогон не зависал."""
+        while True:
+            for _tid, info in list(scheduler._pending_agent_questions.items()):
+                fut = info["future"]
+                if fut and not fut.done():
+                    opts = info.get("options") or []
+                    answer = opts[0] if opts else "Продолжай на своё усмотрение."
+                    fut.set_result(answer)
+                    logger.info("auto-answer → %s", answer[:40])
+            await asyncio.sleep(3)
+
+    responder = asyncio.create_task(auto_answer())
     logger.info("Запускаю задачу %s", task.id)
     await scheduler._run_openhands(task)
+    responder.cancel()
     await scheduler.flush_notifications()
 
-    logger.info("Итоговый статус: %s", task.status)
+    logger.info("Итоговый статус: %s | цена: %.2f ₽ | токены %s/%s", task.status,
+                task.cost_rub, task.tokens_prompt, task.tokens_completion)
     for line in task.log:
         logger.info("  %s", line)
 

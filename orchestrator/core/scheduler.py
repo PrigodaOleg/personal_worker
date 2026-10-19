@@ -1675,6 +1675,7 @@ class Scheduler:
             self._notify_author(
                 task,
                 f"✅ Задача выполнена, но код не изменился — PR не требуется.\n\n"
+                f"Стоимость: {self._cost_line(task)}\n\n"
                 f"Лог выполнения:\n" + "\n".join(task.log[-10:]),
             )
             return
@@ -1688,7 +1689,8 @@ class Scheduler:
             self._notify_author(
                 task,
                 f"✅ Задача выполнена (dry-run: PR не создавался).\n\n"
-                f"Ветка: {branch} (push --dry-run прошёл)\n\n"
+                f"Ветка: {branch} (push --dry-run прошёл)\n"
+                f"Стоимость: {self._cost_line(task)}\n\n"
                 f"Изменения:\n{diff}\n\n"
                 f"Лог выполнения:\n" + "\n".join(task.log[-10:]),
             )
@@ -1707,7 +1709,8 @@ class Scheduler:
         self.state.save(task)
         self._notify_author(
             task,
-            f"✅ Задача выполнена! PR создан: {pr_url}",
+            f"✅ Задача выполнена! PR создан: {pr_url}\n"
+            f"Стоимость: {self._cost_line(task)}",
         )
 
     # ------------------------------------------------------------------ #
