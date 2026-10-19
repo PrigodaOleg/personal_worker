@@ -46,8 +46,16 @@ personal_worker/
 │   └── GITHUB_APP_SETUP.md       # создание GitHub App
 ├── tests/
 └── docs/
-    └── ARCHITECTURE.md
+    ├── ARCHITECTURE.md
+    └── AGENT_CONTEXT.md     # контекст для следующей сессии с AI-агентом
 ```
+
+## Продолжаете работу над проектом?
+
+Прочитайте [docs/AGENT_CONTEXT.md](docs/AGENT_CONTEXT.md) — там текущее
+состояние, где смотреть логи всех трёх слоёв и грабли, на которые уже
+наступали (VPN перебивает доступ к LLM, `host.docker.internal` в Linux,
+где должен стоять Flutter).
 
 ## Быстрый старт
 
