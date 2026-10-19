@@ -45,6 +45,14 @@ class Task:
     # Номер попытки. Растёт при перезапуске, чтобы ветка PR не конфликтовала
     # с веткой предыдущего прогона.
     attempt: int = 1
+    # Токены, израсходованные моделью (из llm_metrics OpenHands), и цена работы.
+    # Цена считается как токены × сохранённые цены модели (см. pricing.py).
+    tokens_prompt: int = 0
+    tokens_completion: int = 0
+    tokens_cache_read: int = 0
+    cost_rub: float = 0.0
+    # ID сообщения с кнопками (меню/карточкой), чтобы обновлять его in-place.
+    ui_message_id: Optional[int] = None
 
     def add_log(self, message: str) -> None:
         self.log.append(f"[{datetime.utcnow().isoformat()}] {message}")

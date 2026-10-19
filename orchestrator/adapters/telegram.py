@@ -8,10 +8,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Optional
+from typing import Optional, Union
 
 import telegram
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    Update,
+)
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -22,6 +27,16 @@ from telegram.ext import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Кнопки постоянного меню (ReplyKeyboardMarkup). Текст кнопки = входящее сообщение,
+# поэтому он же используется для маршрутизации к команде.
+MENU_COMMANDS: dict[str, str] = {
+    "📊 Статус": "/status",
+    "📋 Задачи": "/tasks",
+    "🧠 Модель": "/model",
+    "🚫 Отмена": "/cancel",
+    "❓ Помощь": "/help",
+}
 
 
 class TelegramAdapter:
@@ -141,11 +156,23 @@ class TelegramAdapter:
              for row in rows]
         )
 
+    @staticmethod
+    def build_menu_keyboard() -> ReplyKeyboardMarkup:
+        """Постоянное меню-клавиатура внизу чата (кнопки шлют текст)."""
+        keys = list(MENU_COMMANDS.keys())
+        rows = [keys[i:i + 2] for i in range(0, len(keys), 2)]
+        return ReplyKeyboardMarkup(
+            [[telegram.KeyboardButton(t) for t in row] for row in rows],
+            resize_keyboard=True,
+            one_time_keyboard=False,
+            is_persistent=True,
+        )
+
     async def send_message(
         self,
         chat_id: int,
         text: str,
-        keyboard: Optional[InlineKeyboardMarkup] = None,
+        keyboard: Optional[Union[InlineKeyboardMarkup, ReplyKeyboardMarkup]] = None,
     ) -> Optional[int]:
         """Отправить сообщение, повторяя при сетевых сбоях.
 

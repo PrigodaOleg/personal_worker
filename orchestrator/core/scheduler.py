@@ -26,14 +26,16 @@ import os
 import re
 import shutil
 import tempfile
+import time
 from datetime import datetime, timedelta
 from typing import Optional
 
 from orchestrator.adapters.github import GitHubAdapter
 from orchestrator.adapters.imac import IMacAdapter
 from orchestrator.adapters.openhands import OpenHandsAdapter
-from orchestrator.adapters.telegram import TelegramAdapter
+from orchestrator.adapters.telegram import MENU_COMMANDS, TelegramAdapter
 from orchestrator.core.config import Config
+from orchestrator.core import pricing
 from orchestrator.core.state import StateStore
 from orchestrator.core.task import Task, TaskSource, TaskStatus
 from orchestrator.runners.ios import IOSRunner
@@ -79,6 +81,9 @@ class Scheduler:
         self.ios_runner = IOSRunner(imac=self.imac)
 
         self._pending_clarifications: dict[str, dict] = {}
+        # Ожидающие ответа пользователя ВОПРОСЫ АГЕНТА (в процессе работы):
+        # task.id -> {task, conversation_id, options, future, asked_at}.
+        self._pending_agent_questions: dict[str, dict] = {}
         self._pending_notifications: set = set()  # фоновые отправки в Telegram
         self._llm_configured: bool = False
         self._running_tasks: set[str] = set()  # задачи, которые выполняются в фоне
@@ -282,6 +287,37 @@ class Scheduler:
         """Модель задачи: своя, либо модель по умолчанию."""
         return self._strip_provider(task.model) or self._default_model()
 
+    async def _finalize_cost(self, task: Task) -> None:
+        """Посчитать стоимость работы модели (токены × сохранённые цены) в задаче.
+
+        Токены берём из llm_metrics OpenHands, цены — из БД (pricing.py).
+        Вызывается при завершении задачи (успех или ошибка, когда агент уже
+        поработал), чтобы цена попала в карточку и уведомление.
+        """
+        if not task.conversation_id:
+            return
+        try:
+            usage = await self.openhands.get_usage(task.conversation_id)
+            task.tokens_prompt = usage.get("prompt_tokens", 0)
+            task.tokens_completion = usage.get("completion_tokens", 0)
+            task.tokens_cache_read = usage.get("cache_read_tokens", 0)
+            cost_rub, _ = pricing.compute_cost(
+                self.state,
+                self._effective_model(task),
+                task.tokens_prompt,
+                task.tokens_completion,
+                task.tokens_cache_read,
+            )
+            task.cost_rub = cost_rub
+            self.state.save(task)
+            logger.info(
+                "[cost] task %s: %d in / %d out / %d cache → %.2f ₽",
+                task.id, task.tokens_prompt, task.tokens_completion,
+                task.tokens_cache_read, cost_rub,
+            )
+        except Exception as exc:  # noqa: BLE001 - стоимость не должна ломать пайплайн
+            logger.warning("[cost] finalize failed for %s: %s", task.id, exc)
+
     async def _fetch_models(self) -> list[str]:
         """Список доступных моделей (с кэшем)."""
         cached = getattr(self, "_models_cache", None)
@@ -468,10 +504,25 @@ class Scheduler:
             return
         chat_id = str(msg["chat_id"])
 
+        # Кнопки постоянного меню превращаем в команды (текст кнопки = команда).
+        mapped = MENU_COMMANDS.get(text)
+        if mapped:
+            text = mapped
+
         # Команды бота — обрабатываем синхронно, не блокируем
         if text.startswith("/"):
             await self._handle_telegram_command(chat_id, text)
             return
+
+        # Ответ на вопрос АГЕНТА (задан в процессе работы) — отправляем ему.
+        for _tid, qinfo in self._pending_agent_questions.items():
+            qtask = qinfo["task"]
+            if qtask.source == TaskSource.TELEGRAM and qtask.source_id == chat_id:
+                fut = qinfo["future"]
+                if fut and not fut.done():
+                    fut.set_result(text)
+                logger.info("[agent-question] answer from chat %s: %s", chat_id, text[:50])
+                return
 
         # 1. Если есть ожидающееся уточнение для этого чата — это ответ
         pending = [
@@ -613,15 +664,27 @@ class Scheduler:
         chat_id_int = int(chat_id)
         logger.info("[telegram] command from %s: %s", chat_id, text)
 
+        if cmd == "/start":
+            await self.telegram.send_message(
+                chat_id_int,
+                "🤖 Личный помощник по Flutter-задачам.\n\n"
+                "Просто напишите задачу — и я начну её выполнять.\n"
+                "Модель по умолчанию: "
+                f"{self._default_model()}\n\n"
+                "Используйте меню внизу:",
+                keyboard=self.telegram.build_menu_keyboard(),
+            )
+            return
+
         if cmd == "/help":
             await self.telegram.send_message(
                 chat_id_int,
-                "🤖 Доступные команды:\n"
-                "/status — состояние текущей задачи\n"
-                "/tasks — все задачи, результаты и ссылки на PR\n"
-                "/model — модель LLM по умолчанию\n"
-                "/cancel — отменить текущую задачу\n"
-                "/help — эта справка\n"
+                "🤖 Доступные команды (или кнопки меню):\n"
+                "📊 Статус — состояние текущей задачи\n"
+                "📋 Задачи — все задачи, результаты и ссылки на PR\n"
+                "🧠 Модель — модель LLM по умолчанию\n"
+                "🚫 Отмена — отменить текущую задачу\n"
+                "❓ Помощь — эта справка\n"
                 "\nПросто напишите задачу в свободной форме — и я начну её выполнять.",
             )
             return
@@ -636,7 +699,8 @@ class Scheduler:
                     chat_id_int,
                     f"{emoji} Задача: «{active.title[:60]}»\n"
                     f"Статус: {self._task_status_label(active.status)}\n"
-                    f"Модель: {self._effective_model(active)}\n\n"
+                    f"Модель: {self._effective_model(active)}\n"
+                    f"Стоимость: {self._cost_line(active)}\n\n"
                     f"📊 Слои:\n{layers}\n\n"
                     f"📋 Что делает агент:\n{activity}",
                     keyboard=self._task_actions_keyboard(active),
@@ -732,10 +796,20 @@ class Scheduler:
             f"Статус: {self._task_status_label(task.status)}\n"
             f"Модель: {model}\n"
             f"Попытка: {task.attempt}\n"
+            f"Стоимость: {self._cost_line(task)}\n"
             f"PR: {pr}\n"
             f"Создана: {created}"
         )
         return card
+
+    def _cost_line(self, task: Task) -> str:
+        if not task.tokens_prompt and not task.tokens_completion and not task.cost_rub:
+            return "—"
+        return (
+            f"{task.cost_rub:.2f} ₽ "
+            f"(вход {task.tokens_prompt:,} / выход {task.tokens_completion:,} ток.)"
+            .replace(",", " ")
+        )
 
     async def _send_task_list(self, chat_id_int: int, chat_id: str, page: int,
                               message_id: Optional[int] = None) -> None:
@@ -821,6 +895,25 @@ class Scheduler:
         chat_id_int = int(chat_id) if chat_id is not None else 0
 
         if data == "noop":
+            return
+
+        if data.startswith("ans:"):
+            _, ans_task_id, ans_idx = data.split(":", 2)
+            qinfo = self._pending_agent_questions.get(ans_task_id)
+            if qinfo:
+                opts = qinfo["options"]
+                try:
+                    i = int(ans_idx)
+                except (TypeError, ValueError):
+                    i = -1
+                answer = opts[i] if 0 <= i < len(opts) else ""
+                if answer:
+                    fut = qinfo["future"]
+                    if fut and not fut.done():
+                        fut.set_result(answer)
+                    await self.telegram.answer_callback_query(
+                        query["callback_query_id"], f"✅ {answer[:32]}"
+                    )
             return
 
         if data == "menu":
@@ -1167,6 +1260,76 @@ class Scheduler:
 
         await self._monitor_openhands(task, conversation_id, client_dir)
 
+    _QUESTION_OPT_RE = re.compile(r"^\s*(?:[-*•]|\(?\d{1,2}[.)\]]|\(?[A-Za-z][.)])\s+(.+)$")
+
+    def _parse_question_options(self, question: str) -> tuple[str, list[str]]:
+        """Извлечь варианты ответа из текста вопроса (нумерованные/буллиты).
+
+        Варианты показываем кнопками; если пунктов меньше 2 — свободный ввод.
+        """
+        options: list[str] = []
+        for ln in question.splitlines():
+            m = self._QUESTION_OPT_RE.match(ln)
+            if m:
+                opt = m.group(1).strip()
+                if opt:
+                    options.append(opt)
+        return question, options
+
+    async def _handle_agent_question(self, task: Task, conversation_id: str,
+                                     question: str) -> bool:
+        """Показать вопрос агента, дождаться ответа и отправить его в разговор.
+
+        Варианты из вопроса показываются кнопками; свободный текст тоже
+        принимается. Ответ уходит в тот же разговор через send_message, чтобы
+        агент продолжил работу. True — ответ доставлен.
+        """
+        text, options = self._parse_question_options(question)
+        fut = asyncio.get_event_loop().create_future()
+        self._pending_agent_questions[task.id] = {
+            "task": task,
+            "conversation_id": conversation_id,
+            "options": options,
+            "future": fut,
+            "asked_at": datetime.utcnow(),
+        }
+
+        if task.source == TaskSource.TELEGRAM:
+            chat_id = int(task.source_id)
+            keyboard = None
+            if len(options) >= 2:
+                rows = [[(opt[:48], f"ans:{task.id}:{i}")] for i, opt in enumerate(options)]
+                keyboard = self.telegram.build_keyboard(rows)
+            await self.telegram.send_message(chat_id, f"❓ {text}", keyboard=keyboard)
+            if keyboard is None:
+                await self.telegram.send_message(
+                    chat_id, "✍️ Ответьте на вопрос текстом."
+                )
+        elif task.source == TaskSource.GITHUB:
+            try:
+                self.github.create_comment(int(task.source_id), f"❓ {text}")
+            except Exception as exc:  # noqa: BLE001
+                logger.error("[agent-question] github comment failed: %s", exc)
+
+        logger.info("[agent-question] task %s waiting for user answer", task.id)
+        try:
+            answer = await asyncio.wait_for(
+                fut, timeout=self.config.clarification_timeout_seconds
+            )
+        except asyncio.TimeoutError:
+            self._pending_agent_questions.pop(task.id, None)
+            return False
+
+        self._pending_agent_questions.pop(task.id, None)
+        try:
+            await self.openhands.send_message(conversation_id, answer)
+            task.add_log(f"Ответ пользователю отправлен агенту: {answer[:60]}")
+            self.state.save(task)
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.error("[agent-question] send answer failed: %s", exc)
+            return False
+
     async def _monitor_openhands(self, task: Task, conversation_id: str, client_dir: str) -> None:
         """Мониторит сессию OpenHands: уточнения, завершение, ошибки.
 
@@ -1187,6 +1350,7 @@ class Scheduler:
                         f"OpenHands: состояние агента недоступно "
                         f"({info.get('error')})"
                     )
+                    await self._finalize_cost(task)
                     self.state.save(task)
                     log_text = "\n".join(task.log[-15:]) if task.log else ""
                     self._notify_author(
@@ -1206,16 +1370,28 @@ class Scheduler:
 
             state_misses = 0
 
-            # Агент ждёт ответа пользователя — либо задача выполнена, либо
-            # задан вопрос. Различаем по последнему сообщению агента.
+            # Агент ждёт ответа пользователя — либо вопрос, либо финальный отчёт.
             if state_val == "awaiting_user_input":
                 message = (info.get("message") or "").strip()
-                if self._looks_like_clarification(message):
-                    task.status = TaskStatus.CLARIFYING
-                    task.clarification_question = message
-                    self.state.save(task)
-                    await self._ask_clarification(task)
-                    return
+                wants_response = bool(info.get("wait_for_response"))
+                if wants_response or self._looks_like_clarification(message):
+                    # Вопрос агента в процессе работы: показываем, ждём ответ,
+                    # отправляем в тот же разговор и продолжаем мониторинг.
+                    answered = await self._handle_agent_question(
+                        task, conversation_id, message
+                    )
+                    if not answered:
+                        task.status = TaskStatus.FAILED
+                        task.add_log("Ответ на вопрос агента не получен (таймаут)")
+                        await self._finalize_cost(task)
+                        self.state.save(task)
+                        self._notify_author(
+                            task,
+                            "⏰ Не дождался ответа на вопрос — задача остановлена.\n"
+                            f"Вопрос был: {message[:200]}",
+                        )
+                        return
+                    continue
                 task.status = TaskStatus.DONE
                 self.state.save(task)
                 task.add_log("OpenHands completed successfully")
@@ -1235,6 +1411,7 @@ class Scheduler:
                 error_msg = (info.get("message") or f"агент в состоянии {state_val}")
                 task.status = TaskStatus.FAILED
                 task.add_log(f"OpenHands failed: {error_msg}")
+                await self._finalize_cost(task)
                 self.state.save(task)
                 log_text = "\n".join(task.log[-15:]) if task.log else ""
                 self._notify_author(
@@ -1260,6 +1437,7 @@ class Scheduler:
                     return
                 task.status = TaskStatus.FAILED
                 task.add_log("OpenHands stopped before completion")
+                await self._finalize_cost(task)
                 self.state.save(task)
                 log_text = "\n".join(task.log[-15:]) if task.log else ""
                 self._notify_author(
@@ -1397,6 +1575,8 @@ class Scheduler:
         return {"status": "ok", "copied": copied, "removed": removed}
 
     async def _build_ios_and_create_pr(self, task: Task, client_dir: str) -> None:
+        # Считаем стоимость отработанной модели до итоговых действий.
+        await self._finalize_cost(task)
         # Сначала вытаскиваем правки агента из runtime-контейнера на хост,
         # иначе в PR не попадёт ничего.
         sync = await self._sync_changes_from_runtime(task, client_dir)
@@ -1547,11 +1727,28 @@ class Scheduler:
                 "asked_at": task.created_at,
             }
 
+        # Справочные метрики SWE и цены моделей: сид + первое обновление.
+        try:
+            pricing.seed_benchmarks(self.state)
+            await pricing.refresh_prices(self.state, self.openhands)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[loop] pricing init error: %s", exc)
+        price_refresh_interval = 6 * 3600  # обновлять цены раз в 6 часов
+        last_price_refresh = time.time()
+
         while True:
             try:
                 await self.poll_github()
             except Exception as exc:
                 logger.error("[loop] github poll error: %s", exc)
+
+            # Периодически обновляем цены моделей.
+            if time.time() - last_price_refresh > price_refresh_interval:
+                try:
+                    await pricing.refresh_prices(self.state, self.openhands)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("[loop] price refresh error: %s", exc)
+                last_price_refresh = time.time()
 
             # Обрабатываем задачи в статусе CLARIFYING (ожидание уточнений)
             for task in self.state.list_by_status(TaskStatus.CLARIFYING):

@@ -14,6 +14,7 @@ class StateStore:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(self.db_path))
+        self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._init_schema()
 
@@ -44,9 +45,39 @@ class StateStore:
             self._conn.execute("ALTER TABLE tasks ADD COLUMN model TEXT")
         if "attempt" not in existing:
             self._conn.execute("ALTER TABLE tasks ADD COLUMN attempt INTEGER NOT NULL DEFAULT 1")
+        for col in ("tokens_prompt", "tokens_completion", "tokens_cache_read"):
+            if col not in existing:
+                self._conn.execute(f"ALTER TABLE tasks ADD COLUMN {col} INTEGER NOT NULL DEFAULT 0")
+        if "cost_rub" not in existing:
+            self._conn.execute("ALTER TABLE tasks ADD COLUMN cost_rub REAL NOT NULL DEFAULT 0")
+        if "ui_message_id" not in existing:
+            self._conn.execute("ALTER TABLE tasks ADD COLUMN ui_message_id INTEGER")
         # Ключ-значение для настроек UI (например, модель по умолчанию).
         self._conn.execute(
             "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)"
+        )
+        # Цены моделей (USD за 1 токен) — обновляются периодически из provod.ai.
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS model_prices (
+                model TEXT PRIMARY KEY,
+                prompt_usd REAL NOT NULL DEFAULT 0,
+                completion_usd REAL NOT NULL DEFAULT 0,
+                cache_read_usd REAL NOT NULL DEFAULT 0,
+                updated_at TEXT
+            )
+            """
+        )
+        # Метрики SWE-bенчмарков (справочные, из отчёта цена/качество).
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS model_benchmarks (
+                model TEXT PRIMARY KEY,
+                swe_bench REAL,
+                note TEXT,
+                updated_at TEXT
+            )
+            """
         )
         self._conn.commit()
 
@@ -62,14 +93,62 @@ class StateStore:
         )
         self._conn.commit()
 
+    # ------------------------------------------------------------------ #
+    # Цены моделей (USD за 1 токен)
+    # ------------------------------------------------------------------ #
+    def upsert_price(self, model: str, prompt_usd: float, completion_usd: float,
+                     cache_read_usd: float) -> None:
+        from datetime import datetime
+        self._conn.execute(
+            "INSERT OR REPLACE INTO model_prices "
+            "(model, prompt_usd, completion_usd, cache_read_usd, updated_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (model, prompt_usd, completion_usd, cache_read_usd, datetime.utcnow().isoformat()),
+        )
+        self._conn.commit()
+
+    def get_price(self, model: str) -> dict | None:
+        row = self._conn.execute(
+            "SELECT * FROM model_prices WHERE model = ?", (model,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def get_all_prices(self) -> dict[str, dict]:
+        rows = self._conn.execute("SELECT * FROM model_prices").fetchall()
+        return {r["model"]: dict(r) for r in rows}
+
+    # ------------------------------------------------------------------ #
+    # Метрики SWE-бенчмарков (справочные)
+    # ------------------------------------------------------------------ #
+    def upsert_benchmark(self, model: str, swe_bench: float | None,
+                         note: str | None = None) -> None:
+        from datetime import datetime
+        self._conn.execute(
+            "INSERT OR REPLACE INTO model_benchmarks (model, swe_bench, note, updated_at) "
+            "VALUES (?, ?, ?, ?)",
+            (model, swe_bench, note, datetime.utcnow().isoformat()),
+        )
+        self._conn.commit()
+
+    def get_benchmark(self, model: str) -> dict | None:
+        row = self._conn.execute(
+            "SELECT * FROM model_benchmarks WHERE model = ?", (model,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def get_all_benchmarks(self) -> dict[str, dict]:
+        rows = self._conn.execute("SELECT * FROM model_benchmarks").fetchall()
+        return {r["model"]: dict(r) for r in rows}
+
     def save(self, task: Task) -> None:
         self._conn.execute(
             """
             INSERT OR REPLACE INTO tasks
             (id, source, source_id, title, description, status,
              clarification_question, clarification_answer, created_at, pr_url, log,
-             conversation_id, model, attempt)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             conversation_id, model, attempt, tokens_prompt, tokens_completion,
+             tokens_cache_read, cost_rub, ui_message_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 task.id,
@@ -86,6 +165,11 @@ class StateStore:
                 task.conversation_id,
                 task.model,
                 task.attempt,
+                task.tokens_prompt,
+                task.tokens_completion,
+                task.tokens_cache_read,
+                task.cost_rub,
+                task.ui_message_id,
             ),
         )
         self._conn.commit()
@@ -121,36 +205,40 @@ class StateStore:
         ).fetchall()
         return [self._row_to_task(r) for r in rows]
 
-    def _row_to_task(self, row: tuple) -> Task:
+    def _row_to_task(self, row: sqlite3.Row) -> Task:
         import datetime as _dt
 
         log_list = []
-        if row[10]:
+        if row["log"]:
             try:
-                log_list = ast.literal_eval(row[10])
+                log_list = ast.literal_eval(row["log"])
             except (ValueError, SyntaxError):
                 log_list = []
 
-        # row соответствует порядку SELECT *; читаем новые поля по наличию.
-        conversation_id = row[11] if len(row) > 11 else None
-        model = row[12] if len(row) > 12 else None
-        attempt = row[13] if len(row) > 13 and row[13] is not None else 1
+        def _num(key, default=0):
+            v = row[key]
+            return default if v is None else v
 
         return Task(
-            id=row[0],
-            source=TaskSource(row[1]),
-            source_id=row[2],
-            title=row[3],
-            description=row[4],
-            status=TaskStatus(row[5]),
-            clarification_question=row[6],
-            clarification_answer=row[7],
-            created_at=_dt.datetime.fromisoformat(row[8]),
-            pr_url=row[9],
+            id=row["id"],
+            source=TaskSource(row["source"]),
+            source_id=row["source_id"],
+            title=row["title"],
+            description=row["description"],
+            status=TaskStatus(row["status"]),
+            clarification_question=row["clarification_question"],
+            clarification_answer=row["clarification_answer"],
+            created_at=_dt.datetime.fromisoformat(row["created_at"]),
+            pr_url=row["pr_url"],
             log=log_list,
-            conversation_id=conversation_id,
-            model=model,
-            attempt=attempt,
+            conversation_id=row["conversation_id"],
+            model=row["model"],
+            attempt=_num("attempt", 1),
+            tokens_prompt=_num("tokens_prompt"),
+            tokens_completion=_num("tokens_completion"),
+            tokens_cache_read=_num("tokens_cache_read"),
+            cost_rub=_num("cost_rub"),
+            ui_message_id=row["ui_message_id"],
         )
 
     def close(self) -> None:

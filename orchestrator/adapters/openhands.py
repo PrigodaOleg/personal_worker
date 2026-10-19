@@ -148,6 +148,14 @@ class OpenHandsAdapter:
         Возвращает id моделей без префикса провайдера (например,
         `claude-sonnet-4.6`) — их удобно показывать в клавиатуре.
         """
+        raw = await self.list_models_raw()
+        if raw.get("status") != "ok":
+            return raw
+        models = sorted({m["id"].split("/", 1)[-1] for m in raw["models"] if m.get("id")})
+        return {"status": "ok", "models": models}
+
+    async def list_models_raw(self) -> dict:
+        """Полный список моделей с метаданными (цены, контекст и т.д.)."""
         if not self.llm_base_url or not self.llm_api_key:
             return {"status": "error", "error": "LLM не настроен"}
         url = self.llm_base_url.rstrip("/") + "/models"
@@ -157,16 +165,42 @@ class OpenHandsAdapter:
             r.raise_for_status()
             data = r.json()
             items = data.get("data", data) if isinstance(data, dict) else data
-            models = []
-            for m in items if isinstance(items, list) else []:
-                mid = m.get("id") if isinstance(m, dict) else m
-                if not mid:
-                    continue
-                models.append(mid.split("/", 1)[-1])  # убираем префикс провайдера
-            return {"status": "ok", "models": sorted(set(models))}
+            models = [m for m in items if isinstance(m, dict) and m.get("id")]
+            return {"status": "ok", "models": models}
         except httpx.HTTPError as exc:
-            logger.error("[openhands] list_models failed: %s", exc)
+            logger.error("[openhands] list_models_raw failed: %s", exc)
             return {"status": "error", "error": str(exc)}
+
+    async def get_usage(self, conversation_id: str) -> dict:
+        """Использование токенов разговором (из llm_metrics событий).
+
+        Возвращает накопленные токены: prompt/completion/cache_read. Источник —
+        `GET /api/conversations/{id}/events`, у событий есть `llm_metrics` с
+        `accumulated_token_usage`.
+        """
+        empty = {"prompt_tokens": 0, "completion_tokens": 0, "cache_read_tokens": 0}
+        try:
+            r = await self._client.get(
+                f"{self.base_url}/api/conversations/{conversation_id}/events",
+                headers=self._headers(),
+            )
+            r.raise_for_status()
+            events = r.json().get("events", [])
+        except httpx.HTTPError as exc:
+            logger.error("[openhands] get_usage failed: %s", exc)
+            return empty
+
+        acc = empty
+        for e in events:
+            metrics = e.get("llm_metrics") or {}
+            usage = metrics.get("accumulated_token_usage") or {}
+            if usage:
+                acc = {
+                    "prompt_tokens": usage.get("prompt_tokens", 0) or 0,
+                    "completion_tokens": usage.get("completion_tokens", 0) or 0,
+                    "cache_read_tokens": usage.get("cache_read_tokens", 0) or 0,
+                }
+        return acc
 
     async def create_conversation(
         self,
@@ -266,6 +300,7 @@ class OpenHandsAdapter:
         agent_state = None
         message = None
         completed = False
+        wait_for_response = False
         for event in events:
             if event.get("observation") == "agent_state_changed":
                 extras = event.get("extras") or {}
@@ -277,10 +312,13 @@ class OpenHandsAdapter:
                         completed = True
             if event.get("source") == "agent" and event.get("action") == "message":
                 message = event.get("message")
+                args = event.get("args") or {}
+                wait_for_response = bool(args.get("wait_for_response"))
 
         return {
             "agent_state": agent_state,
             "message": message,
+            "wait_for_response": wait_for_response,
             "completed": completed,
             "error": None,
         }
