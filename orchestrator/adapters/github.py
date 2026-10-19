@@ -48,6 +48,27 @@ class GitHubAdapter:
         self._gh = Github(auth=installation_auth)
         self._repo = self._gh.get_repo(self.repo_full_name)
 
+    def get_git_credentials(self) -> tuple[str, str]:
+        """Логин и токен для git push.
+
+        GitHub App нельзя аутентифицировать в git по логину/паролю, поэтому
+        используем installation token как пароль. Токен у PyGithub запрашивается
+        лениво, поэтому сначала прикрепляем requester через _ensure_auth().
+        """
+        self._ensure_auth()
+        assert self._gh is not None
+        # .token нельзя трогать до прикрепления requester — поэтому идём
+        # через авторизацию клиента, которая уже использована в запросах.
+        auth = self._gh.requester.auth
+        token = getattr(auth, "token", None)
+        if not token:
+            raise RuntimeError("не удалось получить installation token")
+        return "x-access-token", token
+
+    def repo_clone_url(self) -> str:
+        """URL репозитория для git clone/push."""
+        return f"https://github.com/{self.repo_full_name}.git"
+
     def fetch_open_issues(self) -> list[dict]:
         """Вернуть открытые issues с меткой self.label."""
         self._ensure_auth()

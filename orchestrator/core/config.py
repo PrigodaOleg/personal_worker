@@ -121,13 +121,55 @@ class Config:
         )
 
     # --- iMac ---
+    @staticmethod
+    def _placeholder(value: str | None) -> str | None:
+        """Значения-заглушки из .env.example (TODO_*) считаем ненастроенными.
+
+        Иначе шаг iOS запускается с вымышленным пользователем и падает,
+        вместо того чтобы честно пропуститься.
+        """
+        if not value:
+            return None
+        stripped = value.strip()
+        if not stripped or stripped.upper().startswith("TODO"):
+            return None
+        return stripped
+
+    @property
+    def git_author_name(self) -> str:
+        """Имя автора коммитов, создаваемых оркестратором."""
+        return self._env(
+            "GIT_AUTHOR_NAME", self._raw_get("git_author_name", default="")
+        ).strip() or "personal_worker"
+
+    @property
+    def git_author_email(self) -> str:
+        """Почта автора коммитов, создаваемых оркестратором."""
+        return self._env(
+            "GIT_AUTHOR_EMAIL", self._raw_get("git_author_email", default="")
+        ).strip() or "personal_worker@users.noreply.github.com"
+
+    @property
+    def pr_dry_run(self) -> bool:
+        """Режим dry-run для шага PR: пуш проверяется, но ничего не уходит на GitHub.
+
+        Полезно для сквозных прогонов — цикл проверяется целиком, а ветки и PR
+        в репозитории не появляются.
+        """
+        return self._env("PR_DRY_RUN", self._raw_get("pr_dry_run", default="")).strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+
     @property
     def imac_host(self) -> str | None:
-        return self._env("IMAC_HOST", self._raw_get("imac", "host"))
+        return self._placeholder(self._env("IMAC_HOST", self._raw_get("imac", "host")))
 
     @property
     def imac_user(self) -> str | None:
-        return self._env("IMAC_USER", self._raw_get("imac", "user"))
+        return self._placeholder(self._env("IMAC_USER", self._raw_get("imac", "user")))
 
     @property
     def imac_ssh_key(self) -> str:

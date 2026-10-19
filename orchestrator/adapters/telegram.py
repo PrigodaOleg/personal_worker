@@ -10,6 +10,7 @@ import asyncio
 import logging
 from typing import Optional
 
+import telegram
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -84,9 +85,43 @@ class TelegramAdapter:
             await self._app.stop()
             await self._app.shutdown()
 
-    async def send_message(self, chat_id: int, text: str) -> None:
+    async def connect(self) -> None:
+        """Поднять бота только на отправку (без поллинга).
+
+        Нужно для одноразовых прогонов и скриптов: уведомления уходят,
+        но входящие сообщения не обрабатываются.
+        """
         if self._app:
-            await self._app.bot.send_message(chat_id=chat_id, text=text)
+            return
+        self._app = ApplicationBuilder().token(self.bot_token).build()
+        await self._app.initialize()
+
+    async def close(self) -> None:
+        if self._app:
+            await self._app.shutdown()
+            self._app = None
+
+    async def send_message(self, chat_id: int, text: str) -> None:
+        """Отправить сообщение, повторяя при сетевых сбоях.
+
+        Telegram периодически отваливается по таймауту (особенно через VPN),
+        и без повторов уведомление о результате задачи просто теряется.
+        """
+        if not self._app:
+            return
+
+        last_exc: Exception | None = None
+        for attempt in range(1, 4):
+            try:
+                await self._app.bot.send_message(chat_id=chat_id, text=text)
+                return
+            except (telegram.error.TimedOut, telegram.error.NetworkError) as exc:
+                last_exc = exc
+                logger.warning(
+                    "[telegram] send failed (attempt %d/3): %s", attempt, exc
+                )
+                await asyncio.sleep(2 * attempt)
+        logger.error("[telegram] message not delivered after 3 attempts: %s", last_exc)
 
     async def ask_clarification(self, chat_id: int, question: str) -> str:
         """Задать уточняющий вопрос и вернуть будущий ответ."""

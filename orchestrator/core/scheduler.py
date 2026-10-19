@@ -19,10 +19,13 @@ flutter test / flutter build linux / flutter build web / flutter build apk.
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import logging
 import os
 import re
+import shutil
+import tempfile
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -75,6 +78,7 @@ class Scheduler:
         self.ios_runner = IOSRunner(imac=self.imac)
 
         self._pending_clarifications: dict[str, dict] = {}
+        self._pending_notifications: set = set()  # фоновые отправки в Telegram
         self._llm_configured: bool = False
         self._running_tasks: set[str] = set()  # задачи, которые выполняются в фоне
         # Имя контейнера сервера OpenHands — нужно для вывода логов в /status.
@@ -95,13 +99,78 @@ class Scheduler:
     def _workspace_for(self, task: Task) -> str:
         return os.path.join(self.config.work_dir, task.id)
 
+    async def _git_diff_summary(self, client_dir: str, limit: int = 20) -> str:
+        """Краткая сводка изменений для уведомления."""
+        proc = await asyncio.create_subprocess_exec(
+            "git", "-C", client_dir, "diff", "--stat", "HEAD~1", "HEAD",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=60)
+        text = out.decode("utf-8", errors="replace").strip()
+        if not text:
+            return "—"
+        lines = text.splitlines()
+        return "\n".join(lines[:limit])
+
+    @staticmethod
+    def _match_line_endings(content: bytes, reference: bytes) -> bytes:
+        """Привести переводы строк копируемого файла к стилю исходного.
+
+        Агент (и линтеры внутри контейнера) часто переписывают файлы,
+        меняя CRLF на LF. Если это не отфильтровать, в PR попадает файл
+        целиком «изменённым» — diff становится нечитаемым. Реальная правка
+        при этом сохраняется.
+        """
+        ref_crlf = reference.count(b"\r\n") > reference.count(b"\n") // 2
+        out_crlf = content.count(b"\r\n") > content.count(b"\n") // 2
+        if ref_crlf == out_crlf:
+            return content
+        if ref_crlf:  # исходник CRLF, копия LF -> разворачиваем в CRLF
+            return content.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
+        return content.replace(b"\r\n", b"\n")  # исходник LF, копия CRLF
+
+    def _write_matched(self, src_tmp: str, dst: str) -> None:
+        """Скопировать файл из контейнера, сохранив стиль переводов строк."""
+        with open(src_tmp, "rb") as fh:
+            content = fh.read()
+        if os.path.exists(dst):
+            with open(dst, "rb") as fh:
+                content = self._match_line_endings(content, fh.read())
+        os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
+        with open(dst, "wb") as fh:
+            fh.write(content)
+
+    def _git_auth_args(self) -> list[str]:
+        """Аргументы git для аутентификации и авторства коммитов.
+
+        Токен передаётся заголовком, а не в URL: иначе он утекает в
+        `git remote -v` и в логи ошибок git. Идентичность задаём явно —
+        в контейнере git обычно не настроен, и `git commit` падает с
+        "Author identity unknown".
+        """
+        user, token = self.github.get_git_credentials()
+        basic = base64.b64encode(f"{user}:{token}".encode()).decode()
+        author = self.config.git_author_name
+        email = self.config.git_author_email
+        return [
+            "-c", f"http.extraHeader=Authorization: Basic {basic}",
+            "-c", f"user.name={author}",
+            "-c", f"user.email={email}",
+        ]
+
     def _ensure_workspace(self, task: Task) -> str:
         ws = self._workspace_for(task)
         os.makedirs(ws, exist_ok=True)
         return ws
 
     def _notify_author(self, task: Task, text: str) -> None:
-        """Отправить уведомление автору задачи в исходном канале."""
+        """Отправить уведомление автору задачи в исходном канале.
+
+        Telegram-отправка асинхронная, поэтому запускаем её фоном. Задачу
+        обязательно держим в self._pending_notifications: иначе GC может
+        уничтожить её до отправки, и уведомление молча потеряется.
+        """
         if task.source == TaskSource.GITHUB:
             try:
                 num = int(task.source_id)
@@ -112,10 +181,17 @@ class Scheduler:
         elif task.source == TaskSource.TELEGRAM:
             try:
                 chat_id = int(task.source_id)
-                asyncio.create_task(self.telegram.send_message(chat_id, text))
-                logger.info("[notify] telegram message sent to %s", chat_id)
+                fut = asyncio.ensure_future(self.telegram.send_message(chat_id, text))
+                self._pending_notifications.add(fut)
+                fut.add_done_callback(self._pending_notifications.discard)
+                logger.info("[notify] telegram message queued for %s", chat_id)
             except Exception as exc:
                 logger.error("[notify] telegram send failed: %s", exc)
+
+    async def flush_notifications(self) -> None:
+        """Дождаться отправки всех отложенных уведомлений."""
+        if self._pending_notifications:
+            await asyncio.gather(*list(self._pending_notifications), return_exceptions=True)
 
     def _get_active_task_for_chat(self, chat_id: str) -> Optional[Task]:
         """Найти активную (не завершённую) задачу для этого chat_id."""
@@ -291,6 +367,37 @@ class Scheduler:
             return "— пусто"
         return "\n".join(rows[-lines:])
 
+    async def _collect_task_logs(self, task: Optional[Task], lines: int = 3) -> str:
+        """Что агент реально выполнял в runtime-контейнере.
+
+        Это команды и их вывод из траектории разговора — то есть лог самой
+        задачи, а не логи служебных процессов контейнера.
+        """
+        if not task or not task.conversation_id:
+            return "— задача ещё не запускалась в контейнере"
+
+        traj = await self.openhands.get_trajectory(task.conversation_id)
+        if traj.get("status") == "error":
+            return f"— не удалось получить траекторию: {traj.get('error')}"
+
+        events = traj.get("trajectory") or traj.get("events") or traj
+        if not isinstance(events, list):
+            return "— траектория пуста"
+
+        rows: list[str] = []
+        for event in events:
+            if event.get("observation") != "run":
+                continue
+            extras = event.get("extras") or {}
+            meta = extras.get("metadata") or {}
+            cmd = extras.get("command") or str(event.get("message") or "")
+            code = meta.get("exit_code")
+            rows.append(f"$ {cmd}\n  → exit {code}")
+
+        if not rows:
+            return "— агент ещё не выполнял команд"
+        return "\n".join(rows[-lines:])
+
     async def _collect_layer_logs(self, task: Optional[Task], lines: int = 3) -> str:
         """Последние строки логов всех трёх слоёв системы.
 
@@ -300,6 +407,7 @@ class Scheduler:
         orchestrator_log = (
             "\n".join(task.log[-lines:]) if task and task.log else "— нет записей"
         )
+        task_logs = await self._collect_task_logs(task, lines=lines)
 
         server = await self._tail_command(
             [
@@ -321,6 +429,7 @@ class Scheduler:
 
         return (
             f"\n\n🧭 Оркестратор:\n{truncate(orchestrator_log)}"
+            f"\n\n📋 Задача в контейнере:\n{truncate(task_logs)}"
             f"\n\n🖥 OpenHands сервер:\n{truncate(server)}"
             f"\n\n📦 Runtime-контейнер:\n{truncate(runtime)}"
         )
@@ -562,20 +671,26 @@ class Scheduler:
         client_dir = os.path.join(ws, "social_mind")
         repo_url = f"https://github.com/{self.config.github_repo}.git"
 
-        # Клонируем репозиторий в рабочую директорию (видимую из контейнера OpenHands)
+        # Клонируем репозиторий в рабочую директорию
         if not os.path.exists(os.path.join(client_dir, ".git")):
+            clone_cmd = ["git", *self._git_auth_args(), "clone", "--depth", "1", repo_url, client_dir]
             proc = await asyncio.create_subprocess_exec(
-                "git", "clone", "--depth", "1", repo_url, client_dir,
+                *clone_cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            await proc.communicate()
+            _, err = await proc.communicate()
+            if proc.returncode != 0:
+                logger.error("[git] clone failed: %s", err.decode("utf-8", errors="replace").strip())
 
-        # Инструкция для агента: внести изменения + запустить тесты и сборки внутри контейнера
+        # Инструкция для агента: внести изменения + запустить тесты и сборки внутри контейнера.
+        # Путь — ВНУТРИ runtime-контейнера: там проект лежит в /workspace/<repo>.
+        # (Путь /opt/openhands/workspace/... из хоста в контейнере не существует.)
         instruction = (
             f"{task.description}\n\n"
             "ТРЕБОВАНИЯ:\n"
-            "1. Работа в папке /opt/openhands/workspace/social_mind/domains/client\n"
+            "1. Работай в папке /workspace/social_mind/domains/client "
+            "(внутри контейнера проект лежит в /workspace/social_mind)\n"
             "2. После внесения изменений запусти:\n"
             "   - flutter test\n"
             "   - flutter build linux\n"
@@ -764,7 +879,141 @@ class Scheduler:
     # ------------------------------------------------------------------ #
     # iOS (на iMac) + PR
     # ------------------------------------------------------------------ #
+    async def _run_in_container(self, container: str, cmd: str) -> tuple[int, str, str]:
+        """Выполнить shell-команду внутри runtime-контейнера."""
+        proc = await asyncio.create_subprocess_exec(
+            "docker", "exec", container, "bash", "-lc", cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=300)
+        return (
+            proc.returncode,
+            out.decode("utf-8", errors="replace"),
+            err.decode("utf-8", errors="replace"),
+        )
+
+    async def _sync_changes_from_runtime(
+        self, task: Task, client_dir: str
+    ) -> dict:
+        """Перенести правки агента из runtime-контейнера на хост.
+
+        Агент работает в /workspace/social_mind внутри контейнера, а шаг PR
+        смотрит в рабочую копию на хосте. Контейнер ничего не монтирует
+        (Mounts: []), поэтому без копирования в PR попадает пустая ветка.
+
+        Копируем ТОЛЬКО реально изменённые файлы (список даёт git status внутри
+        контейнера): это и быстрее, и не тащит в коммит build/ и .dart_tool/.
+        """
+        if not task.conversation_id:
+            return {"status": "skipped", "reason": "нет conversation_id"}
+
+        container = f"openhands-runtime-{task.conversation_id}"
+        root = "/workspace/social_mind"
+
+        # База — origin/main: это коммит, с которого начинался клон. Смотрим на
+        # ВСЕ изменения с базы, включая те, что агент успел закоммитить внутри
+        # контейнера (git status показал бы только рабочее дерево и пропустил их).
+        async def _paths(cmd: str) -> list[str]:
+            code, out, err = await self._run_in_container(container, f"cd {root} && {cmd}")
+            if code != 0:
+                raise RuntimeError(err.strip() or f"{cmd}: код {code}")
+            return [p for p in out.split("\0") if p]
+
+        try:
+            changed = await _paths(
+                "git diff --name-only -z --diff-filter=ACMR origin/main"
+            )
+            deleted = await _paths(
+                "git diff --name-only -z --diff-filter=D origin/main"
+            )
+            # Новые (не отслеживаемые и не в .gitignore) файлы.
+            changed += await _paths("git ls-files --others --exclude-standard -z")
+        except RuntimeError as exc:
+            return {"status": "error", "error": str(exc)}
+
+        # Убираем дубли, сохраняя порядок.
+        seen: set[str] = set()
+        changed = [p for p in changed if not (p in seen or seen.add(p))]
+
+        copied = 0
+        # Временные файлы держим ВНЕ рабочей копии: иначе .pw-tmp попадёт
+        # в `git add -A` и уедет в PR.
+        staging = tempfile.mkdtemp(prefix="pw-sync-")
+        try:
+            for idx, raw in enumerate(changed):
+                is_dir = raw.endswith("/")
+                path = raw.rstrip("/")
+                dst = os.path.join(client_dir, path)
+                os.makedirs(os.path.dirname(dst) or client_dir, exist_ok=True)
+
+                tmp = os.path.join(staging, f"entry{idx}")
+                pull = await asyncio.create_subprocess_exec(
+                    "docker", "cp", f"{container}:{root}/{path}", tmp,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                _, perr = await asyncio.wait_for(pull.communicate(), timeout=120)
+                if pull.returncode != 0:
+                    return {
+                        "status": "error",
+                        "error": f"не удалось скопировать {path}: "
+                        + perr.decode("utf-8", errors="replace").strip(),
+                    }
+
+                if is_dir or os.path.isdir(tmp):
+                    # docker cp каталога распаковывает его СОДЕРЖИМОЕ в tmp.
+                    os.makedirs(dst, exist_ok=True)
+                    for src_root, _dirs, files in os.walk(tmp):
+                        rel = os.path.relpath(src_root, tmp)
+                        out_root = dst if rel == "." else os.path.join(dst, rel)
+                        os.makedirs(out_root, exist_ok=True)
+                        for name in files:
+                            self._write_matched(
+                                os.path.join(src_root, name),
+                                os.path.join(out_root, name),
+                            )
+                else:
+                    self._write_matched(tmp, dst)
+                copied += 1
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
+
+        removed = 0
+        for raw in deleted:
+            path = raw.rstrip("/")
+            dst = os.path.join(client_dir, path)
+            if os.path.isfile(dst):
+                os.remove(dst)
+                removed += 1
+
+        return {"status": "ok", "copied": copied, "removed": removed}
+
     async def _build_ios_and_create_pr(self, task: Task, client_dir: str) -> None:
+        # Сначала вытаскиваем правки агента из runtime-контейнера на хост,
+        # иначе в PR не попадёт ничего.
+        sync = await self._sync_changes_from_runtime(task, client_dir)
+        if sync.get("status") == "ok":
+            task.add_log(
+                f"Из контейнера: изменено {sync.get('copied')}, "
+                f"удалено {sync.get('removed')}"
+            )
+        elif sync.get("status") == "error":
+            task.status = TaskStatus.FAILED
+            task.add_log(f"Синхронизация из контейнера не удалась: {sync.get('error')}")
+            self.state.save(task)
+            log_text = "\n".join(task.log[-15:]) if task.log else ""
+            self._notify_author(
+                task,
+                "❌ Не удалось забрать правки агента из runtime-контейнера.\n\n"
+                f"Ошибка: {sync.get('error')}\n\n"
+                f"Лог выполнения:\n{log_text}",
+            )
+            return
+        else:
+            task.add_log(f"Синхронизация пропущена: {sync.get('reason')}")
+        self.state.save(task)
+
         # iOS на iMac, если настроен
         if self.config.imac_host and self.config.imac_user:
             task.add_log("Starting iOS build+test on iMac")
@@ -788,19 +1037,31 @@ class Scheduler:
 
         # Создаём ветку, коммит, пуш, PR
         branch = f"ai-task-{task.id}"
+        dry_run = self.config.pr_dry_run
         try:
-            await asyncio.create_subprocess_exec(
-                "git", "-C", client_dir, "checkout", "-b", branch,
-            )
-            await asyncio.create_subprocess_exec(
-                "git", "-C", client_dir, "add", "-A",
-            )
-            await asyncio.create_subprocess_exec(
-                "git", "-C", client_dir, "commit", "-m", f"AI task: {task.title}",
-            )
-            await asyncio.create_subprocess_exec(
-                "git", "-C", client_dir, "push", "origin", branch,
-            )
+            for git_cmd in (
+                ["checkout", "-b", branch],
+                ["add", "-A"],
+                ["commit", "-m", f"AI task: {task.title}"],
+                # В dry-run пуш только проверяется — на GitHub ничего не уходит.
+                (["push", "--dry-run", "-u", "origin", branch] if dry_run
+                 else ["push", "-u", "origin", branch]),
+            ):
+                proc = await asyncio.create_subprocess_exec(
+                    "git", "-C", client_dir, *self._git_auth_args(), *git_cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                out, err = await asyncio.wait_for(proc.communicate(), timeout=300)
+                if proc.returncode != 0:
+                    # Пустой коммит — не ошибка, если правок и вправду нет.
+                    msg = err.decode("utf-8", errors="replace").strip()
+                    if git_cmd[0] == "commit" and "nothing to commit" in msg:
+                        task.add_log("git: нет изменений для коммита")
+                        continue
+                    raise RuntimeError(f"git {' '.join(git_cmd)}: {msg}")
+                if dry_run and git_cmd[0] == "push":
+                    task.add_log("git push --dry-run: ветка проверена, на GitHub не отправлена")
         except Exception as exc:
             error_msg = str(exc)
             task.status = TaskStatus.FAILED
@@ -815,7 +1076,22 @@ class Scheduler:
             )
             return
 
-        pr_url = await self.github.create_pr(
+        if dry_run:
+            diff = await self._git_diff_summary(client_dir)
+            task.pr_url = f"(dry-run) ветка {branch} не отправлена"
+            task.status = TaskStatus.DONE
+            self.state.save(task)
+            task.add_log("PR пропущен: включён PR_DRY_RUN")
+            self._notify_author(
+                task,
+                f"✅ Задача выполнена (dry-run: PR не создавался).\n\n"
+                f"Ветка: {branch} (push --dry-run прошёл)\n\n"
+                f"Изменения:\n{diff}\n\n"
+                f"Лог выполнения:\n" + "\n".join(task.log[-10:]),
+            )
+            return
+
+        pr_url = self.github.create_pr(
             branch=branch,
             base="main",
             title=f"[AI] {task.title}",
