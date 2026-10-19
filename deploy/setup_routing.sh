@@ -7,7 +7,16 @@
 # ============================================================
 set -euo pipefail
 
-TELEGRAM_IP="149.154.166.110"
+# Официальные подсети Telegram (api.telegram.org балансируется по многим адресам,
+# поэтому одного IP недостаточно).
+TELEGRAM_NETS=(
+    "149.154.160.0/20"
+    "91.108.4.0/22"
+    "91.108.8.0/22"
+    "91.108.12.0/22"
+    "91.108.16.0/22"
+    "91.108.56.0/22"
+)
 VPN_DEV="tun0"
 VPN_GW="10.8.0.1"
 LAN_DEV="enp3s0"
@@ -45,9 +54,11 @@ log_info "Удалены маршруты по умолчанию через VPN
 ip route replace default via "$LAN_GW" dev "$LAN_DEV" metric 100 2>/dev/null || true
 log_info "Default route через $LAN_GW ($LAN_DEV)"
 
-# 3. Маршрут к API Telegram через VPN
-ip route replace "$TELEGRAM_IP" via "$VPN_GW" dev "$VPN_DEV" 2>/dev/null || true
-log_info "Маршрут к Telegram API ($TELEGRAM_IP) через $VPN_DEV"
+# 3. Маршруты к подсетям Telegram через VPN
+for tg_net in "${TELEGRAM_NETS[@]}"; do
+    ip route replace "$tg_net" via "$VPN_GW" dev "$VPN_DEV" 2>/dev/null || true
+    log_info "Маршрут к Telegram $tg_net через $VPN_DEV"
+done
 
 # 4. Исключения для VPN серверов (чтобы соединение с VPN шло через LAN, а не через сам VPN)
 for vpn_host in gmrgwztvzi.de.jdfsd.space l8i4sb2gnv.de.klek.it.com; do
@@ -78,6 +89,23 @@ for host in "$GHCR_HOST" "$DOCKER_HUB_HOST" "$DOCKER_CLOUDFLARE_HOST"; do
         log_warn "Не удалось разрешить имя $host, пропускаем"
     fi
 done
+
+# 6. Проверка: всё, кроме Telegram и registry, должно идти через LAN.
+# OpenVPN любит возвращать 0.0.0.0/1 и 128.0.0.0/1 при переподключении,
+# что перехватывает в том числе трафик к LLM (api.provod.ai) и ломает агента.
+verify_via_lan() {
+    local host="$1"
+    local ip
+    ip=$(getent hosts "$host" 2>/dev/null | awk '{print $1}' | head -1 || true)
+    [ -z "$ip" ] && { log_warn "Не удалось разрешить $host, проверка пропущена"; return 0; }
+    if ip route get "$ip" 2>/dev/null | grep -q "dev $VPN_DEV"; then
+        log_err "$host ($ip) всё ещё идёт через $VPN_DEV — split-routing не применился"
+        return 1
+    fi
+    log_info "$host ($ip) идёт через LAN — ок"
+}
+
+verify_via_lan "api.provod.ai" || true
 
 log_info "Маршрутизация настроена успешно"
 echo "=== Текущие маршруты ==="

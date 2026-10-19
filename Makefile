@@ -1,4 +1,4 @@
-.PHONY: install run up down lint test fmt vpn-up routing vpn-status
+.PHONY: install run up down lint test fmt vpn-up routing vpn-status runtime-image openhands-up
 
 VENV := .venv
 PIP := $(VENV)/bin/pip
@@ -30,15 +30,33 @@ vpn-up:
 routing: vpn-up
 	sudo bash deploy/setup_routing.sh
 
-# Запуск оркестратора (с предварительной настройкой VPN и маршрутизации)
-run: routing
+# Образ дочернего runtime-контейнера с Flutter.
+# Агент выполняет команды именно в нём, поэтому Flutter нужен здесь,
+# а не в образе сервера OpenHands.
+runtime-image:
+	sudo docker build -t personal_worker-runtime-flutter:latest \
+		-f docker/runtime-flutter/Dockerfile docker/runtime-flutter
+
+# Поднять OpenHands (сервер) после сборки runtime-образа
+openhands-up: runtime-image
+	sudo docker compose up -d --build
+	@echo "[openhands] ожидание готовности..."
+	@for i in $$(seq 1 30); do \
+		if curl -sf -m 3 -o /dev/null http://localhost:3000/; then \
+			echo "[openhands] готов на http://localhost:3000"; exit 0; \
+		fi; \
+		sleep 2; \
+	done; \
+	echo "[openhands] не ответил за 60с, смотрите: sudo docker logs openhands-flutter"; exit 1
+
+# Запуск оркестратора (VPN, маршрутизация и OpenHands поднимаются сами)
+run: routing openhands-up
 	$(PYTHON) -m orchestrator.main
 
-up:
-	docker compose up -d
+up: openhands-up
 
 down:
-	docker compose down
+	sudo docker compose down
 
 vpn-status:
 	@echo "=== Сетевые интерфейсы ==="
