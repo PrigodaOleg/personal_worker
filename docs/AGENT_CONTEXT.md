@@ -130,20 +130,39 @@ curl -s -H "Authorization: Bearer $OPENHANDS_API_KEY" \
 `<CONV_ID>` берётся из поля `conversation_id` задачи в `state/orchestrator.sqlite`
 или из имени runtime-контейнера.
 
-Интерфейс Telegram (кнопки/инлайн-клавиатура):
+Интерфейс Telegram (постоянное меню-кнопки + инлайн-клавиатура). Слэг-команды,
+кроме `/start`, заменены кнопками меню (`ReplyKeyboardMarkup`); кнопка шлёт текст,
+который маршрутизируется в ту же команду:
 
-- `/status` — статус текущей задачи эмодзи, простые статусы трёх слоёв
-  (оркестратор/OpenHands/runtime — 🟢/🔴/⚪) и **логи траектории** агента
-  (реальные команды и exit-коды — это самое информативное).
-- `/tasks` — все прошлые задачи (GitHub 🐙 + Telegram 💬) с результатами и
-  ссылками на PR, пагинация; у каждой — карточка с кнопками
+- `📊 Статус` (`/status`) — статус текущей задачи эмодзи, простые статусы трёх
+  слоёв (оркестратор/OpenHands/runtime — 🟢/🔴/⚪), **цена работы** и **логи
+  траектории** агента (реальные команды и exit-коды — самое информативное).
+- `📋 Задачи` (`/tasks`) — все прошлые задачи (GitHub 🐙 + Telegram 💬) с
+  результатами, ссылками на PR и ценой, пагинация; у каждой — карточка с кнопками
   «🔄 Перезапустить», «🧠 Модель», «📖 Логи».
-- `/model` — модель LLM **по умолчанию** (для новых задач).
-- Выбор модели — из списка доступных (`GET $OPENHANDS_LLM_BASE_URL/models`):
-  шорт-лист (сильнейшая модель каждого семейства) + кнопка «📋 Все модели»
-  (пагинация). Модель можно задать и для **упавшей** задачи, затем
-  перезапустить её — ветка PR берётся с суффиксом `-r<attempt>`, чтобы не
-  конфликтовать с прошлым прогоном.
+- `🧠 Модель` (`/model`) — модель LLM **по умолчанию** (для новых задач).
+- `🚫 Отмена` (`/cancel`), `❓ Помощь` (`/help`).
+
+Выбор модели — из списка доступных (`GET $OPENHANDS_LLM_BASE_URL/models`):
+шорт-лист (сильнейшая модель каждого семейства) + кнопка «📋 Все модели»
+(пагинация). Модель можно задать и для **упавшей** задачи, затем перезапустить
+её — ветка PR берётся с суффиксом `-r<attempt>`, чтобы не конфликтовать с прошлым
+прогоном.
+
+**Стоимость работы.** Считается как токены (из `llm_metrics` OpenHands:
+`GET /api/conversations/{id}/events` → `llm_metrics.accumulated_token_usage`) ×
+сохранённые цены модели, в ₽ (курс `rub_per_usd`, по умолчанию 82.8). Цены
+(USD/токен из `GET /v1/models` → `pricing`) и метрики **SWE-бенчмарков** (из
+отчёта «provod.ai → Flutter: цена/качество») лежат в БД (`model_prices`,
+`model_benchmarks`); цены обновляются автоматически раз в 6 часов. Модуль —
+`orchestrator/core/pricing.py`. Цена показывается в карточке задачи и `/status`.
+
+**Вопросы агента (в процессе работы).** Когда модель ждёт ответа
+(`awaiting_user_input`, сигнал `wait_for_response` в `MessageAction.args`),
+оркестратор показывает вопрос пользователю: варианты ответа, извлечённые из
+текста (нумерованные `1) 2) 3)`, буллиты `-`, буквы `A) B)`) — кнопками; если
+пунктов нет, ответ — свободным текстом. Ответ уходит **в тот же разговор** через
+`send_message` (не перезапуская задачу), после чего мониторинг продолжается.
 
 Прибрать простаивающие runtime-контейнеры (безопасно, когда задача не идёт —
 проверьте `/status`):
@@ -155,8 +174,12 @@ docker rm -f $(docker ps -aq --filter "name=openhands-runtime")
 ## Сеть
 
 - Этот хост `192.168.88.15` (enp3s0, шлюз `192.168.88.1`), iMac `192.168.88.20`.
-- VPN tun0, шлюз `10.8.0.1`. Через VPN идёт **только Telegram**.
-- `api.provod.ai` = `158.160.9.95`, обязательно через LAN.
+- VPN tun0, шлюз `10.8.0.1`. Через VPN идёт **только Telegram** (и реестры Docker).
+- `api.provod.ai` = `158.160.9.95`, идёт через LAN, мимо VPN. Маршрут —
+  конкретный `/32` через `enp3s0` (`deploy/setup_routing.sh`, шаг 3b): он
+  специфичнее blanket `0.0.0.0/1` от OpenVPN и переживает переподключение VPN.
+  Агент в runtime-контейнере ходит в provod.ai через хост-NAT → LAN, поэтому
+  работает и без VPN.
 - Реестры Docker — через зеркала в `/etc/docker/daemon.json` (там же
   `data-root: /mnt/ssd/docker`).
 
@@ -165,7 +188,10 @@ docker rm -f $(docker ps -aq --filter "name=openhands-runtime")
 `POST /api/settings`, `POST /api/add-git-providers`,
 `POST /api/conversations` (поля `initial_user_msg`, `repository`,
 `selected_branch`), `POST /api/conversations/{id}/start`,
-`GET /api/conversations/{id}`, `GET /api/conversations/{id}/trajectory`.
+`GET /api/conversations/{id}`, `GET /api/conversations/{id}/trajectory`,
+`GET /api/conversations/{id}/events` (у событий есть `llm_metrics` с
+`accumulated_token_usage` — источник токенов для цены), `POST /api/conversations/{id}/message` (отправить ответ агенту, см. «Вопросы агента»). У провайдера также
+`GET /v1/usage` (суммарная статистика) и `GET /v1/models` (цены).
 
 GitHub App через PyGithub 2.5.0: `AppAuth` + `get_installation_auth()`, затем
 `Github(auth=installation_auth)`. Не обращайтесь к `.token` до того, как

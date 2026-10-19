@@ -60,6 +60,19 @@ for tg_net in "${TELEGRAM_NETS[@]}"; do
     log_info "Маршрут к Telegram $tg_net через $VPN_DEV"
 done
 
+# 3b. LLM (provod.ai) — через LAN, мимо VPN. Конкретный /32-маршрут переживает
+# переподключение VPN: OpenVPN возвращает blanket 0.0.0.0/1, но /32 специфичнее
+# и всегда побеждает. Агент в runtime-контейнере ходит в provod.ai через хост (NAT),
+# поэтому этого маршрута достаточно, чтобы и контейнер шёл мимо VPN.
+LLM_HOSTS=( "api.provod.ai" )
+for llm_host in "${LLM_HOSTS[@]}"; do
+    while read -r llm_ip; do
+        [ -z "$llm_ip" ] && continue
+        ip route replace "$llm_ip/32" via "$LAN_GW" dev "$LAN_DEV" 2>/dev/null || true
+        log_info "LLM $llm_host ($llm_ip/32) через $LAN_DEV (без VPN)"
+    done < <(getent ahostsv4 "$llm_host" 2>/dev/null | awk '{print $1}' | sort -u)
+done
+
 # 4. Исключения для VPN серверов (чтобы соединение с VPN шло через LAN, а не через сам VPN)
 for vpn_host in gmrgwztvzi.de.jdfsd.space l8i4sb2gnv.de.klek.it.com; do
     vpn_ip=$(getent hosts "$vpn_host" 2>/dev/null | awk '{print $1}' | head -1 || true)
