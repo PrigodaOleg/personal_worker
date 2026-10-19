@@ -36,6 +36,9 @@ class Task:
     created_at: datetime = field(default_factory=datetime.utcnow)
     pr_url: Optional[str] = None
     log: list[str] = field(default_factory=list)
+    # ID разговора OpenHands. Нужен, чтобы найти runtime-контейнер задачи
+    # (он называется openhands-runtime-<conversation_id>) и показать его логи.
+    conversation_id: Optional[str] = None
 
     def add_log(self, message: str) -> None:
         self.log.append(f"[{datetime.utcnow().isoformat()}] {message}")

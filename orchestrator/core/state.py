@@ -31,10 +31,15 @@ class StateStore:
                 clarification_answer TEXT,
                 created_at TEXT NOT NULL,
                 pr_url TEXT,
-                log TEXT NOT NULL DEFAULT '[]'
+                log TEXT NOT NULL DEFAULT '[]',
+                conversation_id TEXT
             )
             """
         )
+        # Миграция для БД, созданных до появления conversation_id.
+        existing = {r[1] for r in self._conn.execute("PRAGMA table_info(tasks)")}
+        if "conversation_id" not in existing:
+            self._conn.execute("ALTER TABLE tasks ADD COLUMN conversation_id TEXT")
         self._conn.commit()
 
     def save(self, task: Task) -> None:
@@ -42,8 +47,9 @@ class StateStore:
             """
             INSERT OR REPLACE INTO tasks
             (id, source, source_id, title, description, status,
-             clarification_question, clarification_answer, created_at, pr_url, log)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             clarification_question, clarification_answer, created_at, pr_url, log,
+             conversation_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 task.id,
@@ -57,6 +63,7 @@ class StateStore:
                 task.created_at.isoformat(),
                 task.pr_url,
                 str(task.log),
+                task.conversation_id,
             ),
         )
         self._conn.commit()
@@ -98,6 +105,7 @@ class StateStore:
             created_at=_dt.datetime.fromisoformat(row[8]),
             pr_url=row[9],
             log=log_list,
+            conversation_id=row[11] if len(row) > 11 else None,
         )
 
     def close(self) -> None:

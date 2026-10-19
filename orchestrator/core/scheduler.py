@@ -22,6 +22,7 @@ import asyncio
 import hashlib
 import logging
 import os
+import re
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -76,6 +77,10 @@ class Scheduler:
         self._pending_clarifications: dict[str, dict] = {}
         self._llm_configured: bool = False
         self._running_tasks: set[str] = set()  # задачи, которые выполняются в фоне
+        # Имя контейнера сервера OpenHands — нужно для вывода логов в /status.
+        self.openhands_container: str = os.getenv(
+            "OPENHANDS_CONTAINER", "openhands-flutter"
+        )
 
     # ------------------------------------------------------------------ #
     # Вспомогательные
@@ -258,6 +263,65 @@ class Scheduler:
         # Запускаем обработку задачи в фоне — не блокируем Telegram
         asyncio.create_task(self._process_task(task))
 
+    async def _tail_command(self, cmd: list[str], lines: int = 3) -> str:
+        """Выполнить команду и вернуть последние `lines` непустых строк вывода."""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+        except asyncio.TimeoutError:
+            return "— таймаут чтения логов"
+        except FileNotFoundError:
+            return f"— команда {cmd[0]} не найдена"
+        except Exception as exc:  # noqa: BLE001 - диагностика не должна ломать /status
+            return f"— ошибка чтения: {exc}"
+
+        text = out.decode("utf-8", errors="replace")
+        # Убираем ANSI-коды, которыми OpenHands раскрашивает логи:
+        # в Telegram они выглядят мусором.
+        text = re.sub(r"\x1b\[[0-9;]*m", "", text)
+        rows = [r.strip() for r in text.splitlines() if r.strip()]
+        if not rows:
+            return "— пусто"
+        return "\n".join(rows[-lines:])
+
+    async def _collect_layer_logs(self, task: Optional[Task], lines: int = 3) -> str:
+        """Последние строки логов всех трёх слоёв системы.
+
+        Слои: оркестратор (этот процесс), сервер OpenHands и runtime-контейнер,
+        в котором агент выполняет команды.
+        """
+        orchestrator_log = (
+            "\n".join(task.log[-lines:]) if task and task.log else "— нет записей"
+        )
+
+        server = await self._tail_command(
+            [
+                "docker", "logs", "--tail", "60", self.openhands_container,
+            ],
+            lines=lines,
+        )
+
+        if task and task.conversation_id:
+            runtime_name = f"openhands-runtime-{task.conversation_id}"
+            runtime = await self._tail_command(
+                ["docker", "logs", "--tail", "60", runtime_name], lines=lines
+            )
+        else:
+            runtime = "— контейнер ещё не создан"
+
+        def truncate(block: str, limit: int = 500) -> str:
+            return block if len(block) <= limit else block[:limit] + "…"
+
+        return (
+            f"\n\n🧭 Оркестратор:\n{truncate(orchestrator_log)}"
+            f"\n\n🖥 OpenHands сервер:\n{truncate(server)}"
+            f"\n\n📦 Runtime-контейнер:\n{truncate(runtime)}"
+        )
+
     async def _handle_telegram_command(self, chat_id: str, text: str) -> None:
         """Обработка команд бота: /status, /cancel, /help."""
         parts = text.split()
@@ -288,25 +352,31 @@ class Scheduler:
                 if recent:
                     last = recent[-1]
                     emoji = self._task_status_emoji(last.status)
+                    logs = await self._collect_layer_logs(last)
                     await self.telegram.send_message(
                         chat_id_int,
                         f"{emoji} Последняя задача: «{last.title[:50]}…»\n"
                         f"Статус: {last.status.value}\n"
-                        f"PR: {last.pr_url or '—'}",
+                        f"PR: {last.pr_url or '—'}"
+                        f"{logs}",
                     )
                 else:
+                    logs = await self._collect_layer_logs(None)
                     await self.telegram.send_message(
                         chat_id_int,
-                        "🆕 У вас нет активных задач. Напишите мне задачу — и я начну.",
+                        "🆕 У вас нет активных задач. Напишите мне задачу — и я начну."
+                        f"{logs}",
                     )
             else:
                 emoji = self._task_status_emoji(active.status)
                 progress = "\n".join(active.log[-5:]) if active.log else ""
+                logs = await self._collect_layer_logs(active)
                 await self.telegram.send_message(
                     chat_id_int,
                     f"{emoji} Текущая задача: «{active.title[:50]}…»\n"
                     f"Статус: {active.status.value}\n"
-                    f"Прогресс:\n{progress}",
+                    f"Прогресс:\n{progress}"
+                    f"{logs}",
                 )
             return
 
@@ -559,6 +629,7 @@ class Scheduler:
             return
 
         task.add_log(f"OpenHands conversation created: {conversation_id}")
+        task.conversation_id = conversation_id
         self.state.save(task)
 
         # Запускаем agente loop
