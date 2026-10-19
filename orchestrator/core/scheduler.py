@@ -59,6 +59,7 @@ class Scheduler:
             allowed_usernames=config.telegram_allowed_usernames,
         )
         self.telegram.set_message_callback(self._on_telegram_message)
+        self.telegram.set_callback_query_callback(self._on_telegram_callback)
         self.openhands = OpenHandsAdapter(
             base_url=config.openhands_base_url,
             api_key=config.openhands_api_key,
@@ -220,6 +221,25 @@ class Scheduler:
                     return task
         return None
 
+    def _get_any_active_task(self, exclude_id: Optional[str] = None) -> Optional[Task]:
+        """Есть ли активная задача (любого источника), кроме exclude_id.
+
+        Используется при перезапуске: не стартуем новую задачу, пока не
+        завершилась другая, — иначе две задачи с разными моделями начнут
+        конфликтовать за глобальные настройки LLM в OpenHands.
+        """
+        active_statuses = [
+            TaskStatus.NEW,
+            TaskStatus.CLARIFYING,
+            TaskStatus.READY,
+            TaskStatus.RUNNING,
+        ]
+        for status in active_statuses:
+            for task in self.state.list_by_status(status):
+                if task.id != exclude_id:
+                    return task
+        return None
+
     def _task_status_emoji(self, status: TaskStatus) -> str:
         return {
             TaskStatus.NEW: "🆕",
@@ -230,6 +250,181 @@ class Scheduler:
             TaskStatus.FAILED: "❌",
             TaskStatus.CANCELLED: "🚫",
         }.get(status, "➖")
+
+    def _task_status_label(self, status: TaskStatus) -> str:
+        return {
+            TaskStatus.NEW: "новая",
+            TaskStatus.CLARIFYING: "ждёт уточнения",
+            TaskStatus.READY: "готова",
+            TaskStatus.RUNNING: "выполняется",
+            TaskStatus.DONE: "выполнена",
+            TaskStatus.FAILED: "ошибка",
+            TaskStatus.CANCELLED: "отменена",
+        }.get(status, "—")
+
+    # ------------------------------------------------------------------ #
+    # Модели LLM
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _strip_provider(model: Optional[str]) -> Optional[str]:
+        return model.split("/", 1)[-1] if model else None
+
+    def _default_model(self) -> str:
+        """Модель по умолчанию (для новых задач). Переопределяется из /model."""
+        stored = self.state.get_setting("default_model")
+        base = stored or self.config.openhands_llm_model or ""
+        return self._strip_provider(base) or ""
+
+    def _set_default_model(self, model: str) -> None:
+        self.state.set_setting("default_model", self._strip_provider(model) or model)
+
+    def _effective_model(self, task: Task) -> str:
+        """Модель задачи: своя, либо модель по умолчанию."""
+        return self._strip_provider(task.model) or self._default_model()
+
+    async def _fetch_models(self) -> list[str]:
+        """Список доступных моделей (с кэшем)."""
+        cached = getattr(self, "_models_cache", None)
+        if cached is not None:
+            return cached
+        res = await self.openhands.list_models()
+        models = res.get("models") or []
+        if models:
+            self._models_cache = models
+        return models
+
+    @staticmethod
+    def _model_version_key(model_id: str) -> tuple:
+        nums = tuple(int(x) for x in re.findall(r"\d+", model_id))
+        return (nums, model_id)
+
+    _LITE_SEGMENTS = {
+        "flash", "flashx", "mini", "nano", "lite", "haiku", "air", "turbo", "swift",
+    }
+
+    def _tier_score(self, model_id: str) -> int:
+        """Лёгкие/быстрые модели (flash/mini/lite) ранжируем ниже «полных».
+
+        Иначе новейший `qwen3.8-flash` вытеснил бы более сильный `qwen3.7-max`.
+        Сравниваем по целым сегментам: иначе бренды вроде «ge**mini**» и
+        «**mini**max» ошибочно попадут в «лёгкие».
+        """
+        segs = set(re.split(r"[-_.]", model_id.lower()))
+        return 0 if segs & self._LITE_SEGMENTS else 1
+
+    def _shortlist_models(self, models: list[str], current: str, default: str) -> list[str]:
+        """Сильнейшая/новейшая модель каждого семейства + текущая + по умолчанию.
+
+        Датированные снапшоты (вида `deepseek-v4-pro-0813`) из шорт-листа
+        исключаем — это не самостоятельные модели, а точки выгрузки.
+        """
+        base = [m for m in models if not re.search(r"-\d{4}$", m)]
+        families: dict[str, list[str]] = {}
+        for m in base:
+            fam = re.split(r"[-_.]", m)[0]
+            families.setdefault(fam, []).append(m)
+        short: list[str] = []
+        for lst in families.values():
+            best = max(lst, key=lambda m: (self._tier_score(m), self._model_version_key(m)))
+            short.append(best)
+        for extra in (current, default):
+            if extra and extra in models and extra not in short:
+                short.append(extra)
+        return sorted(set(short))
+
+    # ------------------------------------------------------------------ #
+    # Статусы слоёв (для /status)
+    # ------------------------------------------------------------------ #
+    async def _container_state(self, name: str) -> str:
+        proc = await asyncio.create_subprocess_exec(
+            "docker", "inspect", "--format",
+            "{{.State.Status}}{{if .State.Health}}/{{.State.Health.Status}}{{end}}",
+            name,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+        if proc.returncode != 0:
+            return "absent"
+        return out.decode("utf-8", errors="replace").strip() or "unknown"
+
+    @staticmethod
+    def _state_emoji(state: str) -> str:
+        if state in ("running", "healthy", "running/healthy"):
+            return "🟢"
+        if state == "absent":
+            return "⚪"
+        return "🔴"
+
+    async def _layer_status_block(self, task: Optional[Task]) -> str:
+        """Короткий статус трёх слоёв — без дампов логов."""
+        server = await self._container_state(self.openhands_container)
+        if task and task.conversation_id:
+            runtime = await self._container_state(
+                f"openhands-runtime-{task.conversation_id}"
+            )
+            runtime_line = f"{self._state_emoji(runtime)} runtime ({runtime})"
+        else:
+            runtime_line = "⚪ runtime (не создан)"
+        return (
+            f"{self._state_emoji('running')} оркестратор\n"
+            f"{self._state_emoji(server)} OpenHands ({server})\n"
+            f"{runtime_line}"
+        )
+
+    def _model_picker(
+        self, target: str, page: int, mode: str, current: str
+    ) -> tuple[str, list[list[tuple[str, str]]]]:
+        """Текст и кнопки выбора модели. target — 'default' или id задачи."""
+        models = getattr(self, "_models_cache", None) or []
+        default = self._default_model()
+        if mode == "a":
+            items = list(models)
+            title = "Все модели"
+        else:
+            items = self._shortlist_models(models, current, default)
+            title = "Рекомендуемые модели"
+
+        per_page = 8
+        pages = max(1, (len(items) + per_page - 1) // per_page)
+        page = max(0, min(page, pages - 1))
+        chunk = items[page * per_page:(page + 1) * per_page]
+
+        rows: list[list[tuple[str, str]]] = []
+        for i in range(0, len(chunk), 2):
+            row = []
+            for m in chunk[i:i + 2]:
+                mark = "✅ " if m == current else ""
+                row.append((f"{mark}{m}", f"ms:{target}:{page}:{mode}:{m}"))
+            rows.append(row)
+
+        # Навигация
+        nav: list[tuple[str, str]] = []
+        if page > 0:
+            nav.append(("⬅️", f"mp:{target}:{page - 1}:{mode}"))
+        nav.append((f"📄 {page + 1}/{pages}", f"noop"))
+        if page < pages - 1:
+            nav.append(("➡️", f"mp:{target}:{page + 1}:{mode}"))
+        rows.append(nav)
+
+        # Переключатель шорт-лист / все + отмена
+        toggle = "📋 Все модели" if mode == "s" else "⭐ Рекомендуемые"
+        new_mode = "a" if mode == "s" else "s"
+        rows.append([
+            (toggle, f"mp:{target}:0:{new_mode}"),
+            ("🔙 Назад", f"back:{target}"),
+        ])
+
+        label = "по умолчанию" if target == "default" else f"задачи {target[:8]}"
+        text = (
+            f"🧠 Модель {label}:\n"
+            f"Текущая: {current or '—'}\n"
+            f"Выберите из списка ({title}):\n\n"
+            f"⚠️ Если задача падает сразу — модель отклоняет параметры "
+            f"OpenHands, выберите другую."
+        )
+        return text, rows
+
 
     # ------------------------------------------------------------------ #
     # Приём задач из GitHub
@@ -411,42 +606,6 @@ class Scheduler:
             return "— агент ещё не выполнял команд"
         return "\n".join(rows[-lines:])
 
-    async def _collect_layer_logs(self, task: Optional[Task], lines: int = 3) -> str:
-        """Последние строки логов всех трёх слоёв системы.
-
-        Слои: оркестратор (этот процесс), сервер OpenHands и runtime-контейнер,
-        в котором агент выполняет команды.
-        """
-        orchestrator_log = (
-            "\n".join(task.log[-lines:]) if task and task.log else "— нет записей"
-        )
-        task_logs = await self._collect_task_logs(task, lines=lines)
-
-        server = await self._tail_command(
-            [
-                "docker", "logs", "--tail", "60", self.openhands_container,
-            ],
-            lines=lines,
-        )
-
-        if task and task.conversation_id:
-            runtime_name = f"openhands-runtime-{task.conversation_id}"
-            runtime = await self._tail_command(
-                ["docker", "logs", "--tail", "60", runtime_name], lines=lines
-            )
-        else:
-            runtime = "— контейнер ещё не создан"
-
-        def truncate(block: str, limit: int = 500) -> str:
-            return block if len(block) <= limit else block[:limit] + "…"
-
-        return (
-            f"\n\n🧭 Оркестратор:\n{truncate(orchestrator_log)}"
-            f"\n\n📋 Задача в контейнере:\n{truncate(task_logs)}"
-            f"\n\n🖥 OpenHands сервер:\n{truncate(server)}"
-            f"\n\n📦 Runtime-контейнер:\n{truncate(runtime)}"
-        )
-
     async def _handle_telegram_command(self, chat_id: str, text: str) -> None:
         """Обработка команд бота: /status, /cancel, /help."""
         parts = text.split()
@@ -458,51 +617,60 @@ class Scheduler:
             await self.telegram.send_message(
                 chat_id_int,
                 "🤖 Доступные команды:\n"
-                "/status — текущее состояние задачи\n"
+                "/status — состояние текущей задачи\n"
+                "/tasks — все задачи, результаты и ссылки на PR\n"
+                "/model — модель LLM по умолчанию\n"
                 "/cancel — отменить текущую задачу\n"
                 "/help — эта справка\n"
-                "\nПросто напишите задачу в свободной форме, и я начну её выполнять.",
+                "\nПросто напишите задачу в свободной форме — и я начну её выполнять.",
             )
             return
 
         if cmd == "/status":
             active = self._get_active_task_for_chat(chat_id)
-            if not active:
-                all_tasks = (
-                    self.state.list_by_status(TaskStatus.DONE)
-                    + self.state.list_by_status(TaskStatus.FAILED)
-                    + self.state.list_by_status(TaskStatus.CANCELLED)
-                )
-                recent = [t for t in all_tasks if t.source == TaskSource.TELEGRAM and t.source_id == chat_id]
-                if recent:
-                    last = recent[-1]
-                    emoji = self._task_status_emoji(last.status)
-                    logs = await self._collect_layer_logs(last)
-                    await self.telegram.send_message(
-                        chat_id_int,
-                        f"{emoji} Последняя задача: «{last.title[:50]}…»\n"
-                        f"Статус: {last.status.value}\n"
-                        f"PR: {last.pr_url or '—'}"
-                        f"{logs}",
-                    )
-                else:
-                    logs = await self._collect_layer_logs(None)
-                    await self.telegram.send_message(
-                        chat_id_int,
-                        "🆕 У вас нет активных задач. Напишите мне задачу — и я начну."
-                        f"{logs}",
-                    )
-            else:
+            if active:
                 emoji = self._task_status_emoji(active.status)
-                progress = "\n".join(active.log[-5:]) if active.log else ""
-                logs = await self._collect_layer_logs(active)
+                layers = await self._layer_status_block(active)
+                activity = await self._collect_task_logs(active, lines=6)
                 await self.telegram.send_message(
                     chat_id_int,
-                    f"{emoji} Текущая задача: «{active.title[:50]}…»\n"
-                    f"Статус: {active.status.value}\n"
-                    f"Прогресс:\n{progress}"
-                    f"{logs}",
+                    f"{emoji} Задача: «{active.title[:60]}»\n"
+                    f"Статус: {self._task_status_label(active.status)}\n"
+                    f"Модель: {self._effective_model(active)}\n\n"
+                    f"📊 Слои:\n{layers}\n\n"
+                    f"📋 Что делает агент:\n{activity}",
+                    keyboard=self._task_actions_keyboard(active),
                 )
+                return
+            # Активной нет — показываем последнюю задачу.
+            recent = self.state.list_for_chat(chat_id, limit=1)
+            if recent:
+                last = recent[0]
+                emoji = self._task_status_emoji(last.status)
+                layers = await self._layer_status_block(last)
+                await self.telegram.send_message(
+                    chat_id_int,
+                    f"{emoji} Последняя задача: «{last.title[:60]}»\n"
+                    f"Статус: {self._task_status_label(last.status)}\n"
+                    f"PR: {last.pr_url or '—'}\n\n"
+                    f"📊 Слои:\n{layers}",
+                    keyboard=self._task_actions_keyboard(last),
+                )
+            else:
+                await self.telegram.send_message(
+                    chat_id_int,
+                    "🆕 У вас нет задач. Напишите задачу — и я начну.",
+                )
+            return
+
+        if cmd == "/tasks":
+            await self._send_task_list(chat_id_int, chat_id, page=0)
+            return
+
+        if cmd == "/model":
+            current = self._default_model()
+            text, rows = self._model_picker("default", 0, "s", current)
+            await self.telegram.send_message(chat_id_int, text, keyboard=self.telegram.build_keyboard(rows))
             return
 
         if cmd == "/cancel":
@@ -527,6 +695,229 @@ class Scheduler:
             chat_id_int,
             "❓ Неизвестная команда. Используйте /help для справки.",
         )
+
+    # ------------------------------------------------------------------ #
+    # Telegram UI: список задач, карточка, кнопки, перезапуск
+    # ------------------------------------------------------------------ #
+    async def _reply(self, query: dict, text: str, keyboard=None) -> None:
+        """Ответить на нажатие кнопки: отредактировать сообщение, либо отправить."""
+        chat_id = query.get("chat_id")
+        message_id = query.get("message_id")
+        if chat_id and message_id:
+            await self.telegram.edit_message(chat_id, message_id, text, keyboard)
+        elif chat_id:
+            await self.telegram.send_message(chat_id, text, keyboard)
+
+    def _task_actions_keyboard(self, task: Task):
+        return self.telegram.build_keyboard([
+            [("🔄 Перезапустить", f"restart:{task.id}"),
+             ("🧠 Модель", f"model:{task.id}")],
+            [("📖 Логи", f"logs:{task.id}"),
+             ("📋 К списку", "tasks:0")],
+        ])
+
+    def _source_tag(self, task: Task) -> str:
+        return "🐙" if task.source == TaskSource.GITHUB else "💬"
+
+    def _task_card(self, task: Task) -> str:
+        emoji = self._task_status_emoji(task.status)
+        pr = task.pr_url or "—"
+        model = self._effective_model(task)
+        created = task.created_at.strftime("%Y-%m-%d %H:%M")
+        src = "GitHub" if task.source == TaskSource.GITHUB else "Telegram"
+        card = (
+            f"{emoji} {task.title[:70]}\n"
+            f"ID: {task.id}\n"
+            f"Источник: {self._source_tag(task)} {src}\n"
+            f"Статус: {self._task_status_label(task.status)}\n"
+            f"Модель: {model}\n"
+            f"Попытка: {task.attempt}\n"
+            f"PR: {pr}\n"
+            f"Создана: {created}"
+        )
+        return card
+
+    async def _send_task_list(self, chat_id_int: int, chat_id: str, page: int,
+                              message_id: Optional[int] = None) -> None:
+        tasks = self.state.list_recent(limit=50)
+        per_page = 5
+        pages = max(1, (len(tasks) + per_page - 1) // per_page)
+        page = max(0, min(page, pages - 1))
+        chunk = tasks[page * per_page:(page + 1) * per_page]
+
+        if not tasks:
+            text = "📋 Пока нет задач. Напишите задачу — и я начну."
+            await self.telegram.send_message(chat_id_int, text)
+            return
+
+        lines = [f"📋 Задачи ({len(tasks)}), стр. {page + 1}/{pages}:\n"]
+        for t in chunk:
+            emoji = self._task_status_emoji(t.status)
+            pr = t.pr_url or "—"
+            lines.append(f"{emoji} {self._source_tag(t)} {t.title[:55]}\n     PR: {pr}\n")
+        text = "\n".join(lines)
+
+        rows: list[list[tuple[str, str]]] = []
+        for i in range(0, len(chunk), 2):
+            row = []
+            for t in chunk[i:i + 2]:
+                emoji = self._task_status_emoji(t.status)
+                row.append((f"{emoji} {t.title[:24]}", f"t:{t.id}"))
+            rows.append(row)
+
+        nav: list[tuple[str, str]] = []
+        if page > 0:
+            nav.append(("⬅️", f"tasks:{page - 1}"))
+        nav.append((f"📄 {page + 1}/{pages}", "noop"))
+        if page < pages - 1:
+            nav.append(("➡️", f"tasks:{page + 1}"))
+        rows.append(nav)
+
+        keyboard = self.telegram.build_keyboard(rows)
+        if message_id:
+            await self.telegram.edit_message(chat_id_int, message_id, text, keyboard)
+        else:
+            await self.telegram.send_message(chat_id_int, text, keyboard)
+
+    async def _send_task_detail(self, query: dict, task: Task) -> None:
+        activity = await self._collect_task_logs(task, lines=6)
+        text = f"{self._task_card(task)}\n\n📋 Последняя активность:\n{activity}"
+        await self._reply(query, text, self._task_actions_keyboard(task))
+
+    async def _restart_task(self, task: Task, query: dict) -> None:
+        cqid = query.get("callback_query_id", "")
+        chat_id_int = int(query.get("chat_id") or 0)
+        if task.status == TaskStatus.RUNNING:
+            await self.telegram.answer_callback_query(cqid, "⚠️ Задача уже выполняется")
+            return
+        active = self._get_any_active_task(exclude_id=task.id)
+        if active:
+            await self.telegram.answer_callback_query(
+                cqid, f"⚠️ Занята задача «{(active.title or '')[:24]}» — дождитесь"
+            )
+            return
+
+        task.attempt += 1
+        task.status = TaskStatus.READY
+        task.pr_url = None
+        task.conversation_id = None
+        task.clarification_question = None
+        task.clarification_answer = None
+        model = self._effective_model(task)
+        task.add_log(f"Перезапуск #{task.attempt}, модель: {model}")
+        self.state.save(task)
+        # Свежий клон — иначе ветка прошлого прогона мешает коммиту.
+        shutil.rmtree(self._workspace_for(task), ignore_errors=True)
+        logger.info("[restart] task %s attempt %d model %s", task.id, task.attempt, model)
+        await self.telegram.answer_callback_query(
+            cqid, f"🔄 Перезапуск #{task.attempt} ({model})"
+        )
+        asyncio.create_task(self._process_task(task))
+
+    async def _on_telegram_callback(self, query: dict) -> None:
+        data = (query.get("data") or "").strip()
+        chat_id = query.get("chat_id")
+        chat_id_str = str(chat_id) if chat_id is not None else ""
+        chat_id_int = int(chat_id) if chat_id is not None else 0
+
+        if data == "noop":
+            return
+
+        if data == "menu":
+            text = (
+                "🤖 Личный помощник по Flutter-задачам.\n\n"
+                f"Модель по умолчанию: {self._default_model()}\n\n"
+                "Напишите задачу текстом — или выберите действие:"
+            )
+            kb = self.telegram.build_keyboard([
+                [("📋 Мои задачи", "tasks:0"), ("🧠 Модель по умолчанию", "model:default")],
+            ])
+            await self._reply(query, text, kb)
+            return
+
+        if data.startswith("tasks:"):
+            page = int(data.split(":", 1)[1] or 0)
+            await self._send_task_list(chat_id_int, chat_id_str, page,
+                                       message_id=query.get("message_id"))
+            return
+
+        if data.startswith("t:"):
+            task = self.state.get(data.split(":", 1)[1])
+            if task:
+                await self._send_task_detail(query, task)
+            return
+
+        if data.startswith("logs:"):
+            task = self.state.get(data.split(":", 1)[1])
+            if task:
+                activity = await self._collect_task_logs(task, lines=20)
+                text = f"📖 Логи задачи «{task.title[:50]}»:\n\n{activity}"
+                kb = self.telegram.build_keyboard([[("🔙 Назад", f"t:{task.id}")]])
+                await self._reply(query, text, kb)
+            return
+
+        if data.startswith("restart:"):
+            task = self.state.get(data.split(":", 1)[1])
+            if task:
+                await self._restart_task(task, query)
+                await self._send_task_detail(query, task)
+            return
+
+        if data.startswith("model:"):
+            target = data.split(":", 1)[1]
+            current = self._default_model() if target == "default" else (
+                self._effective_model(self.state.get(target)) if self.state.get(target) else ""
+            )
+            # Догружаем список моделей, если ещё не кэширован.
+            await self._fetch_models()
+            text, rows = self._model_picker(target, 0, "s", current)
+            await self._reply(query, text, self.telegram.build_keyboard(rows))
+            return
+
+        if data.startswith("mp:"):
+            _, target, page, mode = data.split(":")
+            current = self._default_model() if target == "default" else (
+                self._effective_model(self.state.get(target)) if self.state.get(target) else ""
+            )
+            await self._fetch_models()
+            text, rows = self._model_picker(target, int(page), mode, current)
+            await self._reply(query, text, self.telegram.build_keyboard(rows))
+            return
+
+        if data.startswith("ms:"):
+            _, target, page, mode, model = data.split(":", 4)
+            if target == "default":
+                self._set_default_model(model)
+                await self.telegram.answer_callback_query(
+                    query["callback_query_id"], f"Модель по умолчанию: {model}"
+                )
+                text, rows = self._model_picker(target, int(page), mode, model)
+                await self._reply(query, text, self.telegram.build_keyboard(rows))
+            else:
+                task = self.state.get(target)
+                if task:
+                    task.model = model
+                    task.add_log(f"Выбрана модель: {model}")
+                    self.state.save(task)
+                    await self.telegram.answer_callback_query(
+                        query["callback_query_id"], f"Модель задачи: {model}"
+                    )
+                    await self._send_task_detail(query, task)
+            return
+
+        if data.startswith("back:"):
+            target = data.split(":", 1)[1]
+            if target == "default":
+                text = f"🤖 Меню. Модель по умолчанию: {self._default_model()}"
+                kb = self.telegram.build_keyboard([
+                    [("📋 Мои задачи", "tasks:0"), ("🧠 Модель по умолчанию", "model:default")],
+                ])
+                await self._reply(query, text, kb)
+            else:
+                task = self.state.get(target)
+                if task:
+                    await self._send_task_detail(query, task)
+            return
 
     # ------------------------------------------------------------------ #
     # Основная обработка задачи (вызывается в фоне через create_task)
@@ -714,8 +1105,11 @@ class Scheduler:
             "Не создавай PR — это сделает оркестратор отдельно."
         )
 
-        # Настраиваем LLM провайдера (provod.ai) перед каждым разговором
-        llm_result = await self.openhands.configure_llm()
+        # Настраиваем LLM провайдера (provod.ai) перед каждым разговором —
+        # модель берём из задачи (либо модель по умолчанию).
+        llm_result = await self.openhands.configure_llm(
+            model=self._effective_model(task)
+        )
         if llm_result.get("status") == "error":
             logger.warning("[openhands] LLM config warning: %s", llm_result.get("error"))
         else:
@@ -1048,8 +1442,9 @@ class Scheduler:
         else:
             task.add_log("iOS skipped: iMac not configured")
 
-        # Создаём ветку, коммит, пуш, PR
-        branch = f"ai-task-{task.id}"
+        # Создаём ветку, коммит, пуш, PR. Ветка зависит от номера попытки —
+        # чтобы перезапуск не конфликтовал с веткой прошлого прогона.
+        branch = f"ai-task-{task.id}-r{task.attempt}"
         dry_run = self.config.pr_dry_run
         try:
             for git_cmd in (

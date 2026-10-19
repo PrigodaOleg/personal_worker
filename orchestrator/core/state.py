@@ -36,10 +36,30 @@ class StateStore:
             )
             """
         )
-        # Миграция для БД, созданных до появления conversation_id.
+        # Миграция для БД, созданных до появления conversation_id / model / attempt.
         existing = {r[1] for r in self._conn.execute("PRAGMA table_info(tasks)")}
         if "conversation_id" not in existing:
             self._conn.execute("ALTER TABLE tasks ADD COLUMN conversation_id TEXT")
+        if "model" not in existing:
+            self._conn.execute("ALTER TABLE tasks ADD COLUMN model TEXT")
+        if "attempt" not in existing:
+            self._conn.execute("ALTER TABLE tasks ADD COLUMN attempt INTEGER NOT NULL DEFAULT 1")
+        # Ключ-значение для настроек UI (например, модель по умолчанию).
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)"
+        )
+        self._conn.commit()
+
+    def get_setting(self, key: str, default: str | None = None) -> str | None:
+        row = self._conn.execute(
+            "SELECT value FROM settings WHERE key = ?", (key,)
+        ).fetchone()
+        return row[0] if row else default
+
+    def set_setting(self, key: str, value: str) -> None:
+        self._conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value)
+        )
         self._conn.commit()
 
     def save(self, task: Task) -> None:
@@ -48,8 +68,8 @@ class StateStore:
             INSERT OR REPLACE INTO tasks
             (id, source, source_id, title, description, status,
              clarification_question, clarification_answer, created_at, pr_url, log,
-             conversation_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             conversation_id, model, attempt)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 task.id,
@@ -64,6 +84,8 @@ class StateStore:
                 task.pr_url,
                 str(task.log),
                 task.conversation_id,
+                task.model,
+                task.attempt,
             ),
         )
         self._conn.commit()
@@ -83,6 +105,22 @@ class StateStore:
         ).fetchall()
         return [self._row_to_task(r) for r in rows]
 
+    def list_recent(self, limit: int = 50) -> list[Task]:
+        """Все задачи, новые сверху — для просмотра истории в /tasks."""
+        rows = self._conn.execute(
+            "SELECT * FROM tasks ORDER BY created_at DESC LIMIT ?", (limit,)
+        ).fetchall()
+        return [self._row_to_task(r) for r in rows]
+
+    def list_for_chat(self, chat_id: str, limit: int = 50) -> list[Task]:
+        """Задачи конкретного чата (Telegram), новые сверху."""
+        rows = self._conn.execute(
+            "SELECT * FROM tasks WHERE source = ? AND source_id = ? "
+            "ORDER BY created_at DESC LIMIT ?",
+            (TaskSource.TELEGRAM.value, chat_id, limit),
+        ).fetchall()
+        return [self._row_to_task(r) for r in rows]
+
     def _row_to_task(self, row: tuple) -> Task:
         import datetime as _dt
 
@@ -92,6 +130,11 @@ class StateStore:
                 log_list = ast.literal_eval(row[10])
             except (ValueError, SyntaxError):
                 log_list = []
+
+        # row соответствует порядку SELECT *; читаем новые поля по наличию.
+        conversation_id = row[11] if len(row) > 11 else None
+        model = row[12] if len(row) > 12 else None
+        attempt = row[13] if len(row) > 13 and row[13] is not None else 1
 
         return Task(
             id=row[0],
@@ -105,7 +148,9 @@ class StateStore:
             created_at=_dt.datetime.fromisoformat(row[8]),
             pr_url=row[9],
             log=log_list,
-            conversation_id=row[11] if len(row) > 11 else None,
+            conversation_id=conversation_id,
+            model=model,
+            attempt=attempt,
         )
 
     def close(self) -> None:

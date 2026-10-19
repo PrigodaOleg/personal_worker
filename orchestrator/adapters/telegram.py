@@ -11,10 +11,11 @@ import logging
 from typing import Optional
 
 import telegram
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
     ApplicationBuilder,
+    CallbackQueryHandler,
     ContextTypes,
     MessageHandler,
     filters,
@@ -36,6 +37,7 @@ class TelegramAdapter:
         self._app: Optional[Application] = None
         self._pending_responses: dict[str, asyncio.Future] = {}
         self._message_callback: Optional[callable] = None
+        self._callback_query_callback: Optional[callable] = None
 
     def _is_allowed(self, username: Optional[str]) -> bool:
         if not self.allowed_usernames:
@@ -45,6 +47,33 @@ class TelegramAdapter:
     def set_message_callback(self, callback: callable) -> None:
         """callback(update_dict) — вызывается на входящее сообщение."""
         self._message_callback = callback
+
+    def set_callback_query_callback(self, callback: callable) -> None:
+        """callback(query_dict) — вызывается на нажатие инлайн-кнопки."""
+        self._callback_query_callback = callback
+
+    async def _callback_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        cq = update.callback_query
+        if not cq or not cq.from_user:
+            return
+        username = cq.from_user.username or ""
+        if not self._is_allowed(username):
+            await cq.answer("Нет доступа.")
+            return
+        # Отвечаем на callback сразу, иначе Telegram будет показывать "часики".
+        try:
+            await cq.answer()
+        except Exception:  # noqa: BLE001
+            pass
+        if self._callback_query_callback:
+            await self._callback_query_callback({
+                "callback_query_id": cq.id,
+                "chat_id": cq.message.chat.id if cq.message else None,
+                "message_id": cq.message.message_id if cq.message else None,
+                "user_id": cq.from_user.id,
+                "username": username,
+                "data": cq.data or "",
+            })
 
     async def _handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not update.effective_user or not update.effective_message:
@@ -74,6 +103,9 @@ class TelegramAdapter:
         self._app.add_handler(
             MessageHandler(filters.TEXT, self._handler)
         )
+        self._app.add_handler(
+            CallbackQueryHandler(self._callback_handler)
+        )
         await self._app.initialize()
         await self._app.start()
         await self._app.updater.start_polling()
@@ -101,20 +133,36 @@ class TelegramAdapter:
             await self._app.shutdown()
             self._app = None
 
-    async def send_message(self, chat_id: int, text: str) -> None:
+    @staticmethod
+    def build_keyboard(rows: list[list[tuple[str, str]]]) -> InlineKeyboardMarkup:
+        """Собрать инлайн-клавиатуру из списка [[(текст, callback_data), ...], ...]."""
+        return InlineKeyboardMarkup(
+            [[InlineKeyboardButton(text, callback_data=data) for text, data in row]
+             for row in rows]
+        )
+
+    async def send_message(
+        self,
+        chat_id: int,
+        text: str,
+        keyboard: Optional[InlineKeyboardMarkup] = None,
+    ) -> Optional[int]:
         """Отправить сообщение, повторяя при сетевых сбоях.
 
         Telegram периодически отваливается по таймауту (особенно через VPN),
         и без повторов уведомление о результате задачи просто теряется.
+        Возвращает message_id — его можно передать в edit_message.
         """
         if not self._app:
-            return
+            return None
 
         last_exc: Exception | None = None
         for attempt in range(1, 4):
             try:
-                await self._app.bot.send_message(chat_id=chat_id, text=text)
-                return
+                msg = await self._app.bot.send_message(
+                    chat_id=chat_id, text=text, reply_markup=keyboard
+                )
+                return msg.message_id
             except (telegram.error.TimedOut, telegram.error.NetworkError) as exc:
                 last_exc = exc
                 logger.warning(
@@ -122,6 +170,44 @@ class TelegramAdapter:
                 )
                 await asyncio.sleep(2 * attempt)
         logger.error("[telegram] message not delivered after 3 attempts: %s", last_exc)
+        return None
+
+    async def edit_message(
+        self,
+        chat_id: int,
+        message_id: int,
+        text: str,
+        keyboard: Optional[InlineKeyboardMarkup] = None,
+    ) -> bool:
+        """Обновить ранее отправленное сообщение (для навигации по кнопкам)."""
+        if not self._app:
+            return False
+        try:
+            await self._app.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=text,
+                reply_markup=keyboard,
+            )
+            return True
+        except telegram.error.BadRequest as exc:
+            # "Message is not modified" — не ошибка при повторном тапе.
+            if "not modified" not in str(exc).lower():
+                logger.warning("[telegram] edit_message failed: %s", exc)
+            return False
+        except (telegram.error.TimedOut, telegram.error.NetworkError) as exc:
+            logger.warning("[telegram] edit_message network error: %s", exc)
+            return False
+
+    async def answer_callback_query(self, callback_query_id: str, text: str = "") -> None:
+        if not self._app:
+            return
+        try:
+            await self._app.bot.answer_callback_query(
+                callback_query_id=callback_query_id, text=text
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[telegram] answer_callback_query failed: %s", exc)
 
     async def ask_clarification(self, chat_id: int, question: str) -> str:
         """Задать уточняющий вопрос и вернуть будущий ответ."""

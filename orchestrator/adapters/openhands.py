@@ -115,10 +115,18 @@ class OpenHandsAdapter:
         except Exception:
             return False
 
-    async def configure_llm(self) -> dict:
-        """Настроить LLM провайдера (provod.ai) через /api/settings."""
+    async def configure_llm(self, model: Optional[str] = None) -> dict:
+        """Настроить LLM провайдера (provod.ai) через /api/settings.
+
+        `model` — переопределение модели для конкретного разговора. Если None,
+        берётся модель по умолчанию из конфига. Модель нормализуется к
+        префиксу `openai/` — он говорит LiteLLM, что эндпоинт OpenAI-совместим.
+        """
+        resolved = model or self.llm_model
+        if resolved and not resolved.startswith("openai/"):
+            resolved = f"openai/{resolved}"
         payload = {
-            "llm_model": self.llm_model,
+            "llm_model": resolved,
             "llm_api_key": self.llm_api_key,
             "llm_base_url": self.llm_base_url,
         }
@@ -132,6 +140,32 @@ class OpenHandsAdapter:
             return r.json()
         except httpx.HTTPError as exc:
             logger.error("[openhands] configure_llm failed: %s", exc)
+            return {"status": "error", "error": str(exc)}
+
+    async def list_models(self) -> dict:
+        """Список доступных моделей у LLM-провайдера (provod.ai /v1/models).
+
+        Возвращает id моделей без префикса провайдера (например,
+        `claude-sonnet-4.6`) — их удобно показывать в клавиатуре.
+        """
+        if not self.llm_base_url or not self.llm_api_key:
+            return {"status": "error", "error": "LLM не настроен"}
+        url = self.llm_base_url.rstrip("/") + "/models"
+        headers = {"Authorization": f"Bearer {self.llm_api_key}"}
+        try:
+            r = await self._client.get(url, headers=headers)
+            r.raise_for_status()
+            data = r.json()
+            items = data.get("data", data) if isinstance(data, dict) else data
+            models = []
+            for m in items if isinstance(items, list) else []:
+                mid = m.get("id") if isinstance(m, dict) else m
+                if not mid:
+                    continue
+                models.append(mid.split("/", 1)[-1])  # убираем префикс провайдера
+            return {"status": "ok", "models": sorted(set(models))}
+        except httpx.HTTPError as exc:
+            logger.error("[openhands] list_models failed: %s", exc)
             return {"status": "error", "error": str(exc)}
 
     async def create_conversation(

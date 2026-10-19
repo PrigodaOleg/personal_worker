@@ -39,6 +39,12 @@ class Task:
     # ID разговора OpenHands. Нужен, чтобы найти runtime-контейнер задачи
     # (он называется openhands-runtime-<conversation_id>) и показать его логи.
     conversation_id: Optional[str] = None
+    # Модель LLM для этой задачи. None — использовать модель по умолчанию.
+    # Можно переопределить из /tasks, в том числе у упавшей задачи перед рестартом.
+    model: Optional[str] = None
+    # Номер попытки. Растёт при перезапуске, чтобы ветка PR не конфликтовала
+    # с веткой предыдущего прогона.
+    attempt: int = 1
 
     def add_log(self, message: str) -> None:
         self.log.append(f"[{datetime.utcnow().isoformat()}] {message}")
