@@ -99,6 +99,19 @@ class Scheduler:
     def _workspace_for(self, task: Task) -> str:
         return os.path.join(self.config.work_dir, task.id)
 
+    async def _git_ahead_count(self, client_dir: str) -> int:
+        """Сколько коммитов в ветке задачи сверх базовой (origin/main)."""
+        proc = await asyncio.create_subprocess_exec(
+            "git", "-C", client_dir, "rev-list", "--count", "origin/main..HEAD",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=60)
+        try:
+            return int(out.decode("utf-8", errors="replace").strip() or "0")
+        except ValueError:
+            return 0
+
     async def _git_diff_summary(self, client_dir: str, limit: int = 20) -> str:
         """Краткая сводка изменений для уведомления."""
         proc = await asyncio.create_subprocess_exec(
@@ -1073,6 +1086,21 @@ class Scheduler:
                 f"❌ Ошибка при создании ветки/пуша.\n\n"
                 f"Ошибка: {error_msg}\n\n"
                 f"Лог выполнения:\n{log_text}",
+            )
+            return
+
+        # Задача без правок кода (например, «просто собери») даёт пустой коммит.
+        # Тогда между ветками нечему быть, и create_pr упал бы — честно выходим.
+        ahead = await self._git_ahead_count(client_dir)
+        if ahead == 0:
+            task.status = TaskStatus.DONE
+            task.pr_url = "(нет изменений для PR)"
+            task.add_log("Изменений нет — PR не требуется")
+            self.state.save(task)
+            self._notify_author(
+                task,
+                f"✅ Задача выполнена, но код не изменился — PR не требуется.\n\n"
+                f"Лог выполнения:\n" + "\n".join(task.log[-10:]),
             )
             return
 
