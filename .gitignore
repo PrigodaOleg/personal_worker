@@ -41,6 +41,12 @@ Thumbs.db
 orchestrator/config.yaml
 config/
 
+# Build secrets (Firebase / CLOSERS_*) — кладёт self-hosted runner, НЕ в git
+secrets/
+
+# GitHub Actions self-hosted runner (скачанный бинарь, машинно-специфичный)
+actions-runner/
+
 # State / logs
 *.db
 *.db-shm
