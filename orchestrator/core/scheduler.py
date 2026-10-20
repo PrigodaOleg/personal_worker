@@ -1765,7 +1765,17 @@ class Scheduler:
         try:
             for git_cmd in (
                 ["checkout", "-b", branch],
-                ["add", "-A"],
+                # Секреты сборки (google-services.json, build.env) кладутся в
+                # рабочую копию ради сборки, но в PR уезжать не должны. Исключаем
+                # их и по точным путям, и по именам — даже если чужой .gitignore
+                # их не ловит (build.env в social_mind как раз не игнорируется).
+                [
+                    "add", "-A", "--", ".",
+                    ":(exclude)build.env",
+                    ":(exclude)google-services.json",
+                    ":(exclude)domains/client/build.env",
+                    ":(exclude)domains/client/android/app/google-services.json",
+                ],
                 ["commit", "-m", f"AI task: {task.title}"],
                 # В dry-run пуш только проверяется — на GitHub ничего не уходит.
                 (["push", "--dry-run", "-u", "origin", branch] if dry_run
