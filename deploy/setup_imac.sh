@@ -52,6 +52,9 @@ xcode-select -p
 xcodebuild -license accept
 xcodebuild -runFirstLaunch || true
 xcodebuild -showsdks | grep -i iphone || echo "   ⚠️ iOS SDK не найден — проверь установку Xcode"
+# Платформа iOS — отдельная большая загрузка. Без неё xcodebuild честно
+# отвечает "Found no destinations for the scheme" и "iOS 18.5 is not installed".
+xcodebuild -downloadPlatform iOS || echo "   (платформа уже скачана или нужен повторный запуск)"
 
 echo "== 4. Сон и автозапуск =="
 pmset -a sleep 0 disablesleep 1 autorestart 1 womp 1
@@ -77,7 +80,9 @@ grep -q '/opt/homebrew/bin' "${ZSHENV}" 2>/dev/null || \
 chown "${WORKER_USER}":staff "${ZSHENV}"
 
 echo "== 7. Проверка (неинтерактивно, как у оркестратора) =="
-su - "${WORKER_USER}" -c 'zsh -c "flutter --version | head -2; pod --version"' || true
+# Первый запуск xcodebuild под новым пользователем прогревает его per-user
+# состояние Xcode; без этого дестинации могут не резолвиться ("iOS not installed").
+su - "${WORKER_USER}" -c 'xcodebuild -showdestinations -workspace ~/personal_worker/client/ios/Runner.xcworkspace -scheme Runner >/dev/null 2>&1; zsh -c "flutter --version | head -2; pod --version"' || true
 
 echo ""
 echo "============================================================"
