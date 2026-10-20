@@ -427,12 +427,11 @@ class Scheduler:
         chunk = items[page * per_page:(page + 1) * per_page]
 
         rows: list[list[tuple[str, str]]] = []
-        for i in range(0, len(chunk), 2):
-            row = []
-            for m in chunk[i:i + 2]:
-                mark = "✅ " if m == current else ""
-                row.append((f"{mark}{m}", f"ms:{target}:{page}:{mode}:{m}"))
-            rows.append(row)
+        for m in chunk:
+            mark = "✅ " if m == current else ""
+            ix, _swe, _avg = pricing.price_quality_index(self.state, m)
+            rows.append([(f"{mark}{m} · IX {pricing.fmt_ix(ix)}",
+                          f"ms:{target}:{page}:{mode}:{m}")])
 
         # Навигация
         nav: list[tuple[str, str]] = []
@@ -456,6 +455,8 @@ class Scheduler:
             f"🧠 Модель {label}:\n"
             f"Текущая: {current or '—'}\n"
             f"Выберите из списка ({title}):\n\n"
+            f"IX — индекс цена/качество: SWE-bench% ÷ ср. цена "
+            f"((вход×3+выход)/4, ₽/1M). Выше = лучше.\n\n"
             f"⚠️ Если задача падает сразу — модель отклоняет параметры "
             f"OpenHands, выберите другую."
         )
@@ -629,33 +630,58 @@ class Scheduler:
     async def _collect_task_logs(self, task: Optional[Task], lines: int = 3) -> str:
         """Что агент реально выполнял в runtime-контейнере.
 
-        Это команды и их вывод из траектории разговора — то есть лог самой
-        задачи, а не логи служебных процессов контейнера.
+        Команды и их коды выхода из событий разговора (`/events`). Показываем и
+        завершённые команды, и текущую (ещё выполняющуюся, помечена 🔄) — чтобы
+        было видно, что агент делает прямо сейчас (например, идёт сборка APK).
         """
         if not task or not task.conversation_id:
             return "— задача ещё не запускалась в контейнере"
 
-        traj = await self.openhands.get_trajectory(task.conversation_id)
-        if traj.get("status") == "error":
-            return f"— не удалось получить траекторию: {traj.get('error')}"
+        events = await self.openhands.get_events(task.conversation_id)
+        if not isinstance(events, list) or not events:
+            return "— агент ещё не выполнял команд"
 
-        events = traj.get("trajectory") or traj.get("events") or traj
-        if not isinstance(events, list):
-            return "— траектория пуста"
-
-        rows: list[str] = []
+        done: list[str] = []
+        running: Optional[str] = None
         for event in events:
-            if event.get("observation") != "run":
+            if not isinstance(event, dict):
                 continue
+            args = event.get("args") or {}
             extras = event.get("extras") or {}
             meta = extras.get("metadata") or {}
-            cmd = extras.get("command") or str(event.get("message") or "")
-            code = meta.get("exit_code")
-            rows.append(f"$ {cmd}\n  → exit {code}")
+            msg = str(event.get("message") or "")
+            action = event.get("action")
+            obs = event.get("observation")
 
+            if action == "run" and obs is None:
+                # команда стартовала, но ещё не завершилась
+                cmd = (args.get("command") or extras.get("command")
+                       or re.sub(r"^Running command:\s*", "", msg))
+                running = self._short_cmd(cmd) or running
+            elif obs == "run":
+                # команда завершилась
+                cmd = extras.get("command") or args.get("command")
+                code = meta.get("exit_code")
+                if not cmd:
+                    m = re.search(r"Command `(.*?)`", msg)
+                    cmd = m.group(1) if m else msg
+                if code is None:
+                    m = re.search(r"exit code (-?\d+)", msg)
+                    code = m.group(1) if m else "?"
+                done.append(f"$ {self._short_cmd(cmd)}\n  → exit {code}")
+                running = None
+
+        rows = list(done[-lines:])
+        if running:
+            rows.append(f"🔄 {running} — выполняется…")
         if not rows:
             return "— агент ещё не выполнял команд"
-        return "\n".join(rows[-lines:])
+        return "\n".join(rows)
+
+    @staticmethod
+    def _short_cmd(cmd: str, max_len: int = 100) -> str:
+        cmd = (cmd or "").strip().replace("\n", " ⏎ ")
+        return cmd if len(cmd) <= max_len else cmd[: max_len - 1] + "…"
 
     async def _handle_telegram_command(self, chat_id: str, text: str) -> None:
         """Обработка команд бота: /status, /cancel, /help."""
@@ -691,40 +717,9 @@ class Scheduler:
 
         if cmd == "/status":
             active = self._get_active_task_for_chat(chat_id)
-            if active:
-                emoji = self._task_status_emoji(active.status)
-                layers = await self._layer_status_block(active)
-                activity = await self._collect_task_logs(active, lines=6)
-                await self.telegram.send_message(
-                    chat_id_int,
-                    f"{emoji} Задача: «{active.title[:60]}»\n"
-                    f"Статус: {self._task_status_label(active.status)}\n"
-                    f"Модель: {self._effective_model(active)}\n"
-                    f"Стоимость: {self._cost_line(active)}\n\n"
-                    f"📊 Слои:\n{layers}\n\n"
-                    f"📋 Что делает агент:\n{activity}",
-                    keyboard=self._task_actions_keyboard(active),
-                )
-                return
-            # Активной нет — показываем последнюю задачу.
-            recent = self.state.list_for_chat(chat_id, limit=1)
-            if recent:
-                last = recent[0]
-                emoji = self._task_status_emoji(last.status)
-                layers = await self._layer_status_block(last)
-                await self.telegram.send_message(
-                    chat_id_int,
-                    f"{emoji} Последняя задача: «{last.title[:60]}»\n"
-                    f"Статус: {self._task_status_label(last.status)}\n"
-                    f"PR: {last.pr_url or '—'}\n\n"
-                    f"📊 Слои:\n{layers}",
-                    keyboard=self._task_actions_keyboard(last),
-                )
-            else:
-                await self.telegram.send_message(
-                    chat_id_int,
-                    "🆕 У вас нет задач. Напишите задачу — и я начну.",
-                )
+            task = active or (self.state.list_for_chat(chat_id, limit=1) or [None])[0]
+            text, keyboard = await self._render_status_view(task)
+            await self.telegram.send_message(chat_id_int, text, keyboard=keyboard)
             return
 
         if cmd == "/tasks":
@@ -774,7 +769,8 @@ class Scheduler:
 
     def _task_actions_keyboard(self, task: Task):
         return self.telegram.build_keyboard([
-            [("🔄 Перезапустить", f"restart:{task.id}"),
+            [("🔄 Обновить", f"refresh:{task.id}")],
+            [("🔁 Перезапустить", f"restart:{task.id}"),
              ("🧠 Модель", f"model:{task.id}")],
             [("📖 Логи", f"logs:{task.id}"),
              ("📋 К списку", "tasks:0")],
@@ -782,6 +778,28 @@ class Scheduler:
 
     def _source_tag(self, task: Task) -> str:
         return "🐙" if task.source == TaskSource.GITHUB else "💬"
+
+    async def _render_status_view(self, task: Optional[Task]) -> tuple[str, object]:
+        """Полный статус задачи (слой/логи/цена) + клавиша «Обновить».
+
+        Общий рендер для /status и кнопки 🔄 Обновить: показывает и активную,
+        и завершённую задачу, включая текущую (ещё не завершённую) команду.
+        """
+        if not task:
+            return "🆕 У вас нет задач. Напишите задачу — и я начну.", None
+        emoji = self._task_status_emoji(task.status)
+        layers = await self._layer_status_block(task)
+        activity = await self._collect_task_logs(task, lines=6)
+        text = (
+            f"{emoji} Задача: «{task.title[:60]}»\n"
+            f"Статус: {self._task_status_label(task.status)}\n"
+            f"Модель: {self._effective_model(task)}\n"
+            f"Стоимость: {self._cost_line(task)}\n"
+            f"PR: {task.pr_url or '—'}\n\n"
+            f"📊 Слои:\n{layers}\n\n"
+            f"📋 Что делает агент:\n{activity}"
+        )
+        return text, self._task_actions_keyboard(task)
 
     def _task_card(self, task: Task) -> str:
         emoji = self._task_status_emoji(task.status)
@@ -932,6 +950,12 @@ class Scheduler:
             page = int(data.split(":", 1)[1] or 0)
             await self._send_task_list(chat_id_int, chat_id_str, page,
                                        message_id=query.get("message_id"))
+            return
+
+        if data.startswith("refresh:"):
+            task = self.state.get(data.split(":", 1)[1])
+            text, keyboard = await self._render_status_view(task)
+            await self._reply(query, text, keyboard)
             return
 
         if data.startswith("t:"):
@@ -1294,13 +1318,15 @@ class Scheduler:
             "asked_at": datetime.utcnow(),
         }
 
+        question_msg_id: Optional[int] = None
+        chat_id: Optional[int] = None
         if task.source == TaskSource.TELEGRAM:
             chat_id = int(task.source_id)
             keyboard = None
             if len(options) >= 2:
                 rows = [[(opt[:48], f"ans:{task.id}:{i}")] for i, opt in enumerate(options)]
                 keyboard = self.telegram.build_keyboard(rows)
-            await self.telegram.send_message(chat_id, f"❓ {text}", keyboard=keyboard)
+            question_msg_id = await self.telegram.send_message(chat_id, f"❓ {text}", keyboard=keyboard)
             if keyboard is None:
                 await self.telegram.send_message(
                     chat_id, "✍️ Ответьте на вопрос текстом."
@@ -1318,9 +1344,16 @@ class Scheduler:
             )
         except asyncio.TimeoutError:
             self._pending_agent_questions.pop(task.id, None)
+            if task.source == TaskSource.TELEGRAM and question_msg_id:
+                await self._close_question_message(chat_id, question_msg_id, text,
+                                                   "⏰ Время ожидания ответа истекло.")
             return False
 
         self._pending_agent_questions.pop(task.id, None)
+        # Ответ принят — убираем кнопки и фиксируем выбор в сообщении с вопросом.
+        if task.source == TaskSource.TELEGRAM and question_msg_id:
+            await self._close_question_message(chat_id, question_msg_id, text,
+                                               f"✅ Ответ принят: {answer[:200]}")
         try:
             await self.openhands.send_message(conversation_id, answer)
             task.add_log(f"Ответ пользователю отправлен агенту: {answer[:60]}")
@@ -1329,6 +1362,16 @@ class Scheduler:
         except Exception as exc:  # noqa: BLE001
             logger.error("[agent-question] send answer failed: %s", exc)
             return False
+
+    async def _close_question_message(self, chat_id: int, message_id: int,
+                                      question: str, footer: str) -> None:
+        """Убрать кнопки вопроса и дописать итог (ответ/истечение) в то же сообщение."""
+        try:
+            await self.telegram.edit_message(
+                chat_id, message_id, f"❓ {question}\n\n{footer}", keyboard=None,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error("[agent-question] close question message failed: %s", exc)
 
     async def _monitor_openhands(self, task: Task, conversation_id: str, client_dir: str) -> None:
         """Мониторит сессию OpenHands: уточнения, завершение, ошибки.
@@ -1716,6 +1759,17 @@ class Scheduler:
     # ------------------------------------------------------------------ #
     # Главный цикл
     # ------------------------------------------------------------------ #
+    async def _refresh_prices_and_benchmarks(self) -> None:
+        """Обновить цены и SWE-бенчмарки; сбой одного не мешает другому."""
+        try:
+            await pricing.refresh_prices(self.state, self.openhands)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[loop] price refresh error: %s", exc)
+        try:
+            await pricing.refresh_benchmarks(self.state)  # Vals AI поверх seed
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[loop] benchmark refresh error: %s", exc)
+
     async def run(self) -> None:
         logger.info("[scheduler] starting (poll_interval=%ds)", self.config.poll_interval_seconds)
 
@@ -1730,13 +1784,13 @@ class Scheduler:
                 "asked_at": task.created_at,
             }
 
-        # Справочные метрики SWE и цены моделей: сид + первое обновление.
+        # Справочные метрики SWE и цены моделей: сид (fallback) + первое обновление.
         try:
             pricing.seed_benchmarks(self.state)
-            await pricing.refresh_prices(self.state, self.openhands)
         except Exception as exc:  # noqa: BLE001
-            logger.warning("[loop] pricing init error: %s", exc)
-        price_refresh_interval = 6 * 3600  # обновлять цены раз в 6 часов
+            logger.warning("[loop] seed benchmarks error: %s", exc)
+        await self._refresh_prices_and_benchmarks()
+        price_refresh_interval = 6 * 3600  # обновлять цены/бенчмарки раз в 6 часов
         last_price_refresh = time.time()
 
         while True:
@@ -1745,12 +1799,9 @@ class Scheduler:
             except Exception as exc:
                 logger.error("[loop] github poll error: %s", exc)
 
-            # Периодически обновляем цены моделей.
+            # Периодически обновляем цены и бенчмарки моделей.
             if time.time() - last_price_refresh > price_refresh_interval:
-                try:
-                    await pricing.refresh_prices(self.state, self.openhands)
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("[loop] price refresh error: %s", exc)
+                await self._refresh_prices_and_benchmarks()
                 last_price_refresh = time.time()
 
             # Обрабатываем задачи в статусе CLARIFYING (ожидание уточнений)

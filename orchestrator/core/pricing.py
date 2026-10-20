@@ -12,7 +12,10 @@
 from __future__ import annotations
 
 import logging
+import re
 from typing import Optional
+
+import httpx
 
 from orchestrator.core.state import StateStore
 
@@ -20,6 +23,11 @@ logger = logging.getLogger(__name__)
 
 # Курс ₽ за $1 для показа цен. Переопределяется настройкой `rub_per_usd`.
 DEFAULT_RUB_PER_USD = 82.8
+
+# Источник живых бенчмарков: лидерборд Vals AI (SWE-bench Verified, mini-SWE-agent).
+# Это источник значений отчёта цена/качество. Парсим HTML-таблицу; при сбое
+# парсинга остаются ранее сохранённые значения (seed / прошлый успешный парсинг).
+VALS_AI_URL = "https://www.vals.ai/benchmarks/swebench"
 
 # SWE-bench Verified (%) из отчёта цена/качество. Значения «н/д» → None.
 BENCHMARKS_SEED: dict[str, tuple[Optional[float], str]] = {
@@ -58,12 +66,74 @@ def rub_per_usd(state: StateStore) -> float:
 
 
 def seed_benchmarks(state: StateStore) -> int:
-    """Заполнить метрики SWE-бенчмарков из отчёта (идемпотентно)."""
+    """Заполнить метрики SWE-бенчмарков из отчёта (идемпотентно, как fallback)."""
     n = 0
     for model, (swe, note) in BENCHMARKS_SEED.items():
         state.upsert_benchmark(model, swe, note)
         n += 1
     logger.info("[pricing] seeded %d benchmarks", n)
+    return n
+
+
+def _parse_valsai_leaderboard(html: str) -> dict[str, float]:
+    """Извлечь {модель: SWE%} из HTML-таблицы лидерборда Vals AI.
+
+    Берём только строки mini-SWE-agent (методика отчёта). Имя модели — из
+    ссылки `<a href="/models/...">Имя</a>`; очищаем от хвостовых `(…)`.
+    """
+    out: dict[str, float] = {}
+    for row in re.findall(r"<tr>(.*?)</tr>", html, re.S):
+        if "mini-swe" not in row.lower():
+            continue
+        mm = re.search(r'<a href="/models/[^"]+">([^<]+)</a>', row)
+        sm = re.search(r"<td>\s*([\d.]+)\s*%</td>", row)
+        if not (mm or sm):
+            continue
+        if not (mm and sm):
+            continue
+        name = re.sub(r"\s*\([^)]*\)\s*$", "", mm.group(1)).strip()
+        try:
+            score = float(sm.group(1))
+        except ValueError:
+            continue
+        if name:
+            out.setdefault(name, score)  # первая (наивысшая) запись побеждает
+    return out
+
+
+async def fetch_benchmarks_valsai() -> dict[str, float]:
+    """Скачать лидерборд Vals AI и вернуть {модель: SWE%} (пусто при сбое)."""
+    try:
+        async with httpx.AsyncClient(
+            timeout=30, follow_redirects=True,
+            headers={"User-Agent": "Mozilla/5.0"},
+        ) as client:
+            r = await client.get(VALS_AI_URL)
+            r.raise_for_status()
+            html = r.text
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[pricing] fetch vals.ai failed: %s", exc)
+        return {}
+    data = _parse_valsai_leaderboard(html)
+    if not data:
+        logger.warning("[pricing] vals.ai: таблица лидерборда не разобрана")
+    return data
+
+
+async def refresh_benchmarks(state: StateStore) -> int:
+    """Обновить SWE-бенчмарки из Vals AI. При сбое остаются прежние значения.
+
+    Возвращает число обновлённых моделей.
+    """
+    data = await fetch_benchmarks_valsai()
+    if not data:
+        logger.info("[pricing] refresh_benchmarks: данных нет, остаются сохранённые")
+        return 0
+    n = 0
+    for name, score in data.items():
+        state.upsert_benchmark(name, score, "Vals AI (mini-SWE-agent)")
+        n += 1
+    logger.info("[pricing] refreshed %d benchmarks from Vals AI", n)
     return n
 
 
@@ -117,3 +187,34 @@ def compute_cost(state: StateStore, model: str,
     )
     cost_rub = cost_usd * rub_per_usd(state)
     return round(cost_rub, 2), round(cost_usd, 4)
+
+
+def price_quality_index(state: StateStore, model: str):
+    """Индекс цена/качество модели. Возвращает (ix, swe, ср_цена_₽/1M).
+
+    Индекс = SWE% ÷ ср. цена; ср. цена = (вход×3 + выход)/4 в ₽ за 1M токенов.
+    Выше = лучше цена/качество (методика отчёта). Любая часть (ix, swe, цена)
+    может быть None, если нет данных о цене или бенчмарке.
+    """
+    bare = (model or "").split("/", 1)[-1]
+    swe = (state.get_benchmark(bare) or {}).get("swe_bench")
+    price = state.get_price(bare) or {}
+    prompt_usd = price.get("prompt_usd")
+    completion_usd = price.get("completion_usd")
+    if prompt_usd is None or completion_usd is None:
+        return None, swe, None
+    rub = rub_per_usd(state)
+    in_rub = float(prompt_usd) * 1e6 * rub
+    out_rub = float(completion_usd) * 1e6 * rub
+    avg = (in_rub * 3 + out_rub) / 4
+    if avg <= 0:
+        return None, swe, None
+    ix = (float(swe) / avg) if swe is not None else None
+    return (round(ix, 3) if ix is not None else None), swe, round(avg, 1)
+
+
+def fmt_ix(ix) -> str:
+    """Компактный вид индекса для кнопки: 4.7 / 0.84 / «—»."""
+    if ix is None:
+        return "—"
+    return f"{ix:.1f}" if ix >= 1 else f"{ix:.2f}"

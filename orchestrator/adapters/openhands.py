@@ -171,6 +171,23 @@ class OpenHandsAdapter:
             logger.error("[openhands] list_models_raw failed: %s", exc)
             return {"status": "error", "error": str(exc)}
 
+    async def get_events(self, conversation_id: str) -> list:
+        """Сырые события разговора (логи команд, состояние агента).
+
+        Источник — `GET /api/conversations/{id}/events`. В отличие от
+        `/trajectory`, работает и для уже завершённых разговоров.
+        """
+        try:
+            r = await self._client.get(
+                f"{self.base_url}/api/conversations/{conversation_id}/events",
+                headers=self._headers(),
+            )
+            r.raise_for_status()
+            return r.json().get("events", [])
+        except httpx.HTTPError as exc:
+            logger.error("[openhands] get_events failed: %s", exc)
+            return []
+
     async def get_usage(self, conversation_id: str) -> dict:
         """Использование токенов разговором (из llm_metrics событий).
 

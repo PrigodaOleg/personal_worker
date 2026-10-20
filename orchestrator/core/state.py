@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 import ast
+import re
 from pathlib import Path
 
 from orchestrator.core.task import Task, TaskSource, TaskStatus
@@ -120,19 +121,29 @@ class StateStore:
     # ------------------------------------------------------------------ #
     # Метрики SWE-бенчмарков (справочные)
     # ------------------------------------------------------------------ #
+    @staticmethod
+    def _norm_model(model: str) -> str:
+        """Канонический ключ модели для сопоставления имён из разных источников.
+
+        Убирает регистр и разделители: `glm-5.3-flash`, `GLM 5.3 Flash` и
+        `glm53flash` дают один ключ. Нужно, чтобы скоры Vals AI («GLM 5.3 Flash»)
+        нашлись для модели provod.ai («glm-5.3-flash»).
+        """
+        return re.sub(r"[^a-z0-9]", "", (model or "").lower())
+
     def upsert_benchmark(self, model: str, swe_bench: float | None,
                          note: str | None = None) -> None:
         from datetime import datetime
         self._conn.execute(
             "INSERT OR REPLACE INTO model_benchmarks (model, swe_bench, note, updated_at) "
             "VALUES (?, ?, ?, ?)",
-            (model, swe_bench, note, datetime.utcnow().isoformat()),
+            (self._norm_model(model), swe_bench, note, datetime.utcnow().isoformat()),
         )
         self._conn.commit()
 
     def get_benchmark(self, model: str) -> dict | None:
         row = self._conn.execute(
-            "SELECT * FROM model_benchmarks WHERE model = ?", (model,)
+            "SELECT * FROM model_benchmarks WHERE model = ?", (self._norm_model(model),)
         ).fetchone()
         return dict(row) if row else None
 
