@@ -40,17 +40,21 @@ class IMacAdapter:
     async def run_ios_build_and_test(self, project_dir: str) -> dict:
         """Перенести проект на iMac, запустить flutter build ios + тесты."""
         logger.info("[imac] preparing remote work dir")
-        mkdir = await self._run(f"mkdir -p {self.work_dir}")
-        if mkdir["returncode"] != 0:
-            return {"status": "error", "error": mkdir["stderr"]}
+        project_name = os.path.basename(project_dir.rstrip("/"))
+        remote_project = f"{self.work_dir}/{project_name}"
+        # mkdir должен выполниться НА iMac (по SSH), а не на этой машине.
+        # Заодно чистим прошлую копию: иначе scp -r положит проект внутрь
+        # существующей папки (client/client) и тесты пойдут по устаревшей копии.
+        prep = await self._run(
+            self._ssh_cmd(f"mkdir -p {self.work_dir} && rm -rf {remote_project}")
+        )
+        if prep["returncode"] != 0:
+            return {"status": "error", "error": prep["stderr"]}
 
         logger.info("[imac] copying project to iMac")
         copy = await self._run(self._scp_cmd(project_dir, self.work_dir))
         if copy["returncode"] != 0:
             return {"status": "error", "error": copy["stderr"]}
-
-        project_name = os.path.basename(project_dir.rstrip("/"))
-        remote_project = f"{self.work_dir}/{project_name}"
 
         logger.info("[imac] flutter test on iMac")
         test_cmd = f"cd {remote_project} && flutter test"
