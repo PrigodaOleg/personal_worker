@@ -1928,8 +1928,8 @@ class Scheduler:
 
         # iOS на iMac, если настроен
         if self.config.imac_host and self.config.imac_user:
-            task.add_log("Starting iOS build+test on iMac")
-            ios_res = await self.ios_runner.build_and_test(client_dir)
+            task.add_log("Starting iOS build on iMac")
+            ios_res = await self.ios_runner.build_ios(client_dir)
             task.add_log(f"iOS result: {ios_res.get('status')}")
             if ios_res.get("status") not in ("ok", "skipped"):
                 error_msg = ios_res.get('error', 'неизвестная ошибка')
@@ -1939,7 +1939,7 @@ class Scheduler:
                 log_text = "\n".join(task.log[-15:]) if task.log else ""
                 self._notify_author(
                     task,
-                    f"❌ iOS сборка/тесты не прошли.\n\n"
+                    f"❌ iOS сборка не прошла.\n\n"
                     f"Ошибка: {error_msg}\n\n"
                     f"Лог выполнения:\n{log_text}",
                 )

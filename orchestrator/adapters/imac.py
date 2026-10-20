@@ -37,14 +37,20 @@ class IMacAdapter:
             f"{local_path} {self.user}@{self.host}:{remote_path}"
         )
 
-    async def run_ios_build_and_test(self, project_dir: str) -> dict:
-        """Перенести проект на iMac, запустить flutter build ios + тесты."""
+    async def run_ios_build(self, project_dir: str) -> dict:
+        """Перенести проект на iMac и собрать flutter build ios.
+
+        Юнит-тесты iMac не гоняет: их уже валидирует runtime-контейнер
+        OpenHands (та же Dart VM). К тому же на macOS VM-тесты падают на
+        isar_plus (нативный символ не подгружается в тестовый процесс).
+        Задача iMac-шага — собрать/слинковать iOS-бинарь.
+        """
         logger.info("[imac] preparing remote work dir")
         project_name = os.path.basename(project_dir.rstrip("/"))
         remote_project = f"{self.work_dir}/{project_name}"
         # mkdir должен выполниться НА iMac (по SSH), а не на этой машине.
         # Заодно чистим прошлую копию: иначе scp -r положит проект внутрь
-        # существующей папки (client/client) и тесты пойдут по устаревшей копии.
+        # существующей папки (client/client) и сборка пойдёт по устаревшей копии.
         prep = await self._run(
             self._ssh_cmd(f"mkdir -p {self.work_dir} && rm -rf {remote_project}")
         )
@@ -55,16 +61,6 @@ class IMacAdapter:
         copy = await self._run(self._scp_cmd(project_dir, self.work_dir))
         if copy["returncode"] != 0:
             return {"status": "error", "error": copy["stderr"]}
-
-        logger.info("[imac] flutter test on iMac")
-        test_cmd = f"cd {remote_project} && flutter test"
-        test = await self._run(self._ssh_cmd(test_cmd))
-        if test["returncode"] != 0:
-            return {
-                "status": "test_failed",
-                "error": test["stderr"],
-                "stdout": test["stdout"],
-            }
 
         logger.info("[imac] flutter build ios on iMac")
         # --no-codesign: dev-сертификатов на iMac нет, а шаг нужен для валидации
@@ -81,7 +77,6 @@ class IMacAdapter:
         return {
             "status": "ok",
             "stdout": build["stdout"],
-            "test_stdout": test["stdout"],
         }
 
     async def _run(self, cmd: str) -> dict:

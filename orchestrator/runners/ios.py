@@ -11,6 +11,6 @@ class IOSRunner:
     def __init__(self, imac: IMacAdapter) -> None:
         self.imac = imac
 
-    async def build_and_test(self, workspace: str) -> dict:
+    async def build_ios(self, workspace: str) -> dict:
         project_dir = os.path.join(workspace, "domains/client")
-        return await self.imac.run_ios_build_and_test(project_dir)
+        return await self.imac.run_ios_build(project_dir)
