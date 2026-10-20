@@ -105,7 +105,7 @@ async def fetch_benchmarks_valsai() -> dict[str, float]:
     """Скачать лидерборд Vals AI и вернуть {модель: SWE%} (пусто при сбое)."""
     try:
         async with httpx.AsyncClient(
-            timeout=30, follow_redirects=True,
+            timeout=60, follow_redirects=True,
             headers={"User-Agent": "Mozilla/5.0"},
         ) as client:
             r = await client.get(VALS_AI_URL)

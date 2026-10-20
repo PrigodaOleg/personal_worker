@@ -83,6 +83,15 @@ class Config:
         return self._env("TELEGRAM_ADMIN_USERNAME", self._raw_get("telegram", "admin_username", default=""))
 
     @property
+    def telegram_admin_chat_id(self) -> int | None:
+        """Chat ID админа для служебных уведомлений (сбой/восстановление)."""
+        v = self._env("TELEGRAM_ADMIN_CHAT_ID", self._raw_get("telegram", "admin_chat_id"))
+        try:
+            return int(v) if v not in (None, "") else None
+        except (TypeError, ValueError):
+            return None
+
+    @property
     def telegram_allowed_usernames(self) -> list[str]:
         raw = self._env("TELEGRAM_ALLOWED_USERNAMES", "")
         if raw:
@@ -187,6 +196,11 @@ class Config:
     @property
     def state_db(self) -> str:
         return self._env("STATE_DB", self._raw_get("paths", "state_db", default="/mnt/ssd/personal_worker/state/orchestrator.sqlite"))
+
+    @property
+    def secrets_dir(self) -> str:
+        """Каталог с build-секретами (Firebase), которые кладёт self-hosted runner."""
+        return self._env("SECRETS_DIR", self._raw_get("paths", "secrets_dir", default="/mnt/ssd/personal_worker/secrets"))
 
     # --- Flutter ---
     @property

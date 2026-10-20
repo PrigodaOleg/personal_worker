@@ -193,6 +193,12 @@ class StateStore:
             return None
         return self._row_to_task(row)
 
+    def delete(self, task_id: str) -> bool:
+        """Удалить задачу из истории. True — если была и удалена."""
+        cur = self._conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+        self._conn.commit()
+        return cur.rowcount > 0
+
     def list_by_status(self, status: TaskStatus) -> list[Task]:
         rows = self._conn.execute(
             "SELECT * FROM tasks WHERE status = ? ORDER BY created_at",

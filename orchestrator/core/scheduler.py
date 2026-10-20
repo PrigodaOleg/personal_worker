@@ -94,6 +94,9 @@ class Scheduler:
         # Сколько опросов подряд терпеть недоступное состояние агента,
         # прежде чем считать задачу упавшей.
         self.max_state_misses: int = int(os.getenv("OPENHANDS_MAX_STATE_MISSES", "10"))
+        # Сколько раз подряд можно авто-перезапускать прерванную задачу после
+        # сбоя/перезагрузки, прежде чем пометить её failed (защита от зацикливания).
+        self.max_resume_attempts: int = int(os.getenv("OPENHANDS_MAX_RESUME_ATTEMPTS", "3"))
 
     # ------------------------------------------------------------------ #
     # Вспомогательные
@@ -211,6 +214,19 @@ class Scheduler:
         """Дождаться отправки всех отложенных уведомлений."""
         if self._pending_notifications:
             await asyncio.gather(*list(self._pending_notifications), return_exceptions=True)
+
+    def _notify_admin(self, text: str) -> None:
+        """Служебное уведомление админу в Telegram (сбой, восстановление)."""
+        chat_id = self.config.telegram_admin_chat_id
+        if not chat_id:
+            logger.debug("[notify] admin chat_id не задан, уведомление пропущено")
+            return
+        try:
+            fut = asyncio.ensure_future(self.telegram.send_message(chat_id, text))
+            self._pending_notifications.add(fut)
+            fut.add_done_callback(self._pending_notifications.discard)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("[notify] admin telegram send failed: %s", exc)
 
     def _get_active_task_for_chat(self, chat_id: str) -> Optional[Task]:
         """Найти активную (не завершённую) задачу для этого chat_id."""
@@ -774,6 +790,7 @@ class Scheduler:
              ("🧠 Модель", f"model:{task.id}")],
             [("📖 Логи", f"logs:{task.id}"),
              ("📋 К списку", "tasks:0")],
+            [("🗑 Удалить", f"delask:{task.id}")],
         ])
 
     def _source_tag(self, task: Task) -> str:
@@ -980,6 +997,37 @@ class Scheduler:
                 await self._send_task_detail(query, task)
             return
 
+        if data.startswith("delask:"):
+            task = self.state.get(data.split(":", 1)[1])
+            if task:
+                kb = self.telegram.build_keyboard([
+                    [("🗑 Да, удалить", f"del:{task.id}"),
+                     ("❌ Отмена", f"t:{task.id}")],
+                ])
+                await self._reply(
+                    query,
+                    f"🗑 Удалить задачу «{task.title[:60]}»?\n\n"
+                    "Это необратимо — задача исчезнет из истории.",
+                    kb,
+                )
+            return
+
+        if data.startswith("del:"):
+            task_id = data.split(":", 1)[1]
+            task = self.state.get(task_id)
+            if not task:
+                await self._reply(query, "Задача не найдена.")
+                return
+            if task.status == TaskStatus.RUNNING:
+                await self._reply(query, "⚠️ Задача сейчас выполняется — сначала остановите её.")
+                return
+            title = task.title[:60]
+            self.state.delete(task_id)
+            await self._reply(query, f"🗑 Задача «{title}» удалена из истории.")
+            await self._send_task_list(chat_id_int, chat_id_str, 0,
+                                       message_id=query.get("message_id"))
+            return
+
         if data.startswith("model:"):
             target = data.split(":", 1)[1]
             current = self._default_model() if target == "default" else (
@@ -1184,6 +1232,38 @@ class Scheduler:
     # ------------------------------------------------------------------ #
     # OpenHands — сборки внутри контейнера
     # ------------------------------------------------------------------ #
+    def _inject_build_secrets(self, client_dir: str) -> bool:
+        """Положить build-секреты (Firebase) в workspace для сборки Flutter.
+
+        Секреты приходят в config.secrets_dir (кладёт self-hosted runner job
+        deploy/sync-build-secrets.yml). Если их нет — просто False: сборка
+        продолжается без Firebase-конфига (для валидации обычно достаточно).
+        """
+        src = self.config.secrets_dir
+        available = False
+
+        gs_src = os.path.join(src, "google-services.json")
+        android_app = os.path.join(client_dir, "domains", "client", "android", "app")
+        if os.path.exists(gs_src) and os.path.isdir(android_app):
+            try:
+                shutil.copyfile(gs_src, os.path.join(android_app, "google-services.json"))
+                available = True
+                logger.info("[secrets] google-services.json установлен в workspace")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[secrets] copy google-services.json failed: %s", exc)
+
+        env_src = os.path.join(src, "build.env")
+        client_app = os.path.join(client_dir, "domains", "client")
+        if os.path.exists(env_src) and os.path.isdir(client_app):
+            try:
+                shutil.copyfile(env_src, os.path.join(client_app, "build.env"))
+                available = True
+                logger.info("[secrets] build.env установлен в workspace")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[secrets] copy build.env failed: %s", exc)
+
+        return available
+
     async def _run_openhands(self, task: Task) -> None:
         task.status = TaskStatus.RUNNING
         self.state.save(task)
@@ -1204,6 +1284,18 @@ class Scheduler:
             if proc.returncode != 0:
                 logger.error("[git] clone failed: %s", err.decode("utf-8", errors="replace").strip())
 
+        # Прокидываем build-секреты (Firebase) в workspace, если они есть.
+        has_secrets = self._inject_build_secrets(client_dir)
+
+        secrets_note = ""
+        if has_secrets:
+            secrets_note = (
+                "ПРИМЕЧАНИЕ (Firebase): google-services.json уже установлен в "
+                "android/app/. Значения --dart-define (CLOSERS_*) лежат в файле "
+                "build.env в domains/client (формат KEY=VALUE). При сборке apk/web "
+                "добавь их через --dart-define (возьми значения из build.env).\n\n"
+            )
+
         # Инструкция для агента: внести изменения + запустить тесты и сборки внутри контейнера.
         # Путь — ВНУТРИ runtime-контейнера: там проект лежит в /workspace/<repo>.
         # (Путь /opt/openhands/workspace/... из хоста в контейнере не существует.)
@@ -1219,6 +1311,7 @@ class Scheduler:
             "   - flutter build apk --release --split-per-abi\n"
             "3. Если какие-либо команды завершаются с ошибкой — исправь код и запусти снова.\n"
             "4. Сообщи, когда все проверки пройдены успешно.\n"
+            f"{secrets_note}"
             "Не создавай PR — это сделает оркестратор отдельно."
         )
 
@@ -1759,6 +1852,80 @@ class Scheduler:
     # ------------------------------------------------------------------ #
     # Главный цикл
     # ------------------------------------------------------------------ #
+    async def _recover_interrupted_tasks(self) -> None:
+        """На старте: найти прерванные (сбой/перезагрузка) задачи и продолжить.
+
+        Задача в RUNNING/READY/CLARIFYING остаётся «в воздухе», если сервис упал
+        или машину перезагрузили во время работы. Уведомляем автора и админа о
+        сбое, затем продолжаем: переподключаемся к живому разговору OpenHands
+        либо перезапускаем задачу.
+        """
+        interrupted: list[Task] = []
+        for status in (TaskStatus.RUNNING, TaskStatus.READY, TaskStatus.CLARIFYING):
+            interrupted.extend(self.state.list_by_status(status))
+        if not interrupted:
+            return
+
+        logger.warning("[recover] found %d interrupted task(s)", len(interrupted))
+        for task in interrupted:
+            try:
+                self._notify_author(
+                    task,
+                    "⚠️ Сервис был перезапущен (сбой или перезагрузка машины).\n"
+                    f"Задача «{task.title[:60]}» была прервана — продолжаю автоматически.",
+                )
+                self._notify_admin(
+                    f"⚠️ Сбой/перезагрузка сервиса. Прерванная задача {task.id} "
+                    f"«{task.title[:40]}» — продолжаю."
+                )
+                await self._resume_task(task)
+            except Exception as exc:  # noqa: BLE001
+                # Ошибка одной задачи не должна ронять всё восстановление.
+                logger.error("[recover] task %s resume error: %s", task.id, exc)
+
+    async def _resume_task(self, task: Task) -> None:
+        """Продолжить прерванную задачу: переподключиться к разговору или перезапуск."""
+        if task.status == TaskStatus.CLARIFYING:
+            # Ждали ответа пользователя — снова встаём в ожидание (в _process_task
+            # ответ, пришедший до сбоя, сам продолжит задачу).
+            self._pending_clarifications[task.id] = {
+                "task": task, "future": None, "asked_at": task.created_at,
+            }
+            asyncio.create_task(self._process_task(task))
+            return
+
+        if task.status == TaskStatus.RUNNING and task.conversation_id:
+            # Пробуем переподключиться к разговору OpenHands — мог уцелеть на диске.
+            info = await self.openhands.get_agent_state(task.conversation_id)
+            if info.get("agent_state") is not None:
+                ws = self._ensure_workspace(task)
+                client_dir = os.path.join(ws, "social_mind")
+                task.add_log("Восстановление: переподключение к разговору OpenHands")
+                self.state.save(task)
+                asyncio.create_task(
+                    self._monitor_openhands(task, task.conversation_id, client_dir)
+                )
+                return
+            task.add_log("Восстановление: разговор OpenHands недоступен — перезапуск")
+            self.state.save(task)
+
+        # Разговор мёртв либо задача READY — перезапускаем с новой попыткой.
+        if task.attempt >= self.max_resume_attempts:
+            task.status = TaskStatus.FAILED
+            task.add_log(f"Превышен лимит перезапусков ({task.attempt})")
+            await self._finalize_cost(task)
+            self.state.save(task)
+            self._notify_author(
+                task,
+                f"❌ Задача перезапускалась после сбоев {task.attempt} раз и остановлена.",
+            )
+            self._notify_admin(f"❌ Задача {task.id} остановлена: превышен лимит перезапусков.")
+            return
+        task.attempt += 1
+        task.status = TaskStatus.READY
+        self.state.save(task)
+        asyncio.create_task(self._run_openhands(task))
+
     async def _refresh_prices_and_benchmarks(self) -> None:
         """Обновить цены и SWE-бенчмарки; сбой одного не мешает другому."""
         try:
@@ -1776,13 +1943,12 @@ class Scheduler:
         # Запуск Telegram polling с retry при сетевых сбоях
         await self._start_telegram_with_retry()
 
-        # Восстанавливаем ожидающие уточнения из БД
-        for task in self.state.list_by_status(TaskStatus.CLARIFYING):
-            self._pending_clarifications[task.id] = {
-                "task": task,
-                "future": None,
-                "asked_at": task.created_at,
-            }
+        # Прерванные задачи (сбой/перезагрузка): уведомить и продолжить.
+        try:
+            await self._recover_interrupted_tasks()
+        except Exception as exc:  # noqa: BLE001
+            # Ошибка восстановления не должна блокировать старт сервиса.
+            logger.error("[recover] interrupted-task recovery error: %s", exc)
 
         # Справочные метрики SWE и цены моделей: сид (fallback) + первое обновление.
         try:

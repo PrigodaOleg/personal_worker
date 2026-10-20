@@ -3,19 +3,25 @@ Description=personal_worker — Flutter task orchestrator
 After=network-online.target docker.service
 Wants=network-online.target
 Requires=docker.service
+# Не ограничивать частоту перезапуска: сервис должен подниматься всегда
+# (перезагрузка ОС, потеря питания, падение).
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
 User=oleg
 WorkingDirectory=/mnt/ssd/personal_worker
-EnvironmentFile=/mnt/ssd/personal_worker/.env
-ExecStartPre=/usr/bin/docker compose up -d
-ExecStart=/usr/bin/python3 -m orchestrator.main --env .env --config orchestrator/config.yaml
-ExecStopPost=/usr/bin/docker compose down
+# Зависимости перед стартом: VPN+маршруты (Telegram через VPN, provod.ai в обход)
+# и контейнер OpenHands. Best-effort (`-`): сбой зависимости не блокирует старт —
+# сам оркестратор ретраит Telegram/LLM при недоступности сети.
+ExecStartPre=-/usr/bin/make routing
+ExecStartPre=-/usr/bin/docker compose up -d
+# Venv-python: системного python3 не хватает (нужны зависимости из .venv).
+ExecStart=/mnt/ssd/personal_worker/.venv/bin/python -m orchestrator.main --env .env --config orchestrator/config.yaml
 Restart=always
 RestartSec=10
-# При перезагрузке ОС — поднимаемся автоматически и продолжаем с того места (SQLite состояние)
-StartLimitBurst=0
+# Состояние (SQLite) сохраняется на каждом переходе статуса, поэтому после
+# падения/перезагрузки задача восстанавливается при старте (_recover_interrupted_tasks).
 
 [Install]
 WantedBy=multi-user.target

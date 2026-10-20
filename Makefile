@@ -1,4 +1,4 @@
-.PHONY: install run up down lint test fmt vpn-up routing vpn-status runtime-image openhands-up
+.PHONY: install run up down lint test fmt vpn-up routing vpn-status runtime-image openhands-up secrets
 
 VENV := .venv
 PIP := $(VENV)/bin/pip
@@ -64,6 +64,21 @@ vpn-status:
 	ip route show | grep -E "default|tun0|enp3s0" || true
 	@echo "=== Проверка Telegram API ==="
 	curl -s -m 5 -o /dev/null -w "%{http_code}\n" https://api.telegram.org 2>&1 || echo "Telegram API недоступен"
+
+# Статус build-секретов (Firebase). Секреты кладёт self-hosted runner job
+# (deploy/sync-build-secrets.yml) каждые 6 часов. См. deploy/SECRETS.md.
+secrets:
+	@echo "=== build-секреты в /mnt/ssd/personal_worker/secrets ==="
+	@if [ -d /mnt/ssd/personal_worker/secrets ]; then \
+		ls -la /mnt/ssd/personal_worker/secrets 2>/dev/null; \
+		echo; echo "Возраст build.env:"; \
+		stat -c '%y' /mnt/ssd/personal_worker/secrets/build.env 2>/dev/null || echo "  build.env ещё не создан"; \
+	else \
+		echo "Каталога secrets/ нет — раннер ещё не отдавал секреты."; \
+	fi
+	@echo
+	@echo "Обновить вручную: GitHub → Actions → 'Sync build secrets to worker' → Run workflow."
+	@echo "Подробности: deploy/SECRETS.md"
 
 lint:
 	$(PIP) install ruff 2>/dev/null; $(VENV)/bin/ruff check orchestrator tests 2>/dev/null || echo "ruff not installed"
