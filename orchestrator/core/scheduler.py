@@ -1233,8 +1233,10 @@ class Scheduler:
     # OpenHands — сборки внутри контейнера
     # ------------------------------------------------------------------ #
     def _inject_build_secrets(self, client_dir: str) -> bool:
-        """Положить build-секреты (Firebase) в workspace для сборки Flutter.
+        """Положить build-секреты (Firebase) в хост-копию workspace.
 
+        Это копия для шага iOS-сборки на iMac; агенту внутри runtime-контейнера
+        она не видна — для агента есть _ensure_build_secrets_in_runtime.
         Секреты приходят в config.secrets_dir (кладёт self-hosted runner job
         deploy/sync-build-secrets.yml). Если их нет — просто False: сборка
         продолжается без Firebase-конфига (для валидации обычно достаточно).
@@ -1264,6 +1266,139 @@ class Scheduler:
 
         return available
 
+    _SECRET_FILE_NAMES = ("google-services.json", "build.env")
+
+    def _has_build_secrets(self) -> bool:
+        """Есть ли build-секреты в config.secrets_dir."""
+        src = self.config.secrets_dir
+        return any(
+            os.path.exists(os.path.join(src, name)) for name in self._SECRET_FILE_NAMES
+        )
+
+    async def _docker(self, *args: str, timeout: float = 60) -> tuple[int, str, str]:
+        """Выполнить docker-команду на хосте (вернёт rc, stdout, stderr)."""
+        proc = await asyncio.create_subprocess_exec(
+            "docker", *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            return 124, "", f"docker {' '.join(args)}: timeout {timeout}s"
+        return (
+            proc.returncode,
+            out.decode("utf-8", errors="replace"),
+            err.decode("utf-8", errors="replace"),
+        )
+
+    async def _ensure_build_secrets_in_runtime(
+        self, conversation_id: str, wait_for_container: bool = False
+    ) -> bool:
+        """Прокинуть build-секреты внутрь runtime-контейнера.
+
+        Контейнер ничего не монтирует (Mounts: []), а агент работает в
+        /workspace/social_mind ВНУТРИ контейнера — хост-копия ему не видна.
+        Поэтому кладём файлы через docker cp в два места:
+        - /tmp/pw-secrets/ — как только контейнер запущен (каталог создаётся
+          всегда; запасной путь для агента);
+        - /workspace/social_mind/... — когда OpenHands уже склонировал
+          репозиторий (основное место для сборки).
+
+        True — установлено (или нечего ставить). False — контейнер или
+        workspace ещё не готовы, повторить позже.
+        """
+        if not self._has_build_secrets():
+            return True
+
+        container = f"openhands-runtime-{conversation_id}"
+        src = self.config.secrets_dir
+
+        # 1. Контейнер должен быть запущен (runtime стартует не мгновенно).
+        running = False
+        attempts = 23 if wait_for_container else 1
+        for _ in range(attempts):
+            code, out, _ = await self._docker(
+                "inspect", "--format", "{{.State.Running}}", container, timeout=20
+            )
+            if code == 0 and out.strip() == "true":
+                running = True
+                break
+            await asyncio.sleep(2)
+        if not running:
+            logger.warning("[secrets] runtime-контейнер %s не запущен", container)
+            return False
+
+        # 2. Стейджинг: /tmp/pw-secrets существует всегда.
+        await self._docker("exec", container, "mkdir", "-p", "/tmp/pw-secrets")
+        for name in self._SECRET_FILE_NAMES:
+            fsrc = os.path.join(src, name)
+            if not os.path.exists(fsrc):
+                continue
+            code, _, err = await self._docker(
+                "cp", fsrc, f"{container}:/tmp/pw-secrets/{name}", timeout=60
+            )
+            if code != 0:
+                logger.warning("[secrets] docker cp %s failed: %s", name, err.strip())
+
+        # 3. Основное место: /workspace/..., когда репозиторий уже склонирован.
+        code, out, _ = await self._run_in_container(
+            container,
+            "c=0; [ -d /workspace/social_mind/domains/client ] && c=1; "
+            "a=0; [ -d /workspace/social_mind/domains/client/android/app ] && a=1; "
+            'echo "$c $a"',
+        )
+        if code != 0:
+            return False
+        try:
+            client_ok, android_ok = (int(x) for x in out.split()[:2])
+        except ValueError:
+            return False
+        if not (client_ok or android_ok):
+            return False  # репозиторий ещё не склонирован — повторим позже
+
+        dst = "/workspace/social_mind/domains/client"
+        targets: list[tuple[str, str]] = []
+        if client_ok and os.path.exists(os.path.join(src, "build.env")):
+            targets.append(("build.env", f"{dst}/build.env"))
+        if android_ok and os.path.exists(os.path.join(src, "google-services.json")):
+            targets.append(
+                ("google-services.json", f"{dst}/android/app/google-services.json")
+            )
+        for name, target in targets:
+            code, _, err = await self._docker(
+                "cp", os.path.join(src, name), f"{container}:{target}", timeout=60
+            )
+            if code != 0:
+                logger.warning("[secrets] install %s failed: %s", name, err.strip())
+                return False
+
+        # 4. Права + .git/info/exclude: чтобы агент не закоммитил секреты
+        #    внутри контейнера и они не уехали в PR при синхронизации.
+        fix = (
+            "set -e; "
+            "chmod 600 /tmp/pw-secrets/* 2>/dev/null || true; "
+            f"for f in {dst}/build.env {dst}/android/app/google-services.json; do "
+            '  [ -f "$f" ] && chmod 600 "$f" || true; '
+            "done; "
+            "ex=/workspace/social_mind/.git/info/exclude; "
+            "if [ -d /workspace/social_mind/.git ]; then "
+            '  mkdir -p "$(dirname "$ex")"; touch "$ex"; '
+            "  for f in build.env google-services.json "
+            "domains/client/build.env domains/client/android/app/google-services.json; do "
+            '    grep -qxF "$f" "$ex" || echo "$f" >> "$ex"; '
+            "  done; "
+            "fi"
+        )
+        code, _, err = await self._run_in_container(container, fix)
+        if code != 0:
+            logger.warning("[secrets] chmod/exclude failed: %s", err.strip())
+
+        logger.info("[secrets] build-секреты установлены в %s", container)
+        return True
+
     async def _run_openhands(self, task: Task) -> None:
         task.status = TaskStatus.RUNNING
         self.state.save(task)
@@ -1290,10 +1425,15 @@ class Scheduler:
         secrets_note = ""
         if has_secrets:
             secrets_note = (
-                "ПРИМЕЧАНИЕ (Firebase): google-services.json уже установлен в "
-                "android/app/. Значения --dart-define (CLOSERS_*) лежат в файле "
-                "build.env в domains/client (формат KEY=VALUE). При сборке apk/web "
-                "добавь их через --dart-define (возьми значения из build.env).\n\n"
+                "ПРИМЕЧАНИЕ (Firebase, build-секреты):\n"
+                "- google-services.json оркестратор кладёт в android/app/ "
+                "автоматически; если файла там нет — скопируй его сам: "
+                "sudo install -m 600 /tmp/pw-secrets/google-services.json "
+                "android/app/google-services.json\n"
+                "- Значения --dart-define (CLOSERS_*) — в /tmp/pw-secrets/build.env "
+                "(формат KEY=VALUE); при сборке apk/web добавь их через --dart-define.\n"
+                "- Это секретные файлы: НЕ коммить их и НЕ показывай их "
+                "содержимое в ответах — только используй для сборки.\n\n"
             )
 
         # Инструкция для агента: внести изменения + запустить тесты и сборки внутри контейнера.
@@ -1366,6 +1506,24 @@ class Scheduler:
         task.add_log(f"OpenHands conversation created: {conversation_id}")
         task.conversation_id = conversation_id
         self.state.save(task)
+
+        # Прокидываем build-секреты внутрь runtime-контейнера: он ничего не
+        # монтирует, а агент работает в /workspace внутри контейнера. Ждём
+        # контейнер; если workspace ещё не склонирован — доложит мониторинг.
+        if self._has_build_secrets():
+            try:
+                staged = await self._ensure_build_secrets_in_runtime(
+                    conversation_id, wait_for_container=True
+                )
+            except Exception as exc:  # noqa: BLE001 — не мешаем старту агента
+                logger.warning("[secrets] ensure failed: %s", exc)
+                staged = False
+            task.add_log(
+                "Build secrets: проброшены в контейнер"
+                if staged
+                else "Build secrets: workspace ещё не готов, установим при мониторинге"
+            )
+            self.state.save(task)
 
         # Запускаем agente loop
         start_result = await self.openhands.start_conversation(conversation_id)
@@ -1474,7 +1632,28 @@ class Scheduler:
         поэтому по нему результат не определить.
         """
         state_misses = 0
+        # Build-секреты: повторяем установку, пока OpenHands не склонировал
+        # репозиторий в /workspace (покрывает и старт, и recovery).
+        secrets_done = not self._has_build_secrets()
+        secrets_tries = 0
         while True:
+            if not secrets_done:
+                secrets_tries += 1
+                try:
+                    secrets_done = await self._ensure_build_secrets_in_runtime(
+                        conversation_id
+                    )
+                except Exception as exc:  # noqa: BLE001 — не роняем мониторинг
+                    logger.warning("[secrets] ensure failed: %s", exc)
+                    secrets_done = False
+                if secrets_done:
+                    task.add_log("Build secrets установлены в контейнер")
+                elif secrets_tries >= 30:
+                    secrets_done = True  # не ретраим вечно
+                    task.add_log(
+                        "Build secrets: не удалось установить в workspace, "
+                        "сборка продолжится без Firebase-конфига"
+                    )
             info = await self.openhands.get_agent_state(conversation_id)
             state_val = info.get("agent_state")
 
@@ -1656,6 +1835,16 @@ class Scheduler:
         # Убираем дубли, сохраняя порядок.
         seen: set[str] = set()
         changed = [p for p in changed if not (p in seen or seen.add(p))]
+
+        # Секреты сборки наружу не тащим: на хосте они уже лежат в secrets_dir,
+        # а в PR они всё равно исключены из git add (страховка в глубину).
+        secret_names = set(self._SECRET_FILE_NAMES)
+        changed = [
+            p for p in changed if os.path.basename(p.rstrip("/")) not in secret_names
+        ]
+        deleted = [
+            p for p in deleted if os.path.basename(p.rstrip("/")) not in secret_names
+        ]
 
         copied = 0
         # Временные файлы держим ВНЕ рабочей копии: иначе .pw-tmp попадёт
