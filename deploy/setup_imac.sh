@@ -65,6 +65,9 @@ su - "${WORKER_USER}" -c 'export PATH=/opt/homebrew/bin:$PATH; brew install coco
 
 echo "== 6. Flutter (stable) =="
 su - "${WORKER_USER}" -c 'test -d ~/flutter || git clone -b stable --depth 1 https://github.com/flutter/flutter.git ~/flutter'
+# SPM отключаем: проект на CocoaPods, а isar_plus_flutter_libs не поддерживает
+# SPM — попытка миграции ломает сборку ("No Xcode build settings").
+su - "${WORKER_USER}" -c 'export PATH=$HOME/flutter/bin:$PATH; flutter config --no-enable-swift-package-manager' || true
 ZSHENV="/Users/${WORKER_USER}/.zshenv"
 grep -q '/opt/homebrew/bin' "${ZSHENV}" 2>/dev/null || \
     printf '%s\n' \
