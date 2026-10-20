@@ -63,7 +63,9 @@ class IMacAdapter:
             }
 
         logger.info("[imac] flutter build ios on iMac")
-        build_cmd = f"cd {remote_project} && flutter build ios --release"
+        # --no-codesign: dev-сертификатов на iMac нет, а шаг нужен для валидации
+        # компиляции/линковки iOS, а не для подписи и выкладки.
+        build_cmd = f"cd {remote_project} && flutter build ios --release --no-codesign"
         build = await self._run(self._ssh_cmd(build_cmd))
         if build["returncode"] != 0:
             return {
