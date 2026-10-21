@@ -195,12 +195,15 @@ class Scheduler:
         уничтожить её до отправки, и уведомление молча потеряется.
         """
         if task.source == TaskSource.GITHUB:
-            try:
-                num = int(task.source_id)
-                self.github.create_comment(num, text)
-                logger.info("[notify] comment added to issue #%s", num)
-            except Exception as exc:
-                logger.error("[notify] github comment failed: %s", exc)
+            async def _comment_to_issue() -> None:
+                try:
+                    num = int(task.source_id)
+                    await asyncio.to_thread(self.github.create_comment, num, text)
+                    logger.info("[notify] comment added to issue #%s", num)
+                except Exception as exc:
+                    logger.error("[notify] github comment failed: %s", exc)
+
+            self._spawn(_comment_to_issue())
         elif task.source == TaskSource.TELEGRAM:
             try:
                 chat_id = int(task.source_id)
@@ -1252,6 +1255,10 @@ class Scheduler:
     # Основная обработка задачи (вызывается в фоне через create_task)
     # ------------------------------------------------------------------ #
     async def _process_task(self, task: Task) -> None:
+        # Объект задачи мог устареть, пока она ждала в очереди, — берём из БД.
+        fresh = self.state.get(task.id)
+        if fresh is not None:
+            task = fresh
         logger.info("[task] %s status=%s", task.id, task.status.value)
 
         if task.status == TaskStatus.NEW:
@@ -1303,7 +1310,9 @@ class Scheduler:
         elif task.source == TaskSource.GITHUB:
             try:
                 num = int(task.source_id)
-                comment_id = self.github.create_comment(num, f"❓ {question}")
+                comment_id = await asyncio.to_thread(
+                    self.github.create_comment, num, f"❓ {question}"
+                )
                 self._pending_clarifications[task.id] = {
                     "task": task,
                     "future": None,
@@ -1327,23 +1336,19 @@ class Scheduler:
                 logger.error("[telegram] failed to send clarification confirmation: %s", exc)
         elif task.source == TaskSource.GITHUB:
             try:
-                self.github.create_comment(int(task.source_id), text)
+                await asyncio.to_thread(
+                    self.github.create_comment, int(task.source_id), text
+                )
             except Exception as exc:
                 logger.error("[clarify] github confirmation failed: %s", exc)
 
     async def _wait_for_clarification(self, task: Task) -> None:
         info = self._pending_clarifications.get(task.id)
-        if not info:
-            # Рестарт/сбой потерял состояние вопроса (живёт в памяти).
-            # Переспрашиваем — иначе задача молча падала бы после каждого
-            # перезапуска сервиса во время ожидания уточнений.
-            logger.warning("[clarify] %s: pending state lost, re-asking", task.id)
-            await self._ask_clarification(task)
-            return
+        asked_at: datetime = (info or {}).get("asked_at") or task.created_at
+        answer = task.clarification_answer
 
-        asked_at: datetime = info["asked_at"]
         timeout = timedelta(seconds=self.config.clarification_timeout_seconds)
-        if datetime.utcnow() - asked_at > timeout:
+        if answer is None and datetime.utcnow() - asked_at > timeout:
             logger.warning("[clarify] timeout for task %s", task.id)
             timeout_h = self.config.clarification_timeout_seconds // 3600
             timeout_txt = (
@@ -1361,35 +1366,47 @@ class Scheduler:
             self._pending_clarifications.pop(task.id, None)
             return
 
-        if task.clarification_answer:
-            answer = task.clarification_answer
-            task.description += f"\n\nУточнение пользователя: {answer}"
-            task.status = TaskStatus.READY
-            self.state.save(task)
-            self._pending_clarifications.pop(task.id, None)
-            await self._confirm_clarification_accepted(task)
-            logger.info("[clarify] task %s calling _run_openhands (answer already set)", task.id)
-            await self._run_openhands(task)
+        if answer is None and info is None:
+            # Рестарт/сбой потерял состояние вопроса (живёт в памяти).
+            # Переспрашиваем — иначе задача молча падала бы после каждого
+            # перезапуска сервиса во время ожидания уточнений.
+            logger.warning("[clarify] %s: pending state lost, re-asking", task.id)
+            await self._ask_clarification(task)
             return
 
-        if info["future"] and not info["future"].done():
-            logger.info("[clarify] task %s waiting for future (poll=%ds)", task.id, self.config.clarification_poll_seconds)
-            try:
-                answer = await asyncio.wait_for(
-                    info["future"], timeout=self.config.clarification_poll_seconds
+        if answer is None and info:
+            fut = info.get("future")
+            if fut and not fut.done():
+                logger.info(
+                    "[clarify] task %s waiting for future (poll=%ds)",
+                    task.id, self.config.clarification_poll_seconds,
                 )
-                logger.info("[clarify] task %s future resolved with answer: %s", task.id, answer[:50])
-                task.clarification_answer = answer
-                task.description += f"\n\nУточнение пользователя: {answer}"
-                task.status = TaskStatus.READY
-                self.state.save(task)
-                self._pending_clarifications.pop(task.id, None)
-                await self._confirm_clarification_accepted(task)
-                logger.info("[clarify] task %s calling _run_openhands", task.id)
-                await self._run_openhands(task)
-            except asyncio.TimeoutError:
-                logger.info("[clarify] task %s future timeout, will retry on next tick", task.id)
-                pass
+                try:
+                    answer = await asyncio.wait_for(
+                        fut, timeout=self.config.clarification_poll_seconds
+                    )
+                except asyncio.TimeoutError:
+                    logger.info(
+                        "[clarify] task %s future timeout, will retry on next tick",
+                        task.id,
+                    )
+                    return
+
+        if not answer:
+            return
+
+        # Ответ получен. Запуск — ТОЛЬКО в фоне: _run_openhands живёт часами,
+        # и если ждать его прямо здесь, встанет весь главный цикл (poll_github,
+        # ответы на вопросы агента, статусы). Для GitHub-задач это вообще
+        # дедлок: ответ на вопрос агента собирает тот же главный цикл.
+        task.description += f"\n\nУточнение пользователя: {answer}"
+        task.clarification_answer = answer
+        task.status = TaskStatus.READY
+        self.state.save(task)
+        self._pending_clarifications.pop(task.id, None)
+        await self._confirm_clarification_accepted(task)
+        logger.info("[clarify] task %s answer accepted, starting openhands in background", task.id)
+        self._spawn(self._run_openhands(task))
 
     def resolve_telegram_answer(self, chat_id: str, answer: str) -> None:
         for tid, info in self._pending_clarifications.items():
@@ -1587,6 +1604,24 @@ class Scheduler:
         return True
 
     async def _run_openhands(self, task: Task) -> None:
+        """Защита от двойного запуска одной задачи.
+
+        Задачу могут «продолжить» одновременно два пути (главный цикл после
+        уточнения и фоновый _process_task) — без защиты создались бы два
+        разговора OpenHands и две ветки PR.
+        """
+        if task.id in self._running_tasks:
+            logger.warning(
+                "[task] %s уже выполняется — дублирующий запуск пропущен", task.id
+            )
+            return
+        self._running_tasks.add(task.id)
+        try:
+            await self._run_openhands_impl(task)
+        finally:
+            self._running_tasks.discard(task.id)
+
+    async def _run_openhands_impl(self, task: Task) -> None:
         task.status = TaskStatus.RUNNING
         self.state.save(task)
 
@@ -1748,7 +1783,11 @@ class Scheduler:
         """
         text, options = self._parse_question_options(question)
         fut = asyncio.get_event_loop().create_future()
-        self._pending_agent_questions[task.id] = {
+        # ВАЖНО: держим ссылку qinfo на запись — в GitHub-ветке в неё
+        # прописываются github_issue/github_after_comment_id, по которым
+        # poll_github находит ответ автора. Без этого задача зависает,
+        # пока не истечёт таймаут ожидания ответа.
+        qinfo = self._pending_agent_questions[task.id] = {
             "task": task,
             "conversation_id": conversation_id,
             "options": options,
@@ -1782,7 +1821,11 @@ class Scheduler:
                 else:
                     lines.append("")
                     lines.append("Ответьте комментарием к issue.")
-                question_comment_id = self.github.create_comment(num, "\n".join(lines))
+                # create_comment — блокирующий вызов PyGithub: уводим в поток,
+                # чтобы не тормозить event loop (и Telegram) на время запроса.
+                question_comment_id = await asyncio.to_thread(
+                    self.github.create_comment, num, "\n".join(lines)
+                )
                 qinfo["github_issue"] = num
                 # Ответом считаем только комментарии ПОСЛЕ этого вопроса.
                 qinfo["github_after_comment_id"] = question_comment_id
@@ -1800,7 +1843,7 @@ class Scheduler:
                 await self._close_question_message(chat_id, question_msg_id, text,
                                                    "⏰ Время ожидания ответа истекло.")
             elif task.source == TaskSource.GITHUB and question_comment_id:
-                self._update_github_question_comment(
+                await self._update_github_question_comment(
                     question_comment_id, text, "⏰ Время ожидания ответа истекло."
                 )
             return False
@@ -1816,11 +1859,22 @@ class Scheduler:
             await self._close_question_message(chat_id, question_msg_id, text,
                                                f"✅ Ответ принят: {answer[:200]}")
         elif task.source == TaskSource.GITHUB and question_comment_id:
-            self._update_github_question_comment(
+            await self._update_github_question_comment(
                 question_comment_id, text, f"✅ Ответ принят: {answer[:200]}"
             )
         try:
-            await self.openhands.send_message(conversation_id, answer)
+            res = await self.openhands.send_message(conversation_id, answer)
+            if res.get("status") == "error" or res.get("success") is False:
+                # Разговор могли погасить за время долгого ожидания ответа —
+                # пробуем разбудить и доставить ещё раз.
+                await self.openhands.start_conversation(conversation_id)
+                res = await self.openhands.send_message(conversation_id, answer)
+                if res.get("status") == "error" or res.get("success") is False:
+                    logger.error(
+                        "[agent-question] answer delivery failed for %s: %s",
+                        conversation_id, res,
+                    )
+                    return False
             task.add_log(f"Ответ пользователю отправлен агенту: {answer[:60]}")
             self.state.save(task)
             return True
@@ -1838,12 +1892,16 @@ class Scheduler:
         except Exception as exc:  # noqa: BLE001
             logger.error("[agent-question] close question message failed: %s", exc)
 
-    def _update_github_question_comment(
+    async def _update_github_question_comment(
         self, comment_id: int, question: str, footer: str
     ) -> None:
         """Дописать итог (ответ/истечение) в комментарий-вопрос issue."""
         try:
-            self.github.update_comment(comment_id, f"❓ {question}\n\n{footer}")
+            await asyncio.to_thread(
+                self.github.update_comment,
+                comment_id,
+                f"❓ {question}\n\n{footer}",
+            )
         except Exception as exc:  # noqa: BLE001
             logger.error("[agent-question] github comment update failed: %s", exc)
 
@@ -1855,6 +1913,10 @@ class Scheduler:
         поэтому по нему результат не определить.
         """
         state_misses = 0
+        # Текст вопроса, на который только что отправили ответ. Нужен, чтобы не
+        # задать тот же вопрос повторно: после доставки ответа агент ещё какое-то
+        # время остаётся в awaiting_user_input со старым сообщением.
+        answered_msg: Optional[str] = None
         # Build-секреты: повторяем установку, пока OpenHands не склонировал
         # репозиторий в /workspace (покрывает и старт, и recovery).
         secrets_done = not self._has_build_secrets()
@@ -1912,11 +1974,21 @@ class Scheduler:
 
             state_misses = 0
 
+            # Агент возобновил работу после ответа — снимаем защиту от
+            # повторного вопроса.
+            if state_val != "awaiting_user_input":
+                answered_msg = None
+
             # Агент ждёт ответа пользователя — либо вопрос, либо финальный отчёт.
             if state_val == "awaiting_user_input":
                 message = (info.get("message") or "").strip()
                 wants_response = bool(info.get("wait_for_response"))
                 if wants_response or self._looks_like_clarification(message):
+                    if message and message == answered_msg:
+                        # Ответ только что отправлен, агент ещё не проснулся —
+                        # повторный вопрос по тому же тексту задавать нельзя.
+                        await asyncio.sleep(self.config.clarification_poll_seconds)
+                        continue
                     # Вопрос агента в процессе работы: показываем, ждём ответ,
                     # отправляем в тот же разговор и продолжаем мониторинг.
                     answered = await self._handle_agent_question(
@@ -1926,7 +1998,9 @@ class Scheduler:
                         return
                     if not answered:
                         task.status = TaskStatus.FAILED
-                        task.add_log("Ответ на вопрос агента не получен (таймаут)")
+                        task.add_log(
+                            "Не удалось получить или доставить ответ на вопрос агента"
+                        )
                         await self._finalize_cost(task)
                         self.state.save(task)
                         self._notify_author(
@@ -1935,6 +2009,7 @@ class Scheduler:
                             f"Вопрос был: {message[:200]}",
                         )
                         return
+                    answered_msg = message
                     continue
                 task.status = TaskStatus.DONE
                 self.state.save(task)
@@ -2315,9 +2390,22 @@ class Scheduler:
         if task.status == TaskStatus.CLARIFYING:
             # Ждали ответа пользователя — снова встаём в ожидание (в _process_task
             # ответ, пришедший до сбоя, сам продолжит задачу).
-            self._pending_clarifications[task.id] = {
-                "task": task, "future": None, "asked_at": task.created_at,
-            }
+            record: dict = {"task": task, "future": None, "asked_at": task.created_at}
+            if task.source == TaskSource.GITHUB:
+                # Без github_issue сбор ответов из комментариев вообще не работает,
+                # а без after_comment_id старый комментарий сойдёт за ответ.
+                try:
+                    num = int(task.source_id)
+                    record["github_issue"] = num
+                    record["github_after_comment_id"] = await asyncio.to_thread(
+                        self.github.last_bot_comment_id, num
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "[recover] %s: github clarify boundary restore failed: %s",
+                        task.id, exc,
+                    )
+            self._pending_clarifications[task.id] = record
             self._spawn(self._process_task(task))
             return
 

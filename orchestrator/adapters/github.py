@@ -107,6 +107,23 @@ class GitHubAdapter:
         issue = self._repo.get_issue(number=issue_number)
         return issue.state
 
+    def last_bot_comment_id(self, issue_number: int) -> Optional[int]:
+        """ID последнего комментария бота к issue (наши вопросы и уведомления).
+
+        Нужен при восстановлении уточнений после рестарта: ответом считаем
+        только комментарии, оставленные ПОСЛЕ нашего последнего комментария.
+        None — у issue ещё нет комментариев от бота.
+        """
+        self._ensure_auth()
+        assert self._repo is not None
+        issue = self._repo.get_issue(number=issue_number)
+        last_id: Optional[int] = None
+        for comment in issue.get_comments():
+            user = comment.user
+            if user is not None and getattr(user, "type", None) == "Bot":
+                last_id = comment.id
+        return last_id
+
     def fetch_issue_comments(
         self, issue_number: int, after_comment_id: Optional[int] = None
     ) -> list[dict]:
