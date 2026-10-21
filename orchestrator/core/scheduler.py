@@ -33,14 +33,12 @@ from typing import Optional
 import yaml
 
 from orchestrator.adapters.github import GitHubAdapter
-from orchestrator.adapters.imac import IMacAdapter
 from orchestrator.adapters.openhands import OpenHandsAdapter
 from orchestrator.adapters.telegram import MENU_COMMANDS, TelegramAdapter
 from orchestrator.core.config import Config
 from orchestrator.core import pricing
 from orchestrator.core.state import StateStore
 from orchestrator.core.task import Task, TaskSource, TaskStatus
-from orchestrator.runners.ios import IOSRunner
 
 logger = logging.getLogger("personal_worker")
 
@@ -74,13 +72,6 @@ class Scheduler:
             github_private_key_path=config.github_private_key_path,
             github_installation_id=config.github_installation_id,
         )
-        self.imac = IMacAdapter(
-            host=config.imac_host or "",
-            user=config.imac_user or "",
-            ssh_key=config.imac_ssh_key,
-            work_dir=config.imac_work_dir,
-        )
-        self.ios_runner = IOSRunner(imac=self.imac)
 
         self._pending_clarifications: dict[str, dict] = {}
         # Ожидающие ответа пользователя ВОПРОСЫ АГЕНТА (в процессе работы):
@@ -1593,6 +1584,66 @@ class Scheduler:
             os.path.exists(os.path.join(src, name)) for name in self._SECRET_FILE_NAMES
         )
 
+    def _imac_ssh_configured(self) -> bool:
+        """iMac настроен (host/user) и SSH-ключ существует на хосте.
+
+        Нужен агенту: iOS-сборку он делает сам, по SSH с iMac (macOS-only
+        шаг, в Linux-контейнере невозможен).
+        """
+        key = os.path.expanduser(self.config.imac_ssh_key)
+        return bool(
+            self.config.imac_host
+            and self.config.imac_user
+            and os.path.exists(key)
+        )
+
+    async def _ensure_imac_ssh_in_runtime(
+        self, conversation_id: str, wait_for_container: bool = False
+    ) -> bool:
+        """Прокинуть SSH-ключ iMac внутрь runtime-контейнера.
+
+        Агент сам ходит на iMac по SSH и интерпретирует результаты сборки —
+        от них зависят его дальнейшие действия. Ключ кладём ТОЛЬКО в
+        /tmp/pw-imac-key: в /workspace/social_mind нельзя — он оказался бы
+        в git-репозитории и уехал бы в PR.
+
+        True — ключ установлен (или iMac не настроен). False — контейнер ещё
+        не готов, повторить позже.
+        """
+        if not self._imac_ssh_configured():
+            return True
+        key = os.path.expanduser(self.config.imac_ssh_key)
+        container = f"openhands-runtime-{conversation_id}"
+
+        # Контейнер должен быть запущен (runtime стартует не мгновенно).
+        running = False
+        attempts = 23 if wait_for_container else 1
+        for _ in range(attempts):
+            code, out, _ = await self._docker(
+                "inspect", "--format", "{{.State.Running}}", container, timeout=20
+            )
+            if code == 0 and out.strip() == "true":
+                running = True
+                break
+            await asyncio.sleep(2)
+        if not running:
+            logger.warning("[imac-ssh] runtime-контейнер %s не запущен", container)
+            return False
+
+        code, _, err = await self._docker(
+            "cp", key, f"{container}:/tmp/pw-imac-key", timeout=60
+        )
+        if code != 0:
+            logger.warning("[imac-ssh] docker cp key failed: %s", err.strip())
+            return False
+        code, _, _ = await self._docker(
+            "exec", container, "chmod", "600", "/tmp/pw-imac-key", timeout=20
+        )
+        if code != 0:
+            logger.warning("[imac-ssh] chmod 600 on key failed")
+            return False
+        return True
+
     async def _docker(self, *args: str, timeout: float = 60) -> tuple[int, str, str]:
         """Выполнить docker-команду на хосте (вернёт rc, stdout, stderr)."""
         proc = await asyncio.create_subprocess_exec(
@@ -1775,6 +1826,51 @@ class Scheduler:
         # Инструкция для агента: внести изменения + запустить тесты и сборки внутри контейнера.
         # Путь — ВНУТРИ runtime-контейнера: там проект лежит в /workspace/<repo>.
         # (Путь /opt/openhands/workspace/... из хоста в контейнере не существует.)
+        #
+        # Проверка iOS: агент сам ходит на iMac по SSH (ключ кладёт
+        # _ensure_imac_ssh_in_runtime в /tmp/pw-imac-key) и интерпретирует
+        # результат — от него зависят его дальнейшие действия. Оркестратор
+        # iOS повторно не собирает.
+        if self._imac_ssh_configured():
+            imac_user = self.config.imac_user
+            imac_host = self.config.imac_host
+            imac_workdir = self.config.imac_work_dir
+            ssh = (
+                f"ssh -i /tmp/pw-imac-key -o StrictHostKeyChecking=accept-new "
+                f"{imac_user}@{imac_host}"
+            )
+            imac_item = (
+                "3. iOS-сборка выполняется НЕ в контейнере (Linux не умеет iOS), "
+                "а на отдельном macOS-хосте по SSH. После успешных проверок из "
+                "пункта 2 сделай:\n"
+                "   a) скопируй проект на iMac (без build-артефактов):\n"
+                "      tar -C /workspace/social_mind/domains/client "
+                "--exclude=build --exclude=.dart_tool -cf - . | \\\n"
+                f"      {ssh} 'mkdir -p {imac_workdir}/client && "
+                f"tar -xf - -C {imac_workdir}/client'\n"
+                "   b) собери iOS (--no-codesign: валидируем компиляцию/линковку, "
+                "а не подпись):\n"
+                f"      {ssh} 'cd {imac_workdir}/client && "
+                "flutter build ios --release --no-codesign'\n"
+                "   c) если сборка упала — исправь код в контейнере и повтори a)–b).\n"
+                "   ВАЖНО: на iMac НЕ запускай flutter test — на macOS тесты "
+                "isar_plus падают из-за отсутствия нативного символа в тестовом "
+                "процессе, это НЕ ошибки твоего кода; тесты уже прогнаны в "
+                "контейнере (пункт 2).\n"
+                "   Если iMac недоступен по SSH (сеть/выключен) — это не ошибка "
+                "кода: продолжи работу и явно укажи в финальном отчёте, что iOS "
+                "не проверена из-за недоступности iMac.\n"
+            )
+            tail_items = (
+                "4. Если какие-либо команды завершаются с ошибкой — исправь код и запусти снова.\n"
+                "5. Сообщи, когда все проверки пройдены успешно.\n"
+            )
+        else:
+            imac_item = ""
+            tail_items = (
+                "3. Если какие-либо команды завершаются с ошибкой — исправь код и запусти снова.\n"
+                "4. Сообщи, когда все проверки пройдены успешно.\n"
+            )
         instruction = (
             f"{task.description}\n\n"
             "ТРЕБОВАНИЯ:\n"
@@ -1785,8 +1881,8 @@ class Scheduler:
             "   - flutter build linux\n"
             "   - flutter build web --release\n"
             "   - flutter build apk --release --split-per-abi\n"
-            "3. Если какие-либо команды завершаются с ошибкой — исправь код и запусти снова.\n"
-            "4. Сообщи, когда все проверки пройдены успешно.\n"
+            f"{imac_item}"
+            f"{tail_items}"
             f"{secrets_note}"
             "Не создавай PR — это сделает оркестратор отдельно."
         )
@@ -1858,6 +1954,22 @@ class Scheduler:
                 "Build secrets: проброшены в контейнер"
                 if staged
                 else "Build secrets: workspace ещё не готов, установим при мониторинге"
+            )
+            self.state.save(task)
+
+        # SSH-ключ iMac: агент сам гоняет iOS-сборку на iMac по SSH.
+        if self._imac_ssh_configured():
+            try:
+                imac_staged = await self._ensure_imac_ssh_in_runtime(
+                    conversation_id, wait_for_container=True
+                )
+            except Exception as exc:  # noqa: BLE001 — не мешаем старту агента
+                logger.warning("[imac-ssh] ensure failed: %s", exc)
+                imac_staged = False
+            task.add_log(
+                "SSH-ключ iMac проброшен в контейнер"
+                if imac_staged
+                else "SSH-ключ iMac: контейнер ещё не готов, установим при мониторинге"
             )
             self.state.save(task)
 
@@ -2043,11 +2155,32 @@ class Scheduler:
         # репозиторий в /workspace (покрывает и старт, и recovery).
         secrets_done = not self._has_build_secrets()
         secrets_tries = 0
+        # SSH-ключ iMac: /tmp-стейджинг не зависит от клона репозитория,
+        # но ретраим на случай, если контейнер ещё поднимался.
+        imac_done = not self._imac_ssh_configured()
+        imac_tries = 0
         while True:
             if task.status == TaskStatus.CANCELLED:
                 task.add_log("Мониторинг остановлен: задача отменена")
                 self.state.save(task)
                 return
+            if not imac_done:
+                imac_tries += 1
+                try:
+                    imac_done = await self._ensure_imac_ssh_in_runtime(
+                        conversation_id
+                    )
+                except Exception as exc:  # noqa: BLE001 — не роняем мониторинг
+                    logger.warning("[imac-ssh] ensure failed: %s", exc)
+                    imac_done = False
+                if imac_done:
+                    task.add_log("SSH-ключ iMac установлен в контейнер")
+                elif imac_tries >= 30:
+                    imac_done = True  # не ретраим вечно
+                    task.add_log(
+                        "SSH-ключ iMac: не удалось установить — "
+                        "iOS-проверка агентом будет недоступна"
+                    )
             if not secrets_done:
                 secrets_tries += 1
                 try:
@@ -2480,26 +2613,9 @@ class Scheduler:
             task.add_log(f"Синхронизация пропущена: {sync.get('reason')}")
         self.state.save(task)
 
-        # iOS на iMac, если настроен
-        if self.config.imac_host and self.config.imac_user:
-            task.add_log("Starting iOS build on iMac")
-            ios_res = await self.ios_runner.build_ios(client_dir)
-            task.add_log(f"iOS result: {ios_res.get('status')}")
-            if ios_res.get("status") not in ("ok", "skipped"):
-                error_msg = ios_res.get('error', 'неизвестная ошибка')
-                task.status = TaskStatus.FAILED
-                self.state.save(task)
-                task.add_log(f"iOS failed: {error_msg}")
-                log_text = "\n".join(task.log[-15:]) if task.log else ""
-                self._notify_author(
-                    task,
-                    f"❌ iOS сборка не прошла.\n\n"
-                    f"Ошибка: {error_msg}\n\n"
-                    f"Лог выполнения:\n{log_text}",
-                )
-                return
-        else:
-            task.add_log("iOS skipped: iMac not configured")
+        # iOS на iMac НЕ собираем здесь: агент сам проверил iOS-сборку по SSH
+        # из runtime-контейнера (см. инструкцию в _run_openhands_impl) и
+        # интерпретировал результат. Дублирующая сборка оркестратором излишня.
 
         # Создаём ветку, коммит, пуш, PR. Ветка зависит от номера попытки —
         # чтобы перезапуск не конфликтовал с веткой прошлого прогона.

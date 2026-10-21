@@ -66,7 +66,12 @@ def make_scheduler() -> Scheduler:
     s.openhands = FakeOpenHands()
     s.telegram = FakeTelegram()
     s.state = types.SimpleNamespace(save=lambda t: None)
-    s.config = types.SimpleNamespace(clarification_timeout_seconds=60)
+    s.config = types.SimpleNamespace(
+        clarification_timeout_seconds=60,
+        imac_host=None,
+        imac_user=None,
+        imac_ssh_key="",
+    )
     return s
 
 

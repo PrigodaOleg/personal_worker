@@ -7,7 +7,8 @@
 ## Что это за система
 
 Оркестратор берёт задачу (GitHub Issue с меткой `aitask` или сообщение
-Telegram), запускает её через OpenHands, собирает iOS на iMac по SSH, создаёт PR
+Telegram), запускает её через OpenHands (агент сам проверяет iOS на iMac по
+SSH из контейнера), создаёт PR
 в `PrigodaOleg/social_mind` и уведомляет автора. Поток задачи и разделение по
 платформам — в [ARCHITECTURE.md](ARCHITECTURE.md).
 
@@ -259,18 +260,32 @@ docker rm -f $(docker ps -aq --filter "name=openhands-runtime")
 восстанавливается после рестарта наравне с READY/CLARIFYING/RUNNING — иначе
 задача из очереди терялась, а poll_github навсегда пропускал её issue.
 
-## Почему iOS собирается на iMac, а не в контейнере
+## iOS-проверка: агент сам ходит на iMac по SSH
 
 Runtime-контейнер агента — Linux: в нём модель гоняет `flutter test`,
 `flutter build apk/web/linux`. `flutter build ios` требует macOS + Xcode —
-в Linux-контейнере это невозможно физически, поэтому шаг делегируется на
-iMac (`orchestrator/runners/ios.py`, SSH). Смысл — pre-flight проверка ДО
-создания PR: без неё сломанная iOS-сборка впервые проявилась бы только в
-GitHub Actions (`macos-latest` в dart.yml) на уже открытом PR. Отключается
-переменными `IMAC_*` (не заданы → «iOS skipped: iMac not configured», iOS
-тогда проверяет только CI после PR). Параллельные сборки на iMac
-невозможны по построению — очередь задач гарантирует одну за раз (каталог
-`~/personal_worker/<project>` на iMac общий, до очереди это была бы гонка).
+в Linux-контейнере это невозможно физически. Оркестратор эту сборку НЕ
+дублирует: агент делает её сам — из контейнера по SSH на iMac, и сам
+интерпретирует результат (от него зависят дальнейшие действия агента).
+
+Механика:
+
+- `_ensure_imac_ssh_in_runtime` кладёт SSH-ключ iMac в контейнер через
+  `docker cp` → `/tmp/pw-imac-key` (chmod 600) — ТОЛЬКО в /tmp: в
+  /workspace/social_mind нельзя, ключ уехал бы в git и в PR. Инъекция — на
+  старте разговора и ретраится в цикле `_monitor_openhands` (как build-секреты).
+- В инструкции агента (`_run_openhands_impl`) пункт 3: tar-проект по SSH на
+  iMac (`--exclude=build --exclude=.dart_tool`), затем
+  `flutter build ios --release --no-codesign` там; при падении — исправить код
+  в контейнере и повторить. rsync в контейнере нет — только tar-over-ssh
+  (ssh/scp/tar в образе есть, контейнер работает под root).
+- На iMac `flutter test` НЕ запускать: на macOS тесты isar_plus падают из-за
+  отсутствия нативного символа в тестовом процессе — это НЕ ошибки кода агента.
+- Если iMac недоступен по SSH — агент продолжает и явно пишет об этом в
+  отчёте (iOS тогда впервые проверится в GHA на PR).
+- Оркестратор в хвосте (`_build_ios_and_create_pr`) iOS больше не собирает;
+  `IOSRunner`/`IMacAdapter` остались в коде, но не используются. Отключение
+  пути — не задавать `IMAC_*`: тогда у агента просто нет пункта 3 про iMac.
 
 ## Артефакты GHA в финальном уведомлении
 
