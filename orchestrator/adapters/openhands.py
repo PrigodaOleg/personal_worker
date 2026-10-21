@@ -355,5 +355,20 @@ class OpenHandsAdapter:
             logger.error("[openhands] send_message failed: %s", exc)
             return {"status": "error", "error": str(exc)}
 
+    async def stop_conversation(self, conversation_id: str) -> dict:
+        """Остановить разговор (best-effort: эндпоинт зависит от версии сервера)."""
+        try:
+            r = await self._client.post(
+                f"{self.base_url}/api/conversations/{conversation_id}/stop",
+                headers=self._headers(),
+            )
+            return {
+                "status": "ok" if r.status_code < 400 else "error",
+                "code": r.status_code,
+            }
+        except httpx.HTTPError as exc:
+            logger.error("[openhands] stop_conversation failed: %s", exc)
+            return {"status": "error", "error": str(exc)}
+
     async def close(self) -> None:
         await self._client.aclose()

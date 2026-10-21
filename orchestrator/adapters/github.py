@@ -100,6 +100,13 @@ class GitHubAdapter:
         comment = self._repo.get_issue_comment(comment_id)
         comment.edit(body)
 
+    def fetch_issue_state(self, issue_number: int) -> str:
+        """Состояние issue: 'open' или 'closed'."""
+        self._ensure_auth()
+        assert self._repo is not None
+        issue = self._repo.get_issue(number=issue_number)
+        return issue.state
+
     def fetch_issue_comments(
         self, issue_number: int, after_comment_id: Optional[int] = None
     ) -> list[dict]:

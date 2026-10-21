@@ -226,6 +226,28 @@ class Scheduler:
         self._background_tasks.add(fut)
         fut.add_done_callback(self._background_tasks.discard)
 
+    def _cancel_task(self, task: Task, reason: str) -> None:
+        """Отменить задачу: статус, висящие вопросы, остановка разговора OpenHands."""
+        task.status = TaskStatus.CANCELLED
+        task.add_log(reason)
+        self.state.save(task)
+        self._pending_clarifications.pop(task.id, None)
+        qinfo = self._pending_agent_questions.pop(task.id, None)
+        if qinfo:
+            fut = qinfo.get("future")
+            if fut is not None and not fut.done():
+                # None = отмена: ответ агенту не отправляем.
+                fut.set_result(None)
+        if task.conversation_id:
+            self._spawn(self._stop_conversation_quietly(task.conversation_id))
+
+    async def _stop_conversation_quietly(self, conversation_id: str) -> None:
+        """Best-effort остановка разговора OpenHands (эндпоинт может отсутствовать)."""
+        try:
+            await self.openhands.stop_conversation(conversation_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[openhands] stop conversation failed: %s", exc)
+
     def _notify_admin(self, text: str) -> None:
         """Служебное уведомление админу в Telegram (сбой, восстановление)."""
         chat_id = self.config.telegram_admin_chat_id
@@ -498,6 +520,8 @@ class Scheduler:
         # Ответы на уточнения и вопросы агента: автор отвечает комментарием к issue.
         self._poll_github_clarification_answers()
         self._poll_github_agent_question_answers()
+        # Закрытый issue = отмена задачи (у GitHub-задач нет /cancel).
+        self._cancel_tasks_for_closed_issues()
         try:
             issues = self.github.fetch_open_issues()
         except Exception as exc:
@@ -609,6 +633,37 @@ class Scheduler:
             if 0 <= idx < len(options):
                 return options[idx]
         return stripped
+
+    def _cancel_tasks_for_closed_issues(self) -> None:
+        """Закрытый issue = отмена задачи: автор закрыл issue — значит, не нужно.
+
+        Отдельной отмены у GitHub-задач нет (Telegram /cancel их не видит),
+        поэтому закрытие issue — естественный жест отмены.
+        """
+        active_statuses = (
+            TaskStatus.NEW,
+            TaskStatus.CLARIFYING,
+            TaskStatus.READY,
+            TaskStatus.RUNNING,
+        )
+        for status in active_statuses:
+            for task in self.state.list_by_status(status):
+                if task.source != TaskSource.GITHUB:
+                    continue
+                try:
+                    issue_state = self.github.fetch_issue_state(int(task.source_id))
+                except Exception as exc:  # noqa: BLE001
+                    logger.error(
+                        "[poll] issue state fetch failed for #%s: %s",
+                        task.source_id, exc,
+                    )
+                    continue
+                if issue_state != "closed":
+                    continue
+                self._cancel_task(task, "issue закрыт автором — задача отменена")
+                logger.info(
+                    "[task] %s cancelled: issue #%s closed", task.id, task.source_id
+                )
 
     # ------------------------------------------------------------------ #
     # Приём задач из Telegram
@@ -854,10 +909,7 @@ class Scheduler:
                     "🆕 Нет активных задач для отмены.",
                 )
                 return
-            active.status = TaskStatus.CANCELLED
-            active.add_log("Отменено пользователем через /cancel")
-            self.state.save(active)
-            self._pending_clarifications.pop(active.id, None)
+            self._cancel_task(active, "Отменено пользователем через /cancel")
             await self.telegram.send_message(
                 chat_id_int,
                 f"🚫 Задача «{active.title[:50]}…» отменена.",
@@ -1722,6 +1774,11 @@ class Scheduler:
                 )
             return False
 
+        if answer is None:
+            # Задача отменена во время ожидания — ответ агенту не отправляем.
+            logger.info("[agent-question] task %s cancelled while waiting", task.id)
+            return False
+
         self._pending_agent_questions.pop(task.id, None)
         # Ответ принят — убираем кнопки и фиксируем выбор в сообщении с вопросом.
         if task.source == TaskSource.TELEGRAM and question_msg_id:
@@ -1772,6 +1829,10 @@ class Scheduler:
         secrets_done = not self._has_build_secrets()
         secrets_tries = 0
         while True:
+            if task.status == TaskStatus.CANCELLED:
+                task.add_log("Мониторинг остановлен: задача отменена")
+                self.state.save(task)
+                return
             if not secrets_done:
                 secrets_tries += 1
                 try:
@@ -1830,6 +1891,8 @@ class Scheduler:
                     answered = await self._handle_agent_question(
                         task, conversation_id, message
                     )
+                    if task.status == TaskStatus.CANCELLED:
+                        return
                     if not answered:
                         task.status = TaskStatus.FAILED
                         task.add_log("Ответ на вопрос агента не получен (таймаут)")
