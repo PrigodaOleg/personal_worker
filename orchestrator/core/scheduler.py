@@ -1162,9 +1162,15 @@ class Scheduler:
         timeout = timedelta(seconds=self.config.clarification_timeout_seconds)
         if datetime.utcnow() - asked_at > timeout:
             logger.warning("[clarify] timeout for task %s", task.id)
+            timeout_h = self.config.clarification_timeout_seconds // 3600
+            timeout_txt = (
+                f"{timeout_h // 24} сут."
+                if timeout_h >= 24 and timeout_h % 24 == 0
+                else f"{timeout_h} ч."
+            )
             self._notify_author(
                 task,
-                "⏰ Время на уточнение истекло (3 часа). Задача помечена как застывшая.",
+                f"⏰ Время на уточнение истекло ({timeout_txt}). Задача помечена как застывшая.",
             )
             task.status = TaskStatus.FAILED
             task.clarification_answer = None

@@ -216,7 +216,7 @@ class Config:
     def clarification_timeout_seconds(self) -> int:
         return int(
             self._env("CLARIFICATION_TIMEOUT_SECONDS")
-            or self._raw_get("scheduler", "clarification_timeout_seconds", default=10800)
+            or self._raw_get("scheduler", "clarification_timeout_seconds", default=172800)
         )
 
     @property
