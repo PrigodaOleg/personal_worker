@@ -111,6 +111,10 @@ class Scheduler:
         # период опроса статуса запуска и общий лимит ожидания.
         self.gha_watch_poll_seconds: int = int(os.getenv("GHA_WATCH_POLL_SECONDS", "60"))
         self.gha_watch_timeout_seconds: int = int(os.getenv("GHA_WATCH_TIMEOUT_SECONDS", "5400"))
+        # Очередь задач: выполняется строго одна за раз (слабое железо —
+        # локальные docker-сборки и один iMac параллельную работу не тянут).
+        self._task_queue: "asyncio.Queue[Task]" = asyncio.Queue()
+        self._queue_worker_started: bool = False
 
     # ------------------------------------------------------------------ #
     # Вспомогательные
@@ -262,6 +266,46 @@ class Scheduler:
         fut = asyncio.ensure_future(coro)
         self._background_tasks.add(fut)
         fut.add_done_callback(self._background_tasks.discard)
+
+    def _enqueue_task(self, task: Task) -> None:
+        """Поставить задачу в очередь выполнения.
+
+        Задачи выполняются строго по одной (слабое железо: локальные сборки
+        в runtime-контейнере и один iMac на всех). Воркер берёт следующую
+        задачу, только когда предыдущая завершилась — включая «хвост» после
+        возврата _process_task (ожидание уточнения и запуск агента уходят
+        в фон, см. _task_queue_worker).
+        """
+        self._ensure_queue_worker()
+        self._task_queue.put_nowait(task)
+        logger.info("[queue] task %s enqueued (depth=%d)", task.id, self._task_queue.qsize())
+
+    def _ensure_queue_worker(self) -> None:
+        if self._queue_worker_started:
+            return
+        self._queue_worker_started = True
+        self._spawn(self._task_queue_worker())
+
+    async def _task_queue_worker(self) -> None:
+        """Единственный воркер: задачи выполняются последовательно.
+
+        Тонкость: _process_task возвращает управление раньше фактического
+        конца работы — после подтверждения уточнения сам запуск агента уходит
+        в фон (_run_openhands через _spawn) и держит task.id в _running_tasks
+        до завершения. Поэтому после возврата _process_task дожидаемся
+        освобождения слота, и только потом берём следующую задачу.
+        """
+        while True:
+            task = await self._task_queue.get()
+            try:
+                logger.info("[queue] task %s started", task.id)
+                await self._process_task(task)
+            except Exception as exc:  # noqa: BLE001 — воркер не должен умирать
+                logger.error("[queue] task %s crashed: %s", task.id, exc)
+            while task.id in self._running_tasks:
+                await asyncio.sleep(1)
+            self._task_queue.task_done()
+            logger.info("[queue] task %s finished, slot free", task.id)
 
     def _cancel_task(self, task: Task, reason: str) -> None:
         """Отменить задачу: статус, висящие вопросы, остановка разговора OpenHands."""
@@ -591,7 +635,7 @@ class Scheduler:
                 f"🚀 Задача принята в работу: «{title[:60]}»\n"
                 "Если понадобятся уточнения — спрошу здесь, в комментариях.",
             )
-            self._spawn(self._process_task(task))
+            self._enqueue_task(task)
 
     def _poll_github_clarification_answers(self) -> None:
         """Забрать ответы на уточнения из комментариев GitHub issues.
@@ -771,24 +815,24 @@ class Scheduler:
             except Exception as exc:
                 logger.error("[telegram] failed to send clarification confirmation: %s", exc)
             # Запускаем обработку задачи в фоне
-            self._spawn(self._process_task(task))
+            self._enqueue_task(task)
             return
 
-        # 2. Проверяем, есть ли уже активная задача у этого пользователя
+        # 2. Активная задача не мешает приёму: новая встаёт в очередь
+        # (задачи выполняются строго по одной — слабое железо).
         active = self._get_active_task_for_chat(chat_id)
         if active:
             emoji = self._task_status_emoji(active.status)
-            progress = "\n".join(active.log[-5:]) if active.log else ""
+            progress = "\n".join(active.log[-3:]) if active.log else ""
             await self.telegram.send_message(
                 int(chat_id),
-                f"{emoji} Я уже занят задачей «{active.title[:50]}…»\n"
-                f"Статус: {active.status.value}\n"
-                f"Подождите завершения или отправьте /cancel для отмены.\n"
+                f"{emoji} Сейчас выполняется: «{active.title[:50]}…» "
+                f"(статус: {active.status.value}).\n"
+                f"Новая задача встанет в очередь и начнётся автоматически.\n"
                 f"Текущий прогресс:\n{progress}",
             )
-            return
 
-        # 3. Иначе — новая задача
+        # 3. Новая задача (в очередь — даже если другая ещё выполняется)
         task_id = self._task_id(TaskSource.TELEGRAM, chat_id + ":" + text[:40])
         existing = self.state.get(task_id)
         if existing and existing.status in (TaskStatus.DONE, TaskStatus.FAILED, TaskStatus.CANCELLED):
@@ -814,13 +858,17 @@ class Scheduler:
         # Подтверждаем получение задачи
         chat_id_int = int(chat_id)
         if task.status == TaskStatus.NEW:
+            position = self._task_queue.qsize() + 1
+            queue_note = (
+                f"Позиция в очереди: {position}. " if position > 1 else ""
+            )
             await self.telegram.send_message(
                 chat_id_int,
                 f"✅ Задача получена: «{task.title[:50]}…\"\n"
-                f"Обработка начата. Я сообщу, когда будет результат или возникнут вопросы.",
+                f"{queue_note}Я сообщу, когда начну и когда будет результат или возникнут вопросы.",
             )
-        # Запускаем обработку задачи в фоне — не блокируем Telegram
-        self._spawn(self._process_task(task))
+        # В очередь — задачи выполняются строго по одной
+        self._enqueue_task(task)
 
     async def _tail_command(self, cmd: list[str], lines: int = 3) -> str:
         """Выполнить команду и вернуть последние `lines` непустых строк вывода."""
@@ -1122,7 +1170,7 @@ class Scheduler:
         await self.telegram.answer_callback_query(
             cqid, f"🔄 Перезапуск #{task.attempt} ({model})"
         )
-        self._spawn(self._process_task(task))
+        self._enqueue_task(task)
 
     async def _on_telegram_callback(self, query: dict) -> None:
         data = (query.get("data") or "").strip()
@@ -1314,6 +1362,38 @@ class Scheduler:
         if task.status == TaskStatus.CLARIFYING:
             await self._wait_for_clarification(task)
             return
+
+        if task.status == TaskStatus.RUNNING:
+            # Восстановление после сбоя (через очередь): разговор мог уцелеть.
+            if task.conversation_id:
+                info = await self.openhands.get_agent_state(task.conversation_id)
+                if info.get("agent_state") is not None:
+                    ws = self._ensure_workspace(task)
+                    client_dir = os.path.join(ws, "social_mind")
+                    task.add_log("Восстановление: переподключение к разговору OpenHands")
+                    self.state.save(task)
+                    await self._monitor_openhands(task, task.conversation_id, client_dir)
+                    return
+                task.add_log("Восстановление: разговор OpenHands недоступен — перезапуск")
+                self.state.save(task)
+            # Разговор мёртв либо не успел создаться: ограниченный перезапуск.
+            if task.attempt >= self.max_resume_attempts:
+                task.status = TaskStatus.FAILED
+                task.add_log(f"Превышен лимит перезапусков ({task.attempt})")
+                await self._finalize_cost(task)
+                self.state.save(task)
+                self._notify_author(
+                    task,
+                    f"❌ Задача перезапускалась после сбоев {task.attempt} раз и остановлена.",
+                )
+                self._notify_admin(
+                    f"❌ Задача {task.id} остановлена: превышен лимит перезапусков."
+                )
+                return
+            task.attempt += 1
+            task.add_log(f"Перезапуск после сбоя: попытка {task.attempt}")
+            task.status = TaskStatus.READY
+            self.state.save(task)
 
         if task.status == TaskStatus.READY:
             await self._run_openhands(task)
@@ -2753,13 +2833,19 @@ class Scheduler:
     async def _recover_interrupted_tasks(self) -> None:
         """На старте: найти прерванные (сбой/перезагрузка) задачи и продолжить.
 
-        Задача в RUNNING/READY/CLARIFYING остаётся «в воздухе», если сервис упал
-        или машину перезагрузили во время работы. Уведомляем автора и админа о
-        сбое, затем продолжаем: переподключаемся к живому разговору OpenHands
-        либо перезапускаем задачу.
+        Задача в NEW/READY/CLARIFYING/RUNNING остаётся «в воздухе», если сервис
+        упал или машину перезагрузили во время работы (NEW — ожидала в очереди
+        выполнения). Уведомляем автора и админа о сбое, затем продолжаем:
+        переподключаемся к живому разговору OpenHands либо перезапускаем
+        задачу. Всё встаёт в очередь и выполняется по одной.
         """
         interrupted: list[Task] = []
-        for status in (TaskStatus.RUNNING, TaskStatus.READY, TaskStatus.CLARIFYING):
+        for status in (
+            TaskStatus.NEW,
+            TaskStatus.READY,
+            TaskStatus.CLARIFYING,
+            TaskStatus.RUNNING,
+        ):
             interrupted.extend(self.state.list_by_status(status))
         if not interrupted:
             return
@@ -2782,10 +2868,16 @@ class Scheduler:
                 logger.error("[recover] task %s resume error: %s", task.id, exc)
 
     async def _resume_task(self, task: Task) -> None:
-        """Продолжить прерванную задачу: переподключиться к разговору или перезапуск."""
+        """Продолжить прерванную задачу: восстановить контекст и встать в очередь.
+
+        Вся фактическая работа (переподключение к разговору, перезапуск,
+        ожидание уточнения) происходит в _process_task, когда до задачи
+        дойдёт очередь — так восстановленные задачи тоже не выполняются
+        параллельно.
+        """
         if task.status == TaskStatus.CLARIFYING:
-            # Ждали ответа пользователя — снова встаём в ожидание (в _process_task
-            # ответ, пришедший до сбоя, сам продолжит задачу).
+            # Ждали ответа пользователя — восстанавливаем запись ожидания
+            # (ответ, пришедший до сбоя, продолжит задачу).
             record: dict = {"task": task, "future": None, "asked_at": task.created_at}
             if task.source == TaskSource.GITHUB:
                 # Без github_issue сбор ответов из комментариев вообще не работает,
@@ -2802,40 +2894,7 @@ class Scheduler:
                         task.id, exc,
                     )
             self._pending_clarifications[task.id] = record
-            self._spawn(self._process_task(task))
-            return
-
-        if task.status == TaskStatus.RUNNING and task.conversation_id:
-            # Пробуем переподключиться к разговору OpenHands — мог уцелеть на диске.
-            info = await self.openhands.get_agent_state(task.conversation_id)
-            if info.get("agent_state") is not None:
-                ws = self._ensure_workspace(task)
-                client_dir = os.path.join(ws, "social_mind")
-                task.add_log("Восстановление: переподключение к разговору OpenHands")
-                self.state.save(task)
-                asyncio.create_task(
-                    self._monitor_openhands(task, task.conversation_id, client_dir)
-                )
-                return
-            task.add_log("Восстановление: разговор OpenHands недоступен — перезапуск")
-            self.state.save(task)
-
-        # Разговор мёртв либо задача READY — перезапускаем с новой попыткой.
-        if task.attempt >= self.max_resume_attempts:
-            task.status = TaskStatus.FAILED
-            task.add_log(f"Превышен лимит перезапусков ({task.attempt})")
-            await self._finalize_cost(task)
-            self.state.save(task)
-            self._notify_author(
-                task,
-                f"❌ Задача перезапускалась после сбоев {task.attempt} раз и остановлена.",
-            )
-            self._notify_admin(f"❌ Задача {task.id} остановлена: превышен лимит перезапусков.")
-            return
-        task.attempt += 1
-        task.status = TaskStatus.READY
-        self.state.save(task)
-        asyncio.create_task(self._run_openhands(task))
+        self._enqueue_task(task)
 
     async def _refresh_prices_and_benchmarks(self) -> None:
         """Обновить цены и SWE-бенчмарки; сбой одного не мешает другому."""
