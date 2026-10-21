@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import time
 from typing import Optional
 
 from github import Github
@@ -105,6 +106,69 @@ class GitHubAdapter:
             f"{self._repo.url}/issues/comments/{comment_id}",
             input={"body": body},
         )
+
+    def _gh_api(self, method: str, path: str, input: Optional[dict] = None) -> dict:
+        """Вызов GitHub API от имени установки, возвращает JSON-ответ."""
+        self._ensure_auth()
+        assert self._repo is not None
+        kw = {"input": input} if input is not None else {}
+        _h, data = self._repo.requester.requestJsonAndCheck(
+            method, f"{self._repo.url}{path}", **kw
+        )
+        return data if isinstance(data, dict) else {}
+
+    def find_workflow_run(
+        self, head_sha: str, timeout_s: int = 40, poll_every_s: float = 8.0
+    ) -> Optional[dict]:
+        """Найти запуск GitHub Actions для коммита.
+
+        Триггер workflow срабатывает с лагом в несколько секунд после push,
+        поэтому поллим до timeout_s. Блокирующий — вызывать через
+        asyncio.to_thread. None — запуск так и не появился.
+        """
+        deadline = time.monotonic() + timeout_s
+        while True:
+            data = self._gh_api(
+                "GET", f"/actions/runs?head_sha={head_sha}&per_page=10"
+            )
+            runs = data.get("workflow_runs") or []
+            if runs:
+                r = runs[0]
+                return {
+                    "id": r["id"],
+                    "html_url": r["html_url"],
+                    "status": r["status"],
+                    "conclusion": r.get("conclusion"),
+                    "name": r.get("name"),
+                }
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(poll_every_s)
+
+    def get_workflow_run(self, run_id: int) -> Optional[dict]:
+        """Статус запуска GitHub Actions (status/conclusion/html_url)."""
+        data = self._gh_api("GET", f"/actions/runs/{run_id}")
+        return {
+            "id": data.get("id"),
+            "html_url": data.get("html_url"),
+            "status": data.get("status"),
+            "conclusion": data.get("conclusion"),
+        }
+
+    def list_run_artifacts(self, run_id: int) -> list[dict]:
+        """Артефакты запуска: [{id, name, size_in_bytes}] (загруженные)."""
+        data = self._gh_api(
+            "GET", f"/actions/runs/{run_id}/artifacts?per_page=100"
+        )
+        return [
+            {
+                "id": a["id"],
+                "name": a.get("name") or "",
+                "size_in_bytes": a.get("size_in_bytes") or 0,
+            }
+            for a in (data.get("artifacts") or [])
+            if not a.get("expired")
+        ]
 
     def fetch_issue_state(self, issue_number: int) -> str:
         """Состояние issue: 'open' или 'closed'."""

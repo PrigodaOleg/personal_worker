@@ -30,6 +30,8 @@ import time
 from datetime import datetime, timedelta
 from typing import Optional
 
+import yaml
+
 from orchestrator.adapters.github import GitHubAdapter
 from orchestrator.adapters.imac import IMacAdapter
 from orchestrator.adapters.openhands import OpenHandsAdapter
@@ -105,6 +107,10 @@ class Scheduler:
         # вопроса (объявил намерение и замолчал). Когда лимит исчерпан —
         # вопрос автору задачи.
         self.max_auto_continues: int = int(os.getenv("OPENHANDS_MAX_AUTO_CONTINUES", "4"))
+        # Слежение за сборкой GitHub Actions для финального комментария:
+        # период опроса статуса запуска и общий лимит ожидания.
+        self.gha_watch_poll_seconds: int = int(os.getenv("GHA_WATCH_POLL_SECONDS", "60"))
+        self.gha_watch_timeout_seconds: int = int(os.getenv("GHA_WATCH_TIMEOUT_SECONDS", "5400"))
 
     # ------------------------------------------------------------------ #
     # Вспомогательные
@@ -220,6 +226,27 @@ class Scheduler:
                 logger.info("[notify] telegram message queued for %s", chat_id)
             except Exception as exc:
                 logger.error("[notify] telegram send failed: %s", exc)
+
+    async def _notify_author_with_comment_id(
+        self, task: Task, text: str
+    ) -> Optional[int]:
+        """Как _notify_author, но ждёт отправки и возвращает id комментария.
+
+        Нужен для финального уведомления: id комментария нужен, чтобы позже
+        дописать в него прямые ссылки на артефакты GHA. Для Telegram-задач
+        возвращает None (редактировать нечего) — текст уходит штатно.
+        """
+        if task.source != TaskSource.GITHUB:
+            self._notify_author(task, text)
+            return None
+        try:
+            num = int(task.source_id)
+            cid = await asyncio.to_thread(self.github.create_comment, num, text)
+            logger.info("[notify] comment added to issue #%s", num)
+            return cid
+        except Exception as exc:
+            logger.error("[notify] github comment failed: %s", exc)
+            return None
 
     async def flush_notifications(self) -> None:
         """Дождаться отправки всех отложенных уведомлений."""
@@ -2495,11 +2522,230 @@ class Scheduler:
         task.pr_url = pr_url
         task.status = TaskStatus.DONE
         self.state.save(task)
-        self._notify_author(
-            task,
-            f"✅ Задача выполнена! PR создан: {pr_url}\n"
-            f"Стоимость: {self._cost_line(task)}",
+
+        # Артефакты GHA: имена берём из workflow на нашей ветке, запуск ищем
+        # по sha коммита (триггер срабатывает с лагом — поллим недолго).
+        # Прямые ссылки на файлы появятся после сборки — следим в фоне и
+        # редактируем свой комментарий между маркерами.
+        artifacts_section, run_id = await self._gha_artifacts_section(
+            task, client_dir, branch
         )
+        notify_text = f"✅ Задача выполнена! PR создан: {pr_url}\n"
+        notify_text += f"Стоимость: {self._cost_line(task)}\n"
+        if artifacts_section:
+            notify_text += f"\n{artifacts_section}"
+        comment_id = await self._notify_author_with_comment_id(task, notify_text)
+        if run_id and comment_id:
+            self._spawn(
+                self._watch_gha_artifacts(task, comment_id, notify_text, run_id)
+            )
+
+    # ------------------------------------------------------------------ #
+    # Артефакты GitHub Actions в финальном уведомлении
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def parse_workflow_artifacts(client_dir: str) -> list[str]:
+        """Имена артефактов (actions/upload-artifact) из workflow на ветке.
+
+        Читаем локальные .github/workflows/*.yml рабочей копии — там ровно та
+        версия workflow, с которой соберётся наш PR. Имена с выражениями
+        ({{ ... }}) пропускаем: заранее их не вычислить.
+        """
+        wf_dir = os.path.join(client_dir, ".github", "workflows")
+        if not os.path.isdir(wf_dir):
+            return []
+        names: list[str] = []
+        try:
+            files = sorted(
+                f for f in os.listdir(wf_dir)
+                if f.endswith((".yml", ".yaml"))
+            )
+        except OSError:
+            return []
+        for fn in files:
+            try:
+                with open(os.path.join(wf_dir, fn), encoding="utf-8") as f:
+                    doc = yaml.safe_load(f)
+            except Exception:  # noqa: BLE001 — битый/не-yaml файл пропускаем
+                continue
+            if not isinstance(doc, dict):
+                continue
+            for job in (doc.get("jobs") or {}).values():
+                if not isinstance(job, dict):
+                    continue
+                for step in job.get("steps") or []:
+                    if not isinstance(step, dict):
+                        continue
+                    uses = str(step.get("uses") or "")
+                    if not uses.startswith("actions/upload-artifact"):
+                        continue
+                    name = (step.get("with") or {}).get("name")
+                    if isinstance(name, str) and name and "${{" not in name:
+                        if name not in names:
+                            names.append(name)
+        return names
+
+    async def _git_head_sha(self, client_dir: str) -> Optional[str]:
+        """sha коммита, который отправили на GitHub (для поиска запуска)."""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "git", "-C", client_dir, "rev-parse", "HEAD",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
+            sha = out.decode().strip()
+            return sha if proc.returncode == 0 and sha else None
+        except Exception:  # noqa: BLE001 — не критично для уведомления
+            return None
+
+    async def _gha_artifacts_section(
+        self, task: Task, client_dir: str, branch: str
+    ) -> tuple[str, Optional[int]]:
+        """Секция «Артефакты GHA» для финального уведомления + id запуска.
+
+        Запуск ищем по sha коммита недолго (до ~40 с): он нужен для ссылки
+        на прогресс сборки и для фонового дописывания прямых ссылок. Если
+        запуск не успел появиться — даём ссылку на проверки коммита, она
+        стабильна. Возвращаем ("", None), если артефактов в workflow нет.
+        """
+        names = self.parse_workflow_artifacts(client_dir)
+        if not names:
+            return "", None
+
+        sha = await self._git_head_sha(client_dir)
+        run = None
+        if sha:
+            try:
+                run = await asyncio.to_thread(
+                    self.github.find_workflow_run, sha, 40, 8.0
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[gha] find_workflow_run failed: %s", exc)
+
+        lines = ["📦 Артефакты GHA (собираются в CI):"]
+        lines += [f"  • {n}" for n in names]
+        if run and run.get("html_url"):
+            lines.append(f"🔧 Сборка: {run['html_url']}")
+            lines.append(
+                "_(прямые ссылки на файлы допишу сюда после завершения сборки)_"
+            )
+        elif sha:
+            checks = (
+                f"https://github.com/{self.config.github_repo}"
+                f"/commit/{sha}/checks"
+            )
+            lines.append(f"🔧 Сборка: {checks}")
+        body = "\n".join(lines)
+        section = f"<!-- gha-artifacts-start -->\n{body}\n<!-- gha-artifacts-end -->"
+        task.add_log(
+            f"Артефакты GHA: {', '.join(names)}"
+            + (f"; run {run['id']}" if run else "; запуск не найден")
+        )
+        self.state.save(task)
+        return section, (run or {}).get("id")
+
+    @staticmethod
+    def replace_marker_section(body: str, new_section: str) -> str:
+        """Заменить текст между маркерами gha-artifacts-* на новый."""
+        start = body.find("<!-- gha-artifacts-start -->")
+        end = body.find("<!-- gha-artifacts-end -->")
+        if start == -1 or end == -1 or end < start:
+            return body
+        return (
+            body[:start]
+            + new_section.strip()
+            + "\n"
+            + body[end + len("<!-- gha-artifacts-end -->"):]
+        )
+
+    @staticmethod
+    def format_artifacts_section(
+        run_id: int,
+        run_url: str,
+        conclusion: Optional[str],
+        artifacts: list[dict],
+        repo_full_name: str,
+    ) -> str:
+        """Финальная секция артефактов: прямые ссылки + размер или вердикт."""
+        if conclusion == "success" and artifacts:
+            lines = ["📦 Артефакты GHA (готовы):"]
+            for a in artifacts:
+                url = (
+                    f"https://github.com/{repo_full_name}"
+                    f"/actions/runs/{run_id}/artifacts/{a['id']}"
+                )
+                mb = a["size_in_bytes"] / 1_000_000
+                size = f"{mb:.1f} МБ" if mb < 1000 else f"{mb / 1000:.2f} ГБ"
+                lines.append(f"  • [{a['name']}]({url}) — {size}")
+            lines.append(f"🔧 Сборка: {run_url} ✅")
+        elif conclusion == "success":
+            lines = [
+                "📦 Артефакты GHA: сборка успешна, артефактов нет.",
+                f"🔧 Сборка: {run_url}",
+            ]
+        else:
+            lines = [
+                f"📦 Артефакты GHA: сборка завершилась ({conclusion or 'неизвестно'}).",
+                f"🔧 Сборка: {run_url}",
+            ]
+        return (
+            "<!-- gha-artifacts-start -->\n"
+            + "\n".join(lines)
+            + "\n<!-- gha-artifacts-end -->"
+        )
+
+    async def _watch_gha_artifacts(
+        self, task: Task, comment_id: int, comment_body: str, run_id: int
+    ) -> None:
+        """Дождаться завершения сборки GHA и дописать прямые ссылки.
+
+        Редактируем свой финальный комментарий: секция между маркерами
+        gha-artifacts-* заменяется на версию с прямыми ссылками на файлы.
+        Ограничены по времени (GHA_WATCH_TIMEOUT_SECONDS), чтобы не висеть
+        вечно на зависшей сборке.
+        """
+        deadline = time.monotonic() + self.gha_watch_timeout_seconds
+        while True:
+            await asyncio.sleep(self.gha_watch_poll_seconds)
+            if time.monotonic() >= deadline:
+                task.add_log("Сборка GHA не завершилась за время слежения — ссылки не дописаны")
+                self.state.save(task)
+                return
+            try:
+                run = await asyncio.to_thread(self.github.get_workflow_run, run_id)
+            except Exception as exc:  # noqa: BLE001 — сеть/API, попробуем снова
+                logger.warning("[gha] get_workflow_run failed: %s", exc)
+                continue
+            if not run or run.get("status") != "completed":
+                continue
+            conclusion = run.get("conclusion")
+            run_url = run.get("html_url") or (
+                f"https://github.com/{self.config.github_repo}/actions/runs/{run_id}"
+            )
+            artifacts: list[dict] = []
+            if conclusion == "success":
+                try:
+                    artifacts = await asyncio.to_thread(
+                        self.github.list_run_artifacts, run_id
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("[gha] list_run_artifacts failed: %s", exc)
+            new_section = self.format_artifacts_section(
+                run_id, run_url, conclusion, artifacts, self.config.github_repo
+            )
+            new_body = self.replace_marker_section(comment_body, new_section)
+            try:
+                await asyncio.to_thread(self.github.update_comment, comment_id, new_body)
+            except Exception as exc:
+                logger.error("[gha] update_comment failed: %s", exc)
+                return
+            task.add_log(
+                f"Ссылки на артефакты GHA добавлены в комментарий "
+                f"(сборка: {conclusion}, артефактов: {len(artifacts)})"
+            )
+            self.state.save(task)
+            return
 
     # ------------------------------------------------------------------ #
     # Главный цикл

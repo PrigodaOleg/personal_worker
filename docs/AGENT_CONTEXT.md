@@ -245,6 +245,23 @@ docker rm -f $(docker ps -aq --filter "name=openhands-runtime")
 - Реестры Docker — через зеркала в `/etc/docker/daemon.json` (там же
   `data-root: /mnt/ssd/docker`).
 
+## Артефакты GHA в финальном уведомлении
+
+После создания PR финальный комментарий к задаче содержит секцию
+`<!-- gha-artifacts-start --> … <!-- gha-artifacts-end -->`: имена артефактов
+парсятся из `actions/upload-artifact` в `.github/workflows/*.yml` **нашей
+ветки** (локальная рабочая копия, выражения `{{ }}` пропускаются), ссылка на
+запуск ищется по sha коммита (`GET /actions/runs?head_sha=` — триггер
+срабатывает с лагом, поллим до ~40 с; не нашли — ссылка на
+`/commit/<sha>/checks`). Фоновый `_watch_gha_artifacts` (лимит
+`GHA_WATCH_TIMEOUT_SECONDS`, опрос `GHA_WATCH_POLL_SECONDS`) после завершения
+сборки редактирует тот же комментарий: между маркерами появляются прямые
+ссылки `…/actions/runs/<id>/artifacts/<artifact_id>` и размеры. Работает и
+для Telegram-задач, но без последующего редактирования (нечему — нет id
+комментария). id финального комментария возвращает
+`_notify_author_with_comment_id` (GitHub-ветка синхронная, не как
+`_notify_author`).
+
 ## API OpenHands (v0.35)
 
 `POST /api/settings`, `POST /api/add-git-providers`,
