@@ -294,3 +294,152 @@ def test_stopped_after_finish_is_completed():
         assert info["state_before_stop"] == "finished"
 
     asyncio.run(scenario())
+
+
+# --------------------------------------------------------------------------- #
+# Классификация паузы агента: финальный отчёт ≠ вопрос
+# --------------------------------------------------------------------------- #
+
+REPORT_SNIPPET = (
+    "Все проверки пройдены успешно! ✅\n\n"
+    "## Что сделано\n\n"
+    "**Изменения (коммит `88f07fa` в локальной ветке `main`, "
+    "без push — PR создаст оркестратор):**\n\n"
+    "1. **`.github/workflows/dart.yml`** — добавлен job `build-ios`.\n"
+    "2. **`domains/client/ios/Podfile`** — новый файл.\n\n"
+    "| Команда | Результат |\n"
+    "|---|---|\n"
+    "| `flutter test` | ✅ 52 теста пройдены |\n\n"
+    "Рабочее дерево чистое."
+)
+
+
+def test_final_report_is_not_a_question():
+    """Финальный отчёт агента (модель завершает им разговор с
+    wait_for_response=true) — не вопрос: нумерованный список в нём — это
+    сделанные действия, а не варианты ответа (задача #36)."""
+    assert Scheduler._classify_agent_pause(REPORT_SNIPPET) == "report"
+    assert Scheduler._classify_agent_pause("Готово. Работа завершена.") == "report"
+    assert Scheduler._classify_agent_pause(
+        "Итог: изменения внесены, все тесты пройдены."
+    ) == "report"
+
+
+def test_real_question_is_recognized():
+    """Настоящие вопросы по-прежнему спрашивают автора."""
+    assert Scheduler._classify_agent_pause("Какой вариант предпочитаете?") == "question"
+    assert Scheduler._classify_agent_pause("Мне нужно уточнение по формату ключа") == "question"
+    assert Scheduler._classify_agent_pause("Should I proceed with option 2?") == "question"
+
+
+def test_announcement_is_not_report_nor_question():
+    """«I'll start by exploring...» — не вопрос и не отчёт: агент просто
+    объявил намерение и встал на паузу."""
+    assert Scheduler._classify_agent_pause(
+        "I'll start by exploring the workflow files in the project."
+    ) == "announce"
+    assert Scheduler._classify_agent_pause("") == "announce"
+
+
+def test_midwork_status_with_future_intent_is_not_final_report():
+    """«Тесты прошли. Теперь запускаю сборку APK» — работа продолжается:
+    завершать задачу по такому сообщению нельзя."""
+    assert Scheduler._classify_agent_pause(
+        "Тесты прошли успешно. Теперь запускаю сборку APK."
+    ) == "announce"
+
+
+def _monitor_scheduler(states: list[dict], max_auto: int = 4):
+    s = make_scheduler()
+    s.config.clarification_poll_seconds = 0.01
+    s.max_auto_continues = max_auto
+    s._has_build_secrets = lambda: True
+
+    class StateOpenHands(FakeOpenHands):
+        counter = 0
+
+        async def get_agent_state(self, conversation_id):
+            st = states[min(self.counter, len(states) - 1)]
+            self.counter += 1
+            return st
+
+    s.openhands = StateOpenHands()
+
+    async def fail_question(*a, **k):
+        raise AssertionError("сообщение классифицировано как вопрос")
+
+    s._handle_agent_question = fail_question
+    return s
+
+
+def test_monitor_finishes_task_on_final_report():
+    """Монитор: агент в awaiting_user_input прислал отчёт → задача DONE,
+    вопрос автору НЕ задаётся, PR-цикл запускается."""
+
+    async def scenario():
+        s = _monitor_scheduler([{
+            "agent_state": "awaiting_user_input",
+            "message": REPORT_SNIPPET,
+            "wait_for_response": True,
+            "completed": False,
+            "state_before_stop": None,
+        }])
+        pr_called = []
+
+        async def fake_pr(task, client_dir):
+            pr_called.append(task.id)
+
+        s._build_ios_and_create_pr = fake_pr
+
+        task = make_task()
+        await asyncio.wait_for(
+            s._monitor_openhands(task, "conv1", "/tmp/client"), timeout=2
+        )
+        assert task.status == TaskStatus.DONE
+        assert pr_called == ["t36"], "завершение без запуска PR-цикла"
+        assert s.openhands.sent == [], "в разговоре нечего отправлять"
+
+    asyncio.run(scenario())
+
+
+def test_monitor_nudges_announcement_instead_of_asking():
+    """Объявление намерения без вопроса не завершает задачу и не вешает
+    вопрос на автора: агенту уходит авто-подталкивание."""
+
+    async def scenario():
+        s = _monitor_scheduler([
+            {"agent_state": "awaiting_user_input",
+             "message": "I'll start by exploring the workflow files in the project.",
+             "wait_for_response": True, "completed": False,
+             "state_before_stop": None},
+            {"agent_state": "running", "message": "", "wait_for_response": False,
+             "completed": False, "state_before_stop": None},
+        ])
+        task = make_task()
+
+        async def fail_pr(task_, client_dir):
+            raise AssertionError("объявление принято за финальный отчёт")
+
+        s._build_ios_and_create_pr = fail_pr
+
+        # После двух опросов останавливаем монитор через отмену задачи.
+        calls = {"n": 0}
+        orig_get_state = s.openhands.get_agent_state  # bound method класса
+
+        async def counting_get_state(conversation_id):
+            calls["n"] += 1
+            if calls["n"] >= 3:
+                task.status = TaskStatus.CANCELLED
+            return await orig_get_state(conversation_id)
+
+        s.openhands.get_agent_state = counting_get_state
+
+        await asyncio.wait_for(
+            s._monitor_openhands(task, "conv1", "/tmp/client"), timeout=2
+        )
+        assert len(s.openhands.sent) == 1, "подталкивание должно быть одно"
+        cid, text = s.openhands.sent[0]
+        assert cid == "conv1" and "Продолжай" in text
+        assert task.status == TaskStatus.CANCELLED
+
+    asyncio.run(scenario())

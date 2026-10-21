@@ -101,6 +101,10 @@ class Scheduler:
         # Сколько раз будить разговор, погасший во время ожидания ответа
         # пользователя (OpenHands гасит простаивающие разговоры по idle-таймауту).
         self.max_stop_restarts: int = int(os.getenv("OPENHANDS_MAX_STOP_RESTARTS", "3"))
+        # Сколько раз подряд авто-продолжать агента, который встал на паузу без
+        # вопроса (объявил намерение и замолчал). Когда лимит исчерпан —
+        # вопрос автору задачи.
+        self.max_auto_continues: int = int(os.getenv("OPENHANDS_MAX_AUTO_CONTINUES", "4"))
 
     # ------------------------------------------------------------------ #
     # Вспомогательные
@@ -1920,6 +1924,12 @@ class Scheduler:
         # задать тот же вопрос повторно: после доставки ответа агент ещё какое-то
         # время остаётся в awaiting_user_input со старым сообщением.
         answered_msg: Optional[str] = None
+        # Текст, на который уже отправляли авто-подталкивание: агент после
+        # доставки ещё какое-то время висит в awaiting_user_input с тем же
+        # сообщением — повторно толкать его нельзя.
+        nudged_msg: Optional[str] = None
+        # Сколько раз подряд авто-продолжали агента без вопроса.
+        auto_continues = 0
         # Сколько раз будили разговор, погасший во время ожидания ответа.
         stop_restarts = 0
         # Build-секреты: повторяем установку, пока OpenHands не склонировал
@@ -1979,19 +1989,42 @@ class Scheduler:
 
             state_misses = 0
 
-            # Агент возобновил работу после ответа — снимаем защиту от
-            # повторного вопроса.
+            # Агент возобновил работу после ответа/подталкивания — снимаем
+            # защиту от повторного вопроса и повторного подталкивания.
             if state_val != "awaiting_user_input":
                 answered_msg = None
+                nudged_msg = None
 
-            # Агент ждёт ответа пользователя — либо вопрос, либо финальный отчёт.
+            # Агент ждёт ввода. Пауза бывает трёх видов: вопрос (реально просит
+            # ввода), финальный отчёт (работа сделана; модель завершает им
+            # разговор с wait_for_response=true, не вызывая finish) и объявление
+            # намерения («начну с изучения…» — ввода не просит). Путать отчёт с
+            # вопросом нельзя: иначе оркестратор вешает на автора задачи
+            # ожидание ответа на... собственный отчёт агента.
             if state_val == "awaiting_user_input":
                 message = (info.get("message") or "").strip()
-                wants_response = bool(info.get("wait_for_response"))
-                if wants_response or self._looks_like_clarification(message):
+                kind = self._classify_agent_pause(message)
+
+                if kind == "report":
+                    # Отчёт о проделанной работе — не вопрос, ждать ответа
+                    # не нужно: завершаем задачу штатно (вплоть до PR).
+                    task.status = TaskStatus.DONE
+                    self.state.save(task)
+                    task.add_log("OpenHands completed (final report, no question)")
+                    self.state.save(task)
+                    await self._build_ios_and_create_pr(task, client_dir)
+                    return
+
+                # Вопрос автору нужен, если это настоящий вопрос либо если
+                # авто-продолжения исчерпаны (объявление без ответа автора
+                # иначе повиснет навсегда).
+                escalate = (
+                    kind == "question" or auto_continues >= self.max_auto_continues
+                )
+                if escalate:
                     if message and message == answered_msg:
-                        # Ответ только что отправлен, агент ещё не проснулся —
-                        # повторный вопрос по тому же тексту задавать нельзя.
+                        # Вопрос только что задан/отвечен, агент ещё не проснулся
+                        # — повторный вопрос по тому же тексту задавать нельзя.
                         await asyncio.sleep(self.config.clarification_poll_seconds)
                         continue
                     # Вопрос агента в процессе работы: показываем, ждём ответ,
@@ -2016,12 +2049,31 @@ class Scheduler:
                         return
                     answered_msg = message
                     continue
-                task.status = TaskStatus.DONE
+
+                # Объявление намерения без вопроса: подталкиваем продолжать.
+                if message and message == nudged_msg:
+                    # Подталкивание уже отправлено, агент ещё не отработал его.
+                    await asyncio.sleep(self.config.clarification_poll_seconds)
+                    continue
+                auto_continues += 1
+                task.add_log(
+                    "Агент на паузе без вопроса — авто-продолжение "
+                    f"({auto_continues}/{self.max_auto_continues})"
+                )
                 self.state.save(task)
-                task.add_log("OpenHands completed successfully")
-                self.state.save(task)
-                await self._build_ios_and_create_pr(task, client_dir)
-                return
+                res = await self.openhands.send_message(
+                    conversation_id, self._CONTINUE_NUDGE
+                )
+                if res.get("status") == "error" or res.get("success") is False:
+                    # Доставка не прошла (возможно, разговор погас) — будим
+                    # и пробуем ещё раз.
+                    await self.openhands.start_conversation(conversation_id)
+                    await self.openhands.send_message(
+                        conversation_id, self._CONTINUE_NUDGE
+                    )
+                nudged_msg = message
+                await asyncio.sleep(self.config.clarification_poll_seconds)
+                continue
 
             if state_val == "finished":
                 task.status = TaskStatus.DONE
@@ -2100,17 +2152,76 @@ class Scheduler:
 
             await asyncio.sleep(self.config.clarification_poll_seconds)
 
-    @staticmethod
-    def _looks_like_clarification(message: str) -> bool:
-        """Агент спрашивает пользователя, а не отчитывается о результате."""
+    # Подталкивание агенту, вставшему на паузу без вопроса (объявил намерение
+    # и замолчал): даём ему ясный протокол — работать, спросить или отчитаться.
+    _CONTINUE_NUDGE = (
+        "Продолжай выполнение задачи по исходной инструкции. "
+        "Если ты сообщил промежуточный статус — просто продолжай работу. "
+        "Если тебе не хватает информации для продолжения — задай конкретный "
+        "вопрос со знаком вопроса (при уместности — с пронумерованными "
+        "вариантами ответа). "
+        "Если работа полностью завершена — ответь «работа завершена» и "
+        "перечисли сделанные изменения."
+    )
+
+    # Явные просьбы ввода: агент спрашивает, а не констатирует.
+    _ASK_MARKERS = (
+        # ru
+        "уточн", "подтверд", "выберите", "выбери", "выбрать", "предпочита",
+        "какой вариант", "какой из", "какую", "каких", "какой формат",
+        "нужно ли", "стоит ли", "не хватает", "недостаточно данных",
+        "недостаточно информации", "скажите", "подскажи", "сообщите",
+        "ответьте", "укажите", "укажи", "ваш выбор", "твой выбор",
+        # en
+        "please confirm", "please specify", "please clarify", "please choose",
+        "let me know", "which option", "which would", "your preference",
+        "do you want", "would you like", "should i", "shall i", "clarif",
+        "answer with", "reply with", "need your input", "waiting for your",
+    )
+
+    # Признаки финального отчёта о проделанной работе.
+    _REPORT_MARKERS = (
+        "что сделано", "что было сделано", "все проверки", "проверки пройдены",
+        "проверки прошли", "тесты пройдены", "тесты прошли", "все тесты",
+        "готово", "работа завершена", "задача выполнена", "завершена",
+        "завершено", "итог", "резюме", "сводка", "результаты проверки",
+        "изменения внесены", "рабочее дерево чистое",
+        "summary", "all checks passed", "successfully completed",
+        "working tree clean",
+    )
+
+    # Фразы, указывающие, что агент собирается продолжать: пауза с ними —
+    # не финальный отчёт, даже если в тексте есть слова из _REPORT_MARKERS
+    # (например, «Тесты прошли. Теперь запускаю сборку APK»).
+    _FUTURE_MARKERS = (
+        "теперь", "далее", "затем", "сейчас", "следующий шаг", "продолжу",
+        "продолжаю", "запускаю", "приступаю", "начну", "начинаю", "сначала",
+        "осталось",
+        "now i", "next step", "let me", "going to", "i'll", "i will",
+    )
+
+    @classmethod
+    def _classify_agent_pause(cls, message: str) -> str:
+        """Классифицировать паузу агента в awaiting_user_input.
+
+        Возвращает одно из:
+        - "question" — агент реально просит ввода (вопрос, просьба уточнить);
+        - "report" — финальный отчёт о проделанной работе (ждать ответа не надо);
+        - "announce" — промежуточное сообщение/объявление намерения
+          («начну с изучения файлов»), ввода не просит.
+        """
         if not message:
-            return False
+            return "announce"
         lowered = message.lower()
-        question_markers = (
-            "уточн", "не хватает данных", "какой вариант", "что выбрать",
-            "нужно уточнение", "clarif",
-        )
-        return message.endswith("?") or any(m in lowered for m in question_markers)
+        if message.rstrip().endswith("?") or any(
+            m in lowered for m in cls._ASK_MARKERS
+        ):
+            return "question"
+        if any(m in lowered for m in cls._REPORT_MARKERS) and not any(
+            m in lowered for m in cls._FUTURE_MARKERS
+        ):
+            return "report"
+        return "announce"
 
     # ------------------------------------------------------------------ #
     # iOS (на iMac) + PR
