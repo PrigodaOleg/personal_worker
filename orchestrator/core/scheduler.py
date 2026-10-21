@@ -85,6 +85,7 @@ class Scheduler:
         # task.id -> {task, conversation_id, options, future, asked_at}.
         self._pending_agent_questions: dict[str, dict] = {}
         self._pending_notifications: set = set()  # фоновые отправки в Telegram
+        self._background_tasks: set = set()  # фоновые asyncio-задачи (держим ссылку)
         self._llm_configured: bool = False
         self._running_tasks: set[str] = set()  # задачи, которые выполняются в фоне
         # Имя контейнера сервера OpenHands — нужно для вывода логов в /status.
@@ -214,6 +215,16 @@ class Scheduler:
         """Дождаться отправки всех отложенных уведомлений."""
         if self._pending_notifications:
             await asyncio.gather(*list(self._pending_notifications), return_exceptions=True)
+
+    def _spawn(self, coro) -> None:
+        """Запустить фоновую задачу, удерживая на неё ссылку.
+
+        asyncio.create_task хранит только слабую ссылку: без удержания GC
+        может оборвать задачу в середине выполнения.
+        """
+        fut = asyncio.ensure_future(coro)
+        self._background_tasks.add(fut)
+        fut.add_done_callback(self._background_tasks.discard)
 
     def _notify_admin(self, text: str) -> None:
         """Служебное уведомление админу в Telegram (сбой, восстановление)."""
@@ -484,6 +495,8 @@ class Scheduler:
     # ------------------------------------------------------------------ #
     async def poll_github(self) -> None:
         logger.debug("[poll] github")
+        # Ответы на уточнения: автор отвечает комментарием к issue.
+        self._poll_github_clarification_answers()
         try:
             issues = self.github.fetch_open_issues()
         except Exception as exc:
@@ -510,7 +523,47 @@ class Scheduler:
             )
             task.add_log(f"issue #{number} by {author}: {title}")
             self.state.save(task)
-            asyncio.create_task(self._process_task(task))
+            self._notify_author(
+                task,
+                f"🚀 Задача принята в работу: «{title[:60]}»\n"
+                "Если понадобятся уточнения — спрошу здесь, в комментариях.",
+            )
+            self._spawn(self._process_task(task))
+
+    def _poll_github_clarification_answers(self) -> None:
+        """Забрать ответы на уточнения из комментариев GitHub issues.
+
+        Автор отвечает комментарием к issue: берём первый комментарий
+        живого участника после нашего вопроса. Здесь только сбор ответа —
+        сама обработка идёт в _wait_for_clarification (основной цикл).
+        """
+        for task_id, info in list(self._pending_clarifications.items()):
+            issue_number = info.get("github_issue")
+            task = info.get("task")
+            if issue_number is None or task is None or task.clarification_answer:
+                continue
+            try:
+                comments = self.github.fetch_issue_comments(
+                    issue_number,
+                    after_comment_id=info.get("github_after_comment_id"),
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    "[clarify] github comments fetch failed for #%s: %s",
+                    issue_number, exc,
+                )
+                continue
+            for comment in comments:
+                body = (comment.get("body") or "").strip()
+                if not body:
+                    continue
+                task.clarification_answer = body
+                self.state.save(task)
+                logger.info(
+                    "[clarify] github answer for task %s from %s: %s",
+                    task_id, comment.get("author"), body[:60],
+                )
+                break
 
     # ------------------------------------------------------------------ #
     # Приём задач из Telegram
@@ -567,7 +620,7 @@ class Scheduler:
             except Exception as exc:
                 logger.error("[telegram] failed to send clarification confirmation: %s", exc)
             # Запускаем обработку задачи в фоне
-            asyncio.create_task(self._process_task(task))
+            self._spawn(self._process_task(task))
             return
 
         # 2. Проверяем, есть ли уже активная задача у этого пользователя
@@ -616,7 +669,7 @@ class Scheduler:
                 f"Обработка начата. Я сообщу, когда будет результат или возникнут вопросы.",
             )
         # Запускаем обработку задачи в фоне — не блокируем Telegram
-        asyncio.create_task(self._process_task(task))
+        self._spawn(self._process_task(task))
 
     async def _tail_command(self, cmd: list[str], lines: int = 3) -> str:
         """Выполнить команду и вернуть последние `lines` непустых строк вывода."""
@@ -921,7 +974,7 @@ class Scheduler:
         await self.telegram.answer_callback_query(
             cqid, f"🔄 Перезапуск #{task.attempt} ({model})"
         )
-        asyncio.create_task(self._process_task(task))
+        self._spawn(self._process_task(task))
 
     async def _on_telegram_callback(self, query: dict) -> None:
         data = (query.get("data") or "").strip()
@@ -1139,17 +1192,33 @@ class Scheduler:
         elif task.source == TaskSource.GITHUB:
             try:
                 num = int(task.source_id)
-                self.github.create_comment(num, f"❓ {question}")
+                comment_id = self.github.create_comment(num, f"❓ {question}")
                 self._pending_clarifications[task.id] = {
                     "task": task,
                     "future": None,
                     "asked_at": datetime.utcnow(),
                     "github_issue": num,
+                    # Ответом считаем только комментарии ПОСЛЕ нашего вопроса.
+                    "github_after_comment_id": comment_id,
                 }
             except Exception as exc:
                 logger.error("[clarify] github comment failed: %s", exc)
                 task.status = TaskStatus.FAILED
                 self.state.save(task)
+
+    async def _confirm_clarification_accepted(self, task: Task) -> None:
+        """Подтвердить автору в исходном канале, что уточнение принято."""
+        text = f"✅ Уточнение принято. Начинаю обработку задачи: «{task.title[:50]}…»"
+        if task.source == TaskSource.TELEGRAM:
+            try:
+                await self.telegram.send_message(int(task.source_id), text)
+            except Exception as exc:
+                logger.error("[telegram] failed to send clarification confirmation: %s", exc)
+        elif task.source == TaskSource.GITHUB:
+            try:
+                self.github.create_comment(int(task.source_id), text)
+            except Exception as exc:
+                logger.error("[clarify] github confirmation failed: %s", exc)
 
     async def _wait_for_clarification(self, task: Task) -> None:
         info = self._pending_clarifications.get(task.id)
@@ -1184,15 +1253,7 @@ class Scheduler:
             task.status = TaskStatus.READY
             self.state.save(task)
             self._pending_clarifications.pop(task.id, None)
-            if task.source == TaskSource.TELEGRAM:
-                try:
-                    chat_id_int = int(task.source_id)
-                    await self.telegram.send_message(
-                        chat_id_int,
-                        f"✅ Уточнение принято. Начинаю обработку задачи: «{task.title[:50]}…»",
-                    )
-                except Exception as exc:
-                    logger.error("[telegram] failed to send clarification confirmation: %s", exc)
+            await self._confirm_clarification_accepted(task)
             logger.info("[clarify] task %s calling _run_openhands (answer already set)", task.id)
             await self._run_openhands(task)
             return
@@ -1209,15 +1270,7 @@ class Scheduler:
                 task.status = TaskStatus.READY
                 self.state.save(task)
                 self._pending_clarifications.pop(task.id, None)
-                if task.source == TaskSource.TELEGRAM:
-                    try:
-                        chat_id_int = int(task.source_id)
-                        await self.telegram.send_message(
-                            chat_id_int,
-                            f"✅ Уточнение принято. Начинаю обработку задачи: «{task.title[:50]}…»",
-                        )
-                    except Exception as exc:
-                        logger.error("[telegram] failed to send clarification confirmation: %s", exc)
+                await self._confirm_clarification_accepted(task)
                 logger.info("[clarify] task %s calling _run_openhands", task.id)
                 await self._run_openhands(task)
             except asyncio.TimeoutError:
@@ -2096,7 +2149,7 @@ class Scheduler:
             self._pending_clarifications[task.id] = {
                 "task": task, "future": None, "asked_at": task.created_at,
             }
-            asyncio.create_task(self._process_task(task))
+            self._spawn(self._process_task(task))
             return
 
         if task.status == TaskStatus.RUNNING and task.conversation_id:

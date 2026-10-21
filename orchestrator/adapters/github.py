@@ -85,12 +85,40 @@ class GitHubAdapter:
             for issue in issues
         ]
 
-    def create_comment(self, issue_number: int, body: str) -> None:
-        """Оставить комментарий к issue."""
+    def create_comment(self, issue_number: int, body: str) -> int:
+        """Оставить комментарий к issue. Возвращает id комментария."""
         self._ensure_auth()
         assert self._repo is not None
         issue = self._repo.get_issue(number=issue_number)
-        issue.create_comment(body)
+        comment = issue.create_comment(body)
+        return comment.id
+
+    def fetch_issue_comments(
+        self, issue_number: int, after_comment_id: Optional[int] = None
+    ) -> list[dict]:
+        """Комментарии issue живых участников (без ботов).
+
+        after_comment_id — вернуть только комментарии, созданные после
+        комментария с этим id (например, после нашего вопроса автору).
+        """
+        self._ensure_auth()
+        assert self._repo is not None
+        issue = self._repo.get_issue(number=issue_number)
+        result = []
+        for comment in issue.get_comments():
+            if after_comment_id is not None and comment.id <= after_comment_id:
+                continue
+            user = comment.user
+            if user is not None and getattr(user, "type", None) == "Bot":
+                continue
+            result.append(
+                {
+                    "id": comment.id,
+                    "author": user.login if user else None,
+                    "body": comment.body or "",
+                }
+            )
+        return result
 
     def create_pr(
         self, branch: str, base: str, title: str, body: str
