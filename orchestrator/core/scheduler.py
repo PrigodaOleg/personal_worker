@@ -1320,8 +1320,11 @@ class Scheduler:
     async def _wait_for_clarification(self, task: Task) -> None:
         info = self._pending_clarifications.get(task.id)
         if not info:
-            task.status = TaskStatus.FAILED
-            self.state.save(task)
+            # Рестарт/сбой потерял состояние вопроса (живёт в памяти).
+            # Переспрашиваем — иначе задача молча падала бы после каждого
+            # перезапуска сервиса во время ожидания уточнений.
+            logger.warning("[clarify] %s: pending state lost, re-asking", task.id)
+            await self._ask_clarification(task)
             return
 
         asked_at: datetime = info["asked_at"]
@@ -1419,6 +1422,20 @@ class Scheduler:
                 logger.info("[secrets] build.env установлен в workspace")
             except Exception as exc:  # noqa: BLE001
                 logger.warning("[secrets] copy build.env failed: %s", exc)
+
+        # Вторая линия защиты (как в runtime-контейнере): .git/info/exclude,
+        # чтобы git не видел секреты даже без pathspec-исключений.
+        git_dir = os.path.join(client_dir, ".git")
+        if available and os.path.isdir(git_dir):
+            try:
+                exclude_path = os.path.join(git_dir, "info", "exclude")
+                os.makedirs(os.path.dirname(exclude_path), exist_ok=True)
+                with open(exclude_path, "a", encoding="utf-8") as fh:
+                    for name in self._SECRET_FILE_NAMES:
+                        fh.write(f"\n**/{name}")
+                logger.info("[secrets] .git/info/exclude дополнен")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[secrets] git exclude write failed: %s", exc)
 
         return available
 
@@ -2153,15 +2170,14 @@ class Scheduler:
             for git_cmd in (
                 ["checkout", "-b", branch],
                 # Секреты сборки (google-services.json, build.env) кладутся в
-                # рабочую копию ради сборки, но в PR уезжать не должны. Исключаем
-                # их и по точным путям, и по именам — даже если чужой .gitignore
-                # их не ловит (build.env в social_mind как раз не игнорируется).
+                # рабочую копию ради сборки, но в PR уезжать не должны.
+                # exclude,glob — обязательно: литеральный путь игнорируемого
+                # файла (google-services.json есть в .gitignore) валит git add
+                # с "paths are ignored" (exit 1). **/ ловит и корень, и вложенность.
                 [
                     "add", "-A", "--", ".",
-                    ":(exclude)build.env",
-                    ":(exclude)google-services.json",
-                    ":(exclude)domains/client/build.env",
-                    ":(exclude)domains/client/android/app/google-services.json",
+                    ":(exclude,glob)**/build.env",
+                    ":(exclude,glob)**/google-services.json",
                 ],
                 ["commit", "-m", f"AI task: {task.title}"],
                 # В dry-run пуш только проверяется — на GitHub ничего не уходит.
