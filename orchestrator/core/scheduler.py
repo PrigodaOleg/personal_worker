@@ -517,11 +517,12 @@ class Scheduler:
     # ------------------------------------------------------------------ #
     async def poll_github(self) -> None:
         logger.debug("[poll] github")
+        # Закрытый/удалённый issue = отмена задачи (у GitHub-задач нет /cancel).
+        # Первым делом — чтобы не опрашивать комментарии уже мёртвых issue.
+        self._cancel_tasks_for_closed_issues()
         # Ответы на уточнения и вопросы агента: автор отвечает комментарием к issue.
         self._poll_github_clarification_answers()
         self._poll_github_agent_question_answers()
-        # Закрытый issue = отмена задачи (у GitHub-задач нет /cancel).
-        self._cancel_tasks_for_closed_issues()
         try:
             issues = self.github.fetch_open_issues()
         except Exception as exc:
@@ -653,6 +654,14 @@ class Scheduler:
                 try:
                     issue_state = self.github.fetch_issue_state(int(task.source_id))
                 except Exception as exc:  # noqa: BLE001
+                    if self._issue_gone(exc):
+                        # Issue удалён (или стал недоступен) — задача-сирота.
+                        self._cancel_task(task, "issue удалён — задача отменена")
+                        logger.info(
+                            "[task] %s cancelled: issue #%s gone",
+                            task.id, task.source_id,
+                        )
+                        continue
                     logger.error(
                         "[poll] issue state fetch failed for #%s: %s",
                         task.source_id, exc,
@@ -664,6 +673,11 @@ class Scheduler:
                 logger.info(
                     "[task] %s cancelled: issue #%s closed", task.id, task.source_id
                 )
+
+    @staticmethod
+    def _issue_gone(exc: Exception) -> bool:
+        """404/410 от GitHub — issue удалён или недоступен."""
+        return getattr(exc, "status", None) in (404, 410)
 
     # ------------------------------------------------------------------ #
     # Приём задач из Telegram
