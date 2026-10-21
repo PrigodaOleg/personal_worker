@@ -46,6 +46,15 @@ chmod 600 "/Users/${WORKER_USER}/.ssh/authorized_keys"
 # Без этой группы sshd молча рвёт соединение ("Connection closed").
 dscl . -append /Groups/com.apple.access_ssh GroupMembership "${WORKER_USER}" 2>/dev/null || true
 systemsetup -setremotelogin on
+# SSH только по ключам: macOS пускает пароль через PAM keyboard-interactive,
+# поэтому гасим оба механизма. Локальный вход с паролем не трогаем —
+# подойти к машине и залогиниться можно всегда.
+mkdir -p /etc/ssh/sshd_config.d
+printf 'PasswordAuthentication no\nKbdInteractiveAuthentication no\nChallengeResponseAuthentication no\n' \
+    > /etc/ssh/sshd_config.d/99-personal_worker.conf
+chmod 644 /etc/ssh/sshd_config.d/99-personal_worker.conf
+/usr/sbin/sshd -t
+launchctl kickstart -k system/com.openssh.sshd
 
 echo "== 3. Xcode =="
 xcode-select -p
