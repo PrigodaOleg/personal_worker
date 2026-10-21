@@ -93,6 +93,13 @@ class GitHubAdapter:
         comment = issue.create_comment(body)
         return comment.id
 
+    def update_comment(self, comment_id: int, body: str) -> None:
+        """Отредактировать существующий комментарий (например, зафиксировать ответ)."""
+        self._ensure_auth()
+        assert self._repo is not None
+        comment = self._repo.get_issue_comment(comment_id)
+        comment.edit(body)
+
     def fetch_issue_comments(
         self, issue_number: int, after_comment_id: Optional[int] = None
     ) -> list[dict]:

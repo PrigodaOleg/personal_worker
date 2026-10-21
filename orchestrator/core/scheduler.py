@@ -495,8 +495,9 @@ class Scheduler:
     # ------------------------------------------------------------------ #
     async def poll_github(self) -> None:
         logger.debug("[poll] github")
-        # Ответы на уточнения: автор отвечает комментарием к issue.
+        # Ответы на уточнения и вопросы агента: автор отвечает комментарием к issue.
         self._poll_github_clarification_answers()
+        self._poll_github_agent_question_answers()
         try:
             issues = self.github.fetch_open_issues()
         except Exception as exc:
@@ -564,6 +565,50 @@ class Scheduler:
                     task_id, comment.get("author"), body[:60],
                 )
                 break
+
+    def _poll_github_agent_question_answers(self) -> None:
+        """Ответы на вопросы агента (по ходу работы) из комментариев issue.
+
+        Ответ — первый комментарий живого участника после вопроса: либо
+        номер варианта (1..N), либо свободный текст.
+        """
+        for task_id, qinfo in list(self._pending_agent_questions.items()):
+            issue_number = qinfo.get("github_issue")
+            fut = qinfo.get("future")
+            if issue_number is None or fut is None or fut.done():
+                continue
+            try:
+                comments = self.github.fetch_issue_comments(
+                    issue_number,
+                    after_comment_id=qinfo.get("github_after_comment_id"),
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    "[agent-question] github comments fetch failed for #%s: %s",
+                    issue_number, exc,
+                )
+                continue
+            for comment in comments:
+                body = (comment.get("body") or "").strip()
+                if not body:
+                    continue
+                answer = self._match_option(body, qinfo.get("options") or [])
+                fut.set_result(answer)
+                logger.info(
+                    "[agent-question] github answer for task %s from %s: %s",
+                    task_id, comment.get("author"), answer[:60],
+                )
+                break
+
+    @staticmethod
+    def _match_option(body: str, options: list[str]) -> str:
+        """Номер варианта (1..N) -> сам вариант; иначе свободный текст."""
+        stripped = body.strip()
+        if stripped.isdigit() and options:
+            idx = int(stripped) - 1
+            if 0 <= idx < len(options):
+                return options[idx]
+        return stripped
 
     # ------------------------------------------------------------------ #
     # Приём задач из Telegram
@@ -1630,6 +1675,7 @@ class Scheduler:
 
         question_msg_id: Optional[int] = None
         chat_id: Optional[int] = None
+        question_comment_id: Optional[int] = None
         if task.source == TaskSource.TELEGRAM:
             chat_id = int(task.source_id)
             keyboard = None
@@ -1643,7 +1689,20 @@ class Scheduler:
                 )
         elif task.source == TaskSource.GITHUB:
             try:
-                self.github.create_comment(int(task.source_id), f"❓ {text}")
+                num = int(task.source_id)
+                lines = [f"❓ {text}"]
+                if len(options) >= 2:
+                    lines.append("")
+                    lines.extend(f"{i + 1}. {opt}" for i, opt in enumerate(options))
+                    lines.append("")
+                    lines.append("Ответьте комментарием: номер варианта или свободный текст.")
+                else:
+                    lines.append("")
+                    lines.append("Ответьте комментарием к issue.")
+                question_comment_id = self.github.create_comment(num, "\n".join(lines))
+                qinfo["github_issue"] = num
+                # Ответом считаем только комментарии ПОСЛЕ этого вопроса.
+                qinfo["github_after_comment_id"] = question_comment_id
             except Exception as exc:  # noqa: BLE001
                 logger.error("[agent-question] github comment failed: %s", exc)
 
@@ -1657,6 +1716,10 @@ class Scheduler:
             if task.source == TaskSource.TELEGRAM and question_msg_id:
                 await self._close_question_message(chat_id, question_msg_id, text,
                                                    "⏰ Время ожидания ответа истекло.")
+            elif task.source == TaskSource.GITHUB and question_comment_id:
+                self._update_github_question_comment(
+                    question_comment_id, text, "⏰ Время ожидания ответа истекло."
+                )
             return False
 
         self._pending_agent_questions.pop(task.id, None)
@@ -1664,6 +1727,10 @@ class Scheduler:
         if task.source == TaskSource.TELEGRAM and question_msg_id:
             await self._close_question_message(chat_id, question_msg_id, text,
                                                f"✅ Ответ принят: {answer[:200]}")
+        elif task.source == TaskSource.GITHUB and question_comment_id:
+            self._update_github_question_comment(
+                question_comment_id, text, f"✅ Ответ принят: {answer[:200]}"
+            )
         try:
             await self.openhands.send_message(conversation_id, answer)
             task.add_log(f"Ответ пользователю отправлен агенту: {answer[:60]}")
@@ -1682,6 +1749,15 @@ class Scheduler:
             )
         except Exception as exc:  # noqa: BLE001
             logger.error("[agent-question] close question message failed: %s", exc)
+
+    def _update_github_question_comment(
+        self, comment_id: int, question: str, footer: str
+    ) -> None:
+        """Дописать итог (ответ/истечение) в комментарий-вопрос issue."""
+        try:
+            self.github.update_comment(comment_id, f"❓ {question}\n\n{footer}")
+        except Exception as exc:  # noqa: BLE001
+            logger.error("[agent-question] github comment update failed: %s", exc)
 
     async def _monitor_openhands(self, task: Task, conversation_id: str, client_dir: str) -> None:
         """Мониторит сессию OpenHands: уточнения, завершение, ошибки.
