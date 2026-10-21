@@ -98,6 +98,9 @@ class Scheduler:
         # Сколько раз подряд можно авто-перезапускать прерванную задачу после
         # сбоя/перезагрузки, прежде чем пометить её failed (защита от зацикливания).
         self.max_resume_attempts: int = int(os.getenv("OPENHANDS_MAX_RESUME_ATTEMPTS", "3"))
+        # Сколько раз будить разговор, погасший во время ожидания ответа
+        # пользователя (OpenHands гасит простаивающие разговоры по idle-таймауту).
+        self.max_stop_restarts: int = int(os.getenv("OPENHANDS_MAX_STOP_RESTARTS", "3"))
 
     # ------------------------------------------------------------------ #
     # Вспомогательные
@@ -1917,6 +1920,8 @@ class Scheduler:
         # задать тот же вопрос повторно: после доставки ответа агент ещё какое-то
         # время остаётся в awaiting_user_input со старым сообщением.
         answered_msg: Optional[str] = None
+        # Сколько раз будили разговор, погасший во время ожидания ответа.
+        stop_restarts = 0
         # Build-секреты: повторяем установку, пока OpenHands не склонировал
         # репозиторий в /workspace (покрывает и старт, и recovery).
         secrets_done = not self._has_build_secrets()
@@ -2041,9 +2046,9 @@ class Scheduler:
                 )
                 return
 
-            # stopped — разговор погашен: либо агент уже отчитался, либо
-            # задачу оборвали. Остальные состояния (loading / running /
-            # paused) означают, что работа ещё идёт.
+            # stopped — разговор погашен. Причины разные: агент уже отчитался
+            # (штатно), разговор погас во время ожидания ответа пользователя
+            # (надо разбудить и продолжить), либо задачу оборвали.
             if state_val == "stopped":
                 # Остановка после отчёта агента — штатное завершение
                 # (OpenHands гасит простаивающий разговор).
@@ -2054,6 +2059,33 @@ class Scheduler:
                     self.state.save(task)
                     await self._build_ios_and_create_pr(task, client_dir)
                     return
+                if info.get("state_before_stop") == "awaiting_user_input":
+                    # Разговор погас (idle-таймаут), пока агент ждал ответ.
+                    # Будим разговор: вопрос остался в траектории, монитор
+                    # задаст его заново; уже данный ответ доставит поллер.
+                    stop_restarts += 1
+                    if stop_restarts > self.max_stop_restarts:
+                        task.status = TaskStatus.FAILED
+                        task.add_log(
+                            "OpenHands: разговор гаснет при ожидании ответа, "
+                            f"попыток пробуждения исчерпано ({self.max_stop_restarts})"
+                        )
+                        await self._finalize_cost(task)
+                        self.state.save(task)
+                        self._notify_author(
+                            task,
+                            "❌ Разговор с агентом остановлен во время ожидания "
+                            "ответа и не возобновляется. Задача остановлена.",
+                        )
+                        return
+                    task.add_log(
+                        "OpenHands: разговор остановлен во время ожидания "
+                        f"ответа — возобновляю (попытка {stop_restarts})"
+                    )
+                    self.state.save(task)
+                    await self.openhands.start_conversation(conversation_id)
+                    await asyncio.sleep(self.config.clarification_poll_seconds)
+                    continue
                 task.status = TaskStatus.FAILED
                 task.add_log("OpenHands stopped before completion")
                 await self._finalize_cost(task)
@@ -2281,11 +2313,18 @@ class Scheduler:
                 out, err = await asyncio.wait_for(proc.communicate(), timeout=300)
                 if proc.returncode != 0:
                     # Пустой коммит — не ошибка, если правок и вправду нет.
+                    # ВАЖНО: git commit печатает "nothing to commit" в STDOUT,
+                    # а не в stderr — проверять нужно оба потока, иначе задача
+                    # без правок падает с пустой ошибкой.
                     msg = err.decode("utf-8", errors="replace").strip()
-                    if git_cmd[0] == "commit" and "nothing to commit" in msg:
+                    out_msg = out.decode("utf-8", errors="replace")
+                    if git_cmd[0] == "commit" and (
+                        "nothing to commit" in msg or "nothing to commit" in out_msg
+                    ):
                         task.add_log("git: нет изменений для коммита")
                         continue
-                    raise RuntimeError(f"git {' '.join(git_cmd)}: {msg}")
+                    shown = msg or out_msg.strip()
+                    raise RuntimeError(f"git {' '.join(git_cmd)}: {shown}")
                 if dry_run and git_cmd[0] == "push":
                     task.add_log("git push --dry-run: ветка проверена, на GitHub не отправлена")
         except Exception as exc:

@@ -318,15 +318,26 @@ class OpenHandsAdapter:
         message = None
         completed = False
         wait_for_response = False
+        # Состояние агента ПЕРЕД остановкой разговора. OpenHands гасит
+        # простаивающие разговоры, в том числе когда агент ждёт ответ
+        # пользователя, — по этому флагу монитор отличает «погас во время
+        # ожидания ответа» (надо разбудить) от «погас после отчёта».
+        state_before_stop = None
         for event in events:
             if event.get("observation") == "agent_state_changed":
                 extras = event.get("extras") or {}
-                if extras.get("agent_state"):
-                    agent_state = extras["agent_state"]
-                    if agent_state in ("awaiting_user_input", "finished"):
-                        # Агент отчитался — дальше разговор просто простаивает,
-                        # пока OpenHands его не остановит.
-                        completed = True
+                new_state = extras.get("agent_state")
+                if new_state:
+                    if new_state == "stopped":
+                        state_before_stop = agent_state
+                        agent_state = "stopped"
+                    else:
+                        agent_state = new_state
+                        if new_state == "finished":
+                            # Завершённый отчёт агента. awaiting_user_input сюда
+                            # не относится: агент мог лишь задать вопрос и ждать
+                            # ответа — это НЕ завершение работы.
+                            completed = True
             if event.get("source") == "agent" and event.get("action") == "message":
                 message = event.get("message")
                 args = event.get("args") or {}
@@ -337,6 +348,7 @@ class OpenHandsAdapter:
             "message": message,
             "wait_for_response": wait_for_response,
             "completed": completed,
+            "state_before_stop": state_before_stop,
             "error": None,
         }
 

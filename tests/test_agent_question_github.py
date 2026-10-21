@@ -228,3 +228,69 @@ def test_run_openhands_guard_prevents_double_start():
         assert calls == ["t36"], "задача запущена дважды"
 
     asyncio.run(scenario())
+
+
+# --------------------------------------------------------------------------- #
+# get_agent_state: stopped во время ожидания ответа ≠ завершение работы
+# --------------------------------------------------------------------------- #
+
+def _state_event(state: str) -> dict:
+    return {"observation": "agent_state_changed", "source": "environment",
+            "extras": {"agent_state": state}}
+
+
+def _agent_message(text: str, wait: bool) -> dict:
+    return {"action": "message", "source": "agent", "message": text,
+            "args": {"wait_for_response": wait}}
+
+
+def make_adapter_with(events: list[dict]):
+    from orchestrator.adapters.openhands import OpenHandsAdapter
+
+    adapter = object.__new__(OpenHandsAdapter)
+    adapter.base_url = "http://localhost:3000"
+
+    async def fake_trajectory(cid):
+        return {"trajectory": events}
+
+    adapter.get_trajectory = fake_trajectory
+    return adapter
+
+
+def test_stopped_while_awaiting_is_not_completed():
+    """Разговор, погашенный idle-таймаутом, пока агент ждал ответ, — НЕ
+    завершённая работа (именно так задача #36 ложно 'выполнилась')."""
+
+    async def scenario():
+        a = make_adapter_with([
+            _agent_message("I'll start by exploring...", True),
+            _state_event("running"),
+            _state_event("awaiting_user_input"),
+            _state_event("stopped"),
+        ])
+        info = await a.get_agent_state("conv1")
+        assert info["agent_state"] == "stopped"
+        assert info["completed"] is False, (
+            "awaiting_user_input не должен считаться завершением работы"
+        )
+        assert info["state_before_stop"] == "awaiting_user_input"
+
+    asyncio.run(scenario())
+
+
+def test_stopped_after_finish_is_completed():
+    """Разговор, погашенный после финального отчёта агента, — завершён."""
+
+    async def scenario():
+        a = make_adapter_with([
+            _agent_message("Готово: всё собралось.", False),
+            _state_event("running"),
+            _state_event("finished"),
+            _state_event("stopped"),
+        ])
+        info = await a.get_agent_state("conv1")
+        assert info["agent_state"] == "stopped"
+        assert info["completed"] is True
+        assert info["state_before_stop"] == "finished"
+
+    asyncio.run(scenario())
