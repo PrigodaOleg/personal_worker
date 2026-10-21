@@ -97,8 +97,14 @@ class GitHubAdapter:
         """Отредактировать существующий комментарий (например, зафиксировать ответ)."""
         self._ensure_auth()
         assert self._repo is not None
-        comment = self._repo.get_issue_comment(comment_id)
-        comment.edit(body)
+        # Прямой PATCH /repos/{owner}/{repo}/issues/comments/{id}:
+        # Repository.get_comment в PyGithub указывает на комментарии
+        # к коммитам (другой эндпоинт и другие права).
+        self._repo.requester.requestJsonAndCheck(
+            "PATCH",
+            f"{self._repo.url}/issues/comments/{comment_id}",
+            input={"body": body},
+        )
 
     def fetch_issue_state(self, issue_number: int) -> str:
         """Состояние issue: 'open' или 'closed'."""

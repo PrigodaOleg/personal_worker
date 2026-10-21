@@ -123,6 +123,15 @@ wait_for_response=true`) → оркестратор публикует вопр�
   ответы после сбоя не собираются, а старый комментарий сойдёт за ответ.
 - PyGithub синхронный: вызовы из async-кода уводим в `asyncio.to_thread`,
   иначе GitHub API на секунды замораживает весь event loop (Telegram, поллинг).
+  Ещё грабля: `Repository.get_comment(id)` в PyGithub — это комментарии к
+  КОММИТАМ (`/repos/.../comments/{id}`, у App на них 403). Комментарии к
+  issue живут на `/repos/.../issues/comments/{id}` — правим их прямым
+  `PATCH` через `requester.requestJsonAndCheck`.
+- GitHub App без права Workflows не может пушить изменения в
+  `.github/workflows/**`: remote rejected «refusing to allow a GitHub App to
+  create or update workflow ... without `workflows` permission». Лечится
+  только в настройках App на GitHub (Repository permissions → Workflows →
+  Read and write), кодом не обходится.
 - OpenHands гасит простаивающий разговор через ~1 час idle, В ТОМ ЧИСЛЕ когда
   агент ждёт ответ пользователя (`stopped` после `awaiting_user_input`).
   Поэтому в `get_agent_state`: `completed=True` только для `finished`;
