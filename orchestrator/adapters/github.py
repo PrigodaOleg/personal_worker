@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import re
 import time
 from typing import Optional
 
@@ -231,6 +232,32 @@ class GitHubAdapter:
             title=title, body=body, base=base, head=branch
         )
         return pr.html_url
+
+    def get_issue_assignees(self, issue_number: int) -> list[str]:
+        """Логины assignees issue — кандидаты в ревьюеры PR и упоминания."""
+        data = self._gh_api("GET", f"/issues/{issue_number}")
+        logins = [
+            (a or {}).get("login") for a in (data.get("assignees") or [])
+        ]
+        return [login for login in logins if login]
+
+    def request_reviewers(self, pr_url: str, reviewers: list[str]) -> None:
+        """Запросить ревью у пользователей на созданный PR.
+
+        Принимает html_url PR (число достаётся из /pull/{n}). Ошибка 422
+        (например, пользователь без доступа к репозиторию) летит наверх —
+        вызывающий код логирует её, но не валит задачу: PR уже создан.
+        """
+        self._ensure_auth()
+        assert self._repo is not None
+        m = re.search(r"/pull/(\d+)", pr_url)
+        if not m:
+            raise ValueError(f"не похоже на URL PR: {pr_url}")
+        self._gh_api(
+            "POST",
+            f"/pulls/{m.group(1)}/requested_reviewers",
+            input={"reviewers": list(reviewers)},
+        )
 
     def task_to_status(self, task: Task) -> TaskStatus:
         """Вспомогательная маппинг (для будущего использования)."""

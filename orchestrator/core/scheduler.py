@@ -2586,6 +2586,29 @@ class Scheduler:
 
         return {"status": "ok", "copied": copied, "removed": removed}
 
+    @staticmethod
+    def _build_pr_body(task: Task, branch: str, assignees: list[str]) -> str:
+        """Тело PR: описание, ветка, линковка с issue и упоминания.
+
+        `Closes #N` (только для задач из GitHub) делает две вещи: PR
+        прилинковывается к issue (секция Development) и issue автоматически
+        закрывается при влитии PR в дефолтную ветку.
+        """
+        parts = [
+            f"Автосоздано personal_worker для задачи:\n\n{task.description}\n",
+            f"Источник: {task.source.value}",
+            f"Ветка: `{branch}`",
+        ]
+        if task.source == TaskSource.GITHUB:
+            parts.append(f"Closes #{task.source_id}")
+        if assignees:
+            parts.append("Ревьюеры: " + " ".join(f"@{a}" for a in assignees))
+        parts.append(
+            "Сборки и тесты пройдены агентом (Linux/Web/Android в контейнере, "
+            "iOS на iMac по SSH)."
+        )
+        return "\n".join(parts)
+
     async def _build_ios_and_create_pr(self, task: Task, client_dir: str) -> None:
         # Считаем стоимость отработанной модели до итоговых действий.
         await self._finalize_cost(task)
@@ -2707,17 +2730,35 @@ class Scheduler:
             )
             return
 
+        # Assignees issue → ревьюеры PR + упоминания. Только для задач из
+        # GitHub (у Telegram-задач issue нет). Сбой здесь не валит задачу:
+        # PR важнее ревьюеров.
+        assignees: list[str] = []
+        if task.source == TaskSource.GITHUB:
+            try:
+                assignees = self.github.get_issue_assignees(int(task.source_id))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[github] assignees fetch failed: %s", exc)
+
+        pr_body = self._build_pr_body(task, branch, assignees)
         pr_url = self.github.create_pr(
             branch=branch,
             base="main",
             title=f"[AI] {task.title}",
-            body=f"Автосоздано personal_worker для задачи:\n\n{task.description}\n\n"
-                 f"Источник: {task.source.value}\n"
-                 f"Все сборки и тесты пройдены (Linux/Web/Android внутри OpenHands, iOS на iMac).",
+            body=pr_body,
         )
         task.pr_url = pr_url
         task.status = TaskStatus.DONE
         self.state.save(task)
+
+        if assignees:
+            try:
+                self.github.request_reviewers(pr_url, assignees)
+                task.add_log(f"Ревьюеры запрошены: {', '.join(assignees)}")
+            except Exception as exc:  # noqa: BLE001 — PR уже создан, не валить
+                logger.warning("[github] reviewers request failed: %s", exc)
+                task.add_log(f"Не удалось запросить ревьюеров: {exc}")
+                self.state.save(task)
 
         # Артефакты GHA: имена берём из workflow на нашей ветке, запуск ищем
         # по sha коммита (триггер срабатывает с лагом — поллим недолго).
@@ -2727,6 +2768,11 @@ class Scheduler:
             task, client_dir, branch
         )
         notify_text = f"✅ Задача выполнена! PR создан: {pr_url}\n"
+        notify_text += f"Ветка: `{branch}`\n"
+        if assignees:
+            notify_text += (
+                "Ревьюеры: " + " ".join(f"@{a}" for a in assignees) + "\n"
+            )
         notify_text += f"Стоимость: {self._cost_line(task)}\n"
         if artifacts_section:
             notify_text += f"\n{artifacts_section}"
