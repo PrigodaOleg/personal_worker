@@ -2485,6 +2485,15 @@ class Scheduler:
         "now i", "next step", "let me", "going to", "i'll", "i will",
     )
 
+    # Маркеры будущего сопоставляем ПО ГРАНИЦАМ СЛОВ: простое вхождение
+    # подстроки даёт ложные срабатывания — «запускаю» совпадает внутри
+    # «тесты не запускаются», и финальный отчёт классифицируется как
+    # объявление намерения. Тогда монитор бесконечно подталкивает агента,
+    # а тот в ответ снова шлёт тот же отчёт (зависание задачи #5).
+    _FUTURE_RE = re.compile(
+        r"\b(?:" + "|".join(re.escape(m) for m in _FUTURE_MARKERS) + r")\b"
+    )
+
     @classmethod
     def _classify_agent_pause(cls, message: str) -> str:
         """Классифицировать паузу агента в awaiting_user_input.
@@ -2502,8 +2511,8 @@ class Scheduler:
             m in lowered for m in cls._ASK_MARKERS
         ):
             return "question"
-        if any(m in lowered for m in cls._REPORT_MARKERS) and not any(
-            m in lowered for m in cls._FUTURE_MARKERS
+        if any(m in lowered for m in cls._REPORT_MARKERS) and not cls._FUTURE_RE.search(
+            lowered
         ):
             return "report"
         return "announce"

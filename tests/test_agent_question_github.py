@@ -337,6 +337,38 @@ def test_real_question_is_recognized():
     assert Scheduler._classify_agent_pause("Should I proceed with option 2?") == "question"
 
 
+# --------------------------------------------------------------------------- #
+# Маркеры будущего — по границам слов (issue #5: зависание в цикле подталкиваний)
+# --------------------------------------------------------------------------- #
+
+REPORT_WITH_NEGATION = (
+    "работа завершена\n\n"
+    "Сделанные изменения:\n"
+    "1. Создан **Makefile** с автоматизацией всего цикла разработки:\n"
+    "   - `ios-build` — `flutter build ios --release --no-codesign` на iMac;\n"
+    "     тесты на iMac не запускаются — isar_plus на macOS падает.\n"
+    "2. Все проверки пройдены успешно: flutter test — 52 теста.\n"
+    "Секреты не коммитились. PR не создавался."
+)
+
+
+def test_report_with_negated_verb_is_report():
+    """«тесты не запускаются» содержит подстроку «запускаю» — простое вхождение
+    превращало финальный отчёт в «объявление намерения», монитор зацикливался
+    на подталкиваниях, задача зависала (issue #5). Границы слов это чинят."""
+    assert Scheduler._classify_agent_pause(REPORT_WITH_NEGATION) == "report"
+
+
+def test_future_intent_still_recognized():
+    """Настоящее намерение продолжать работу — по-прежнему не отчёт."""
+    assert Scheduler._classify_agent_pause(
+        "Тесты прошли успешно. Теперь запускаю сборку APK."
+    ) == "announce"
+    assert Scheduler._classify_agent_pause(
+        "I'll start by exploring the files."
+    ) == "announce"
+
+
 def test_announcement_is_not_report_nor_question():
     """«I'll start by exploring...» — не вопрос и не отчёт: агент просто
     объявил намерение и встал на паузу."""
