@@ -318,12 +318,19 @@ class OpenHandsAdapter:
         message = None
         completed = False
         wait_for_response = False
+        # Сколько в траектории «рабочих» событий (результаты команд, правок,
+        # ошибок). Монитор по росту этого числа между паузами понимает, что
+        # агент реально работал, а не зациклился на объявлении намерения.
+        work_events = 0
         # Состояние агента ПЕРЕД остановкой разговора. OpenHands гасит
         # простаивающие разговоры, в том числе когда агент ждёт ответ
         # пользователя, — по этому флагу монитор отличает «погас во время
         # ожидания ответа» (надо разбудить) от «погас после отчёта».
         state_before_stop = None
         for event in events:
+            obs_type = event.get("observation")
+            if obs_type and obs_type != "agent_state_changed":
+                work_events += 1
             if event.get("observation") == "agent_state_changed":
                 extras = event.get("extras") or {}
                 new_state = extras.get("agent_state")
@@ -349,6 +356,7 @@ class OpenHandsAdapter:
             "wait_for_response": wait_for_response,
             "completed": completed,
             "state_before_stop": state_before_stop,
+            "work_events": work_events,
             "error": None,
         }
 

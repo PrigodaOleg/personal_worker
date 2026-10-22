@@ -448,3 +448,95 @@ def test_monitor_nudges_announcement_instead_of_asking():
         assert task.status == TaskStatus.CANCELLED
 
     asyncio.run(scenario())
+
+
+# --------------------------------------------------------------------------- #
+# auto_continues: счётчик сбрасывается при реальном прогрессе агента (issue #38)
+# --------------------------------------------------------------------------- #
+
+def _pause_state(message: str, work: int) -> dict:
+    return {"agent_state": "awaiting_user_input", "message": message,
+            "wait_for_response": True, "completed": False,
+            "state_before_stop": None, "work_events": work}
+
+
+def _running_state() -> dict:
+    return {"agent_state": "running", "message": "", "wait_for_response": False,
+            "completed": False, "state_before_stop": None, "work_events": 0}
+
+
+def test_monitor_resets_auto_continues_when_agent_works():
+    """Агент сообщает промежуточный статус и РЕАЛЬНО работает между паузами
+    (растут рабочие события) — задача не должна зависнуть на вопросах автору:
+    счётчик авто-продолжений сбрасывается, каждый статус — просто
+    подталкивание (регресс issue #38: бесконечные «да» от автора)."""
+
+    async def scenario():
+        s = _monitor_scheduler([
+            _pause_state("Сообщаю: начал работу", 0),
+            _running_state(),
+            _pause_state("Сообщаю: пишу тесты", 7),
+            _running_state(),
+            _pause_state("Сообщаю: проверяю сборку", 15),
+            _running_state(),
+        ], max_auto=1)
+
+        async def fail_question(*a, **k):
+            raise AssertionError("промежуточный статус переслан автору как вопрос")
+
+        s._handle_agent_question = fail_question
+        task = make_task()
+
+        polls = {"n": 0}
+        orig_get_state = s.openhands.get_agent_state
+
+        async def counting_get_state(conversation_id):
+            polls["n"] += 1
+            if polls["n"] >= 8:
+                task.status = TaskStatus.CANCELLED
+            return await orig_get_state(conversation_id)
+
+        s.openhands.get_agent_state = counting_get_state
+
+        await asyncio.wait_for(
+            s._monitor_openhands(task, "conv1", "/tmp/client"), timeout=2
+        )
+        # Три паузы с прогрессом между ними — три подталкивания, ни одного
+        # вопроса автору, несмотря на max_auto_continues=1.
+        assert len(s.openhands.sent) == 3, (
+            f"ожидалось 3 подталкивания, отправлено {len(s.openhands.sent)}"
+        )
+        assert task.status == TaskStatus.CANCELLED
+
+    asyncio.run(scenario())
+
+
+def test_monitor_escalates_pauses_without_progress():
+    """Паузы ПОДРЯД без единого рабочего события — агент зациклился:
+    после исчерпания лимита вопрос автору правомерен (и это единственный
+    случай, когда промежуточное сообщение уходит автору)."""
+
+    async def scenario():
+        s = _monitor_scheduler([
+            _pause_state("Шаг 1", 0),
+            _pause_state("Шаг 2", 0),
+            _pause_state("Шаг 3", 0),
+        ], max_auto=2)
+        asked: list[str] = []
+
+        async def fake_question(task, cid, msg):
+            asked.append(msg)
+            task.status = TaskStatus.CANCELLED
+            return False
+
+        s._handle_agent_question = fake_question
+        task = make_task()
+        await asyncio.wait_for(
+            s._monitor_openhands(task, "conv1", "/tmp/client"), timeout=2
+        )
+        assert len(asked) == 1, (
+            f"после {2} пауз без прогресса нужна ровно одна эскалация, "
+            f"получено {len(asked)}"
+        )
+
+    asyncio.run(scenario())
