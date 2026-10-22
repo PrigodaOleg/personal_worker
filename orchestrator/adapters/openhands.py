@@ -171,34 +171,45 @@ class OpenHandsAdapter:
             logger.error("[openhands] list_models_raw failed: %s", exc)
             return {"status": "error", "error": str(exc)}
 
-    async def get_events(self, conversation_id: str) -> list:
+    async def get_events(self, conversation_id: str, limit: int = 100) -> list:
         """Сырые события разговора (логи команд, состояние агента).
 
-        Источник — `GET /api/conversations/{id}/events`. В отличие от
-        `/trajectory`, работает и для уже завершённых разговоров.
+        Источник — `GET /api/conversations/{id}/events`. Эндпоинт пагинирован
+        и без параметров отдаёт первые 20 событий (с самого начала разговора),
+        поэтому запрашиваем ПОСЛЕДНИЕ `limit` (reverse=true) и возвращаем их в
+        хронологическом порядке. Работает и для уже завершённых разговоров.
         """
         try:
             r = await self._client.get(
                 f"{self.base_url}/api/conversations/{conversation_id}/events",
+                params={"reverse": "true", "limit": limit},
                 headers=self._headers(),
             )
             r.raise_for_status()
-            return r.json().get("events", [])
+            events = r.json().get("events", [])
         except httpx.HTTPError as exc:
             logger.error("[openhands] get_events failed: %s", exc)
             return []
+        events.reverse()  # reverse=true отдаёт новейшие первыми
+        return events
 
     async def get_usage(self, conversation_id: str) -> dict:
         """Использование токенов разговором (из llm_metrics событий).
 
         Возвращает накопленные токены: prompt/completion/cache_read. Источник —
-        `GET /api/conversations/{id}/events`, у событий есть `llm_metrics` с
-        `accumulated_token_usage`.
+        `GET /api/conversations/{id}/events`.
+
+        ВАЖНО: эндпоинт пагинирован и без параметров отдаёт первые 20 событий
+        (из НАЧАЛА разговора). Раньше accumulate-метрики брались из этого
+        начала, и стоимость получалась в сотни раз заниженной (issue #38:
+        0,87 ₽ вместо ~165 ₽). Запрашиваем последние события (reverse=true) —
+        accumulated_token_usage в новейшем событии есть итог всего разговора.
         """
         empty = {"prompt_tokens": 0, "completion_tokens": 0, "cache_read_tokens": 0}
         try:
             r = await self._client.get(
                 f"{self.base_url}/api/conversations/{conversation_id}/events",
+                params={"reverse": "true", "limit": 100},
                 headers=self._headers(),
             )
             r.raise_for_status()
@@ -207,17 +218,17 @@ class OpenHandsAdapter:
             logger.error("[openhands] get_usage failed: %s", exc)
             return empty
 
-        acc = empty
+        # События идут новейшие первыми: первое с метриками — итог разговора.
         for e in events:
             metrics = e.get("llm_metrics") or {}
             usage = metrics.get("accumulated_token_usage") or {}
             if usage:
-                acc = {
+                return {
                     "prompt_tokens": usage.get("prompt_tokens", 0) or 0,
                     "completion_tokens": usage.get("completion_tokens", 0) or 0,
                     "cache_read_tokens": usage.get("cache_read_tokens", 0) or 0,
                 }
-        return acc
+        return empty
 
     async def create_conversation(
         self,
@@ -318,12 +329,19 @@ class OpenHandsAdapter:
         message = None
         completed = False
         wait_for_response = False
+        # Сколько в траектории «рабочих» событий (результаты команд, правок,
+        # ошибок). Монитор по росту этого числа между паузами понимает, что
+        # агент реально работал, а не зациклился на объявлении намерения.
+        work_events = 0
         # Состояние агента ПЕРЕД остановкой разговора. OpenHands гасит
         # простаивающие разговоры, в том числе когда агент ждёт ответ
         # пользователя, — по этому флагу монитор отличает «погас во время
         # ожидания ответа» (надо разбудить) от «погас после отчёта».
         state_before_stop = None
         for event in events:
+            obs_type = event.get("observation")
+            if obs_type and obs_type != "agent_state_changed":
+                work_events += 1
             if event.get("observation") == "agent_state_changed":
                 extras = event.get("extras") or {}
                 new_state = extras.get("agent_state")
@@ -349,6 +367,7 @@ class OpenHandsAdapter:
             "wait_for_response": wait_for_response,
             "completed": completed,
             "state_before_stop": state_before_stop,
+            "work_events": work_events,
             "error": None,
         }
 
