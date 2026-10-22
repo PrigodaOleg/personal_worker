@@ -252,7 +252,13 @@ class OpenHandsAdapter:
             r.raise_for_status()
             return r.json()
         except httpx.HTTPError as exc:
-            logger.error("[openhands] create_conversation failed: %s", exc)
+            # Тело ответа обязательно: 422 FastAPI описывает, какое поле
+            # не прошло валидацию, и без него причина не видна.
+            body = getattr(exc, "response", None)
+            body_text = getattr(body, "text", "")[:500] if body is not None else ""
+            logger.error(
+                "[openhands] create_conversation failed: %s body=%s", exc, body_text
+            )
             return {"status": "error", "error": str(exc)}
 
     async def start_conversation(self, conversation_id: str) -> dict:

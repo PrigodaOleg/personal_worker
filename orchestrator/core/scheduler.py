@@ -451,6 +451,47 @@ class Scheduler:
         return models
 
     @staticmethod
+    def _render_instruction(
+        description: str,
+        imac_item: str,
+        tail_items: str,
+        secrets_note: str,
+    ) -> str:
+        """Инструкция агенту из описания задачи и стандартных требований.
+
+        Отдельный метод для тестируемости: запятая после последней строки в
+        скобочной конкатенации делает из неё КОРТЕЖ, OpenHands получает вместо
+        строки список и отвечает 422 (issue #5). Здесь это исключено типом.
+        """
+        instruction = (
+            f"{description}\n\n"
+            "ТРЕБОВАНИЯ:\n"
+            "1. Работай в папке /workspace/social_mind/domains/client "
+            "(внутри контейнера проект лежит в /workspace/social_mind)\n"
+            "2. После внесения изменений запусти:\n"
+            "   - flutter test\n"
+            "   - flutter build linux\n"
+            "   - flutter build web --release\n"
+            "   - flutter build apk --release --split-per-abi\n"
+            f"{imac_item}"
+            f"{tail_items}"
+            f"{secrets_note}"
+            "Не создавай PR — это сделает оркестратор отдельно.\n\n"
+            "ПРАВИЛА ОБЩЕНИЯ:\n"
+            "- Промежуточные статусы («теперь пишу тест…», «проверю классы») "
+            "отправляй БЕЗ ожидания ответа и сразу продолжай работу: оркестратор "
+            "не передаёт их пользователю, а пустые паузы тормозят задачу.\n"
+            "- Останавливаться и ждать ответа пользователя можно ТОЛЬКО задавая "
+            "реальный вопрос со знаком вопроса, без которого продолжить нельзя.\n"
+            "- Финальный отчёт — только когда ВСЕ пункты требований выполнены "
+            "(тесты и все сборки прогнаны); в отчёте перечисли сделанные изменения."
+        )
+        assert isinstance(instruction, str), (
+            "инструкция должна быть строкой, а не кортежем"
+        )
+        return instruction
+
+    @staticmethod
     def _model_version_key(model_id: str) -> tuple:
         nums = tuple(int(x) for x in re.findall(r"\d+", model_id))
         return (nums, model_id)
@@ -1871,30 +1912,12 @@ class Scheduler:
                 "3. Если какие-либо команды завершаются с ошибкой — исправь код и запусти снова.\n"
                 "4. Сообщи, когда все проверки пройдены успешно.\n"
             )
-        instruction = (
-            f"{task.description}\n\n"
-            "ТРЕБОВАНИЯ:\n"
-            "1. Работай в папке /workspace/social_mind/domains/client "
-            "(внутри контейнера проект лежит в /workspace/social_mind)\n"
-            "2. После внесения изменений запусти:\n"
-            "   - flutter test\n"
-            "   - flutter build linux\n"
-            "   - flutter build web --release\n"
-            "   - flutter build apk --release --split-per-abi\n"
-            f"{imac_item}"
-            f"{tail_items}"
-            f"{secrets_note}"
-            "Не создавай PR — это сделает оркестратор отдельно.\n\n"
-            "ПРАВИЛА ОБЩЕНИЯ:\n"
-            "- Промежуточные статусы («теперь пишу тест…», «проверю классы») "
-            "отправляй БЕЗ ожидания ответа и сразу продолжай работу: оркестратор "
-            "не передаёт их пользователю, а пустые паузы тормозят задачу.\n"
-            "- Останавливаться и ждать ответа пользователя можно ТОЛЬКО задавая "
-            "реальный вопрос со знаком вопроса, без которого продолжить нельзя.\n"
-            "- Финальный отчёт — только когда ВСЕ пункты требований выполнены "
-            "(тесты и все сборки прогнаны); в отчёте перечисли сделанные изменения.",
+        instruction = self._render_instruction(
+            description=task.description,
+            imac_item=imac_item,
+            tail_items=tail_items,
+            secrets_note=secrets_note,
         )
-
         # Настраиваем LLM провайдера (provod.ai) перед каждым разговором —
         # модель берём из задачи (либо модель по умолчанию).
         llm_result = await self.openhands.configure_llm(

@@ -132,3 +132,26 @@ def test_compute_cost_matches_provider_billing():
         f"стоимость {cost_rub} ₽ вне порядка биллинга provod.ai (150–200 ₽)"
     )
     assert abs(cost_usd - 1.9986) < 0.01
+
+
+# --------------------------------------------------------------------------- #
+# Инструкция агенту — строка, а не кортеж (issue #5: 422 от OpenHands)
+# --------------------------------------------------------------------------- #
+
+def test_render_instruction_returns_string():
+    """Запятая после последней строки скобочной конкатенации превращает её в
+    КОРТЕЖ: OpenHands получает вместо строки список и отвечает 422
+    («Unprocessable Content»), задача мгновенно падает. Регрессия к правке
+    «ПРАВИЛА ОБЩЕНИЯ» (issue #5)."""
+    from orchestrator.core.scheduler import Scheduler
+
+    instr = Scheduler._render_instruction(
+        description="Написать мейкфайл.",
+        imac_item="",
+        tail_items="3. Если какие-либо команды завершаются с ошибкой — исправь код.\n",
+        secrets_note="",
+    )
+    assert isinstance(instr, str)
+    assert instr.startswith("Написать мейкфайл.")
+    assert "ПРАВИЛА ОБЩЕНИЯ" in instr
+    assert "Не создавай PR" in instr
