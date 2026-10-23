@@ -319,6 +319,7 @@ class OpenHandsAdapter:
                 "agent_state": None,
                 "message": None,
                 "completed": False,
+                "error_reason": None,
                 "error": traj.get("error"),
             }
 
@@ -328,6 +329,7 @@ class OpenHandsAdapter:
                 "agent_state": None,
                 "message": None,
                 "completed": False,
+                "error_reason": None,
                 "error": "нет событий в траектории",
             }
 
@@ -335,6 +337,10 @@ class OpenHandsAdapter:
         message = None
         completed = False
         wait_for_response = False
+        # Причина ошибки из события agent_state_changed (OpenHands кладёт туда
+        # текст исключения, например «RuntimeError: ... ServiceUnavailableError»).
+        # По ней монитор отличает временную недоступность LLM от реального сбоя.
+        error_reason = None
         # Сколько в траектории «рабочих» событий (результаты команд, правок,
         # ошибок). Монитор по росту этого числа между паузами понимает, что
         # агент реально работал, а не зациклился на объявлении намерения.
@@ -351,6 +357,8 @@ class OpenHandsAdapter:
             if event.get("observation") == "agent_state_changed":
                 extras = event.get("extras") or {}
                 new_state = extras.get("agent_state")
+                if new_state == "error":
+                    error_reason = extras.get("reason") or error_reason
                 if new_state:
                     if new_state == "stopped":
                         state_before_stop = agent_state
@@ -374,6 +382,7 @@ class OpenHandsAdapter:
             "completed": completed,
             "state_before_stop": state_before_stop,
             "work_events": work_events,
+            "error_reason": error_reason,
             "error": None,
         }
 
