@@ -36,9 +36,9 @@ def main() -> int:
     project = args.project.resolve()
 
     missing = [v for v in SECRET_ENV_VARS if not os_env(v)]
-    pem = os_env("GITHUB_APP_PRIVATE_KEY", "")
+    pem = os_env("GH_APP_PRIVATE_KEY", "")
     if not pem:
-        missing.append("GITHUB_APP_PRIVATE_KEY")
+        missing.append("GH_APP_PRIVATE_KEY")
     if missing:
         print("❌ Не заданы секреты репозитория (GitHub → Settings → Secrets "
               "and variables → Actions → Repository secrets):")

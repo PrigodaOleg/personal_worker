@@ -96,7 +96,7 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           OPENHANDS_API_KEY: ${{ secrets.OPENHANDS_API_KEY }}
           OPENHANDS_LLM_API_KEY: ${{ secrets.OPENHANDS_LLM_API_KEY }}
-          GITHUB_APP_PRIVATE_KEY: ${{ secrets.GITHUB_APP_PRIVATE_KEY }}
+          GH_APP_PRIVATE_KEY: ${{ secrets.GH_APP_PRIVATE_KEY }}
         run: |
           # .env и PEM-ключ собираются из секретов репозитория: развёртывание
           # с нуля = репозиторий + GitHub Secrets. Значения маскируются в логах.

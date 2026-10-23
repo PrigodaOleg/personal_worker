@@ -109,7 +109,7 @@ GitHub → Settings → Environments → New environment → `deploy` → Requir
 | `TELEGRAM_BOT_TOKEN` | токен Telegram-бота |
 | `OPENHANDS_API_KEY` | ключ API сервера OpenHands |
 | `OPENHANDS_LLM_API_KEY` | ключ провайдера LLM (provod.ai) |
-| `GITHUB_APP_PRIVATE_KEY` | приватный ключ GitHub App (PEM целиком) |
+| `GH_APP_PRIVATE_KEY` | приватный ключ GitHub App (PEM целиком) |
 
 Залить/обновить с машины, где есть старый `.env`:
 

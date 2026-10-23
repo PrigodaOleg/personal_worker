@@ -37,6 +37,8 @@ REPO = "PrigodaOleg/personal_worker"
 API = f"https://api.github.com/repos/{REPO}/actions/secrets"
 
 # Имя секрета → источник значения (имя переменной .env / PEM-файла).
+# ВНИМАНИЕ: GitHub запрещает имена секретов с префиксом GITHUB_,
+# поэтому PEM-ключ живёт под именем GH_APP_PRIVATE_KEY.
 ENV_SECRET_SOURCES = {
     "TELEGRAM_BOT_TOKEN": "TELEGRAM_BOT_TOKEN",
     "OPENHANDS_API_KEY": "OPENHANDS_API_KEY",
@@ -99,7 +101,7 @@ def main() -> int:
     }
 
     # 1. Публичный ключ репозитория для шифрования.
-    r = requests.get(API, headers=headers, timeout=30)
+    r = requests.get(f"{API}/public-key", headers=headers, timeout=30)
     if r.status_code == 403:
         print("❌ 403: нет права на секреты. Выдайте App разрешение «Secrets: "
               "Read and write» (Settings → Developer settings → GitHub Apps → "
@@ -122,11 +124,11 @@ def main() -> int:
 
     pem_path = dotenv.get("GITHUB_APP_PRIVATE_KEY_PATH", "")
     if pem_path and Path(pem_path).expanduser().exists():
-        to_sync["GITHUB_APP_PRIVATE_KEY"] = (
+        to_sync["GH_APP_PRIVATE_KEY"] = (
             Path(pem_path).expanduser().read_text()
         )
     else:
-        missing.append("GITHUB_APP_PRIVATE_KEY (GITHUB_APP_PRIVATE_KEY_PATH "
+        missing.append("GH_APP_PRIVATE_KEY (GITHUB_APP_PRIVATE_KEY_PATH "
                        "не задан или файл не существует)")
 
     if missing:
