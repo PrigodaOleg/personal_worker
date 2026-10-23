@@ -19,7 +19,7 @@ on:
       max_wait_minutes:
         description: "Сколько ждать окончания задач и GHA-хвостов (мин)"
         type: number
-        default: 60
+        default: 2880
 
 permissions:
   contents: read
@@ -32,8 +32,10 @@ jobs:
   deploy:
     runs-on: [self-hosted, personal-worker]
     environment: deploy         # кнопка подтверждения (required reviewers)
-    # 30 мин сам деплой + запас на ожидание окончания задач (max_wait_minutes).
-    timeout-minutes: 120
+    # Сам деплой ~30 мин + ожидание задач до 2 суток (2880 мин, равно
+    # CLARIFICATION_TIMEOUT_SECONDS — максимальному времени жизни задачи).
+    # На self-hosted раннере лимит 360 мин не применяется.
+    timeout-minutes: 2940
     steps:
       - name: Checkout main
         uses: actions/checkout@v4
