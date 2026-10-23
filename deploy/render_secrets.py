@@ -74,9 +74,9 @@ def main() -> int:
     return 0
 
 
-def os_env(name: str) -> str:
+def os_env(name: str, default: str = "") -> str:
     import os
-    return os.getenv(name, "")
+    return os.getenv(name, default)
 
 
 if __name__ == "__main__":
