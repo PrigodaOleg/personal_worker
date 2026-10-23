@@ -47,8 +47,11 @@ fi
 
 # Метка personal-worker: деплой-джобы таргетятся в неё, чтобы не уйти
 # на другой self-hosted раннер, если такой появится.
+# --name deploy-runner: различимое имя в UI GitHub и предсказуемое имя
+# systemd-сервиса (actions.runner.PrigodaOleg-personal_worker.deploy-runner).
 # --replace: перерегистрация при повторном запуске скрипта.
 ./config.sh --url "$REPO_URL" --token "$TOKEN" \
+    --name deploy-runner \
     --labels personal-worker --unattended --replace
 
 # Ставим как systemd-сервис (автозапуск при загрузке, авторестарт).
