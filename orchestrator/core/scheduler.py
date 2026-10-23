@@ -1339,6 +1339,8 @@ class Scheduler:
         if not task:
             return "🆕 У вас нет задач. Напишите задачу — и я начну.", None
         emoji = self._task_status_emoji(task.status)
+        if self._killed_by_openhands(task):
+            emoji = "🪓"
         layers = await self._layer_status_block(task)
         activity = await self._collect_task_logs(task, lines=6)
         pending = ""
@@ -1350,6 +1352,12 @@ class Scheduler:
                 f"\n\n❓ Ждёт ответа: {self._short_cmd(q, max_len=300)}\n"
                 "Ответь кнопкой ниже — или комментарием в issue."
             )
+        killed = (
+            "\n\n🪓 Агент остановлен и убит OpenHands (зацикливание). "
+            "Написанное сохранено в контейнере — задачу можно перезапустить."
+            if self._killed_by_openhands(task)
+            else ""
+        )
         text = (
             f"{emoji} Задача: «{task.title[:60]}»\n"
             f"Статус: {self._task_status_label(task.status)}\n"
@@ -1358,18 +1366,25 @@ class Scheduler:
             f"PR: {task.pr_url or '—'}\n\n"
             f"📊 Слои:\n{layers}\n\n"
             f"📋 Что делает агент:\n{activity}"
-            f"{pending}"
+            f"{killed}{pending}"
         )
         return text, self._task_actions_keyboard(task)
 
     def _task_card(self, task: Task) -> str:
         emoji = self._task_status_emoji(task.status)
-        if self._has_pending_question(task.id):
+        if self._killed_by_openhands(task):
+            emoji = "🪓"
+        elif self._has_pending_question(task.id):
             emoji = "❓"
         pr = task.pr_url or "—"
         model = self._effective_model(task)
         created = task.created_at.strftime("%Y-%m-%d %H:%M")
         src = "GitHub" if task.source == TaskSource.GITHUB else "Telegram"
+        killed = (
+            "\n🪓 Убита OpenHands: агент зациклился (написанное сохранено)"
+            if self._killed_by_openhands(task)
+            else ""
+        )
         card = (
             f"{emoji} {task.title[:70]}\n"
             f"ID: {task.id}\n"
@@ -1379,7 +1394,7 @@ class Scheduler:
             f"Попытка: {task.attempt}\n"
             f"Стоимость: {self._cost_line(task)}\n"
             f"PR: {pr}\n"
-            f"Создана: {created}"
+            f"Создана: {created}{killed}"
         )
         return card
 
@@ -1408,7 +1423,9 @@ class Scheduler:
         lines = [f"📋 Задачи ({len(tasks)}), стр. {page + 1}/{pages}:\n"]
         for t in chunk:
             emoji = self._task_status_emoji(t.status)
-            if self._has_pending_question(t.id):
+            if self._killed_by_openhands(t):
+                emoji = "🪓"
+            elif self._has_pending_question(t.id):
                 emoji = "❓"  # висит вопрос агента — требует внимания
             pr = t.pr_url or "—"
             lines.append(f"{emoji} {self._source_tag(t)} {t.title[:55]}\n     PR: {pr}\n")
@@ -2648,6 +2665,10 @@ class Scheduler:
         # Сколько раз продолжали работу агента после временной ошибки
         # (недоступность LLM: 503/429/таймаут).
         error_retries = 0
+        # Сколько раз продолжали после того, как OpenHands сам остановил
+        # агента за зацикливание (AgentStuckInLoopError): один ретрай —
+        # свежий старт того же разговора, обычно модель не повторяет цикл.
+        stuck_retries = 0
         # «Рабочие» события траектории на момент последней паузы агента.
         # Рост этого числа между паузами = агент реально работал (команды,
         # правки) — значит это нормальный рабочий ритм, а не зацикливание.
@@ -2837,6 +2858,30 @@ class Scheduler:
             if state_val in ("error", "rejected"):
                 error_msg = (info.get("message") or f"агент в состоянии {state_val}")
                 reason = info.get("error_reason") or ""
+                stuck_killed = self._is_stuck_loop_error(reason)
+                if state_val == "error" and stuck_killed and stuck_retries < 1:
+                    # OpenHands сам остановил агента (зацикливание). Один ретрай:
+                    # свежий старт разговора — обычно модель не повторяет цикл.
+                    stuck_retries += 1
+                    task.add_log(
+                        "OpenHands остановил агента: зацикливание "
+                        "(AgentStuckInLoopError) — перезапускаю разговор "
+                        "(попытка 1/1)"
+                    )
+                    self.state.save(task)
+                    self._notify_author(
+                        task,
+                        "🪓 OpenHands остановил агента: обнаружено зацикливание.\n"
+                        "Перезапускаю разговор (попытка 1/1) — работа в контейнере "
+                        "сохранена, продолжу с того же места.",
+                    )
+                    await asyncio.sleep(self.error_retry_wait_seconds)
+                    await self.openhands.start_conversation(conversation_id)
+                    await self.openhands.send_message(
+                        conversation_id, self._CONTINUE_NUDGE
+                    )
+                    await asyncio.sleep(self.config.clarification_poll_seconds)
+                    continue
                 if state_val == "error" and self._is_transient_agent_error(reason):
                     if error_retries >= self.max_error_retries:
                         task.status = TaskStatus.FAILED
@@ -2872,16 +2917,44 @@ class Scheduler:
                     await asyncio.sleep(self.config.clarification_poll_seconds)
                     continue
                 task.status = TaskStatus.FAILED
-                task.add_log(f"OpenHands failed: {error_msg}")
+                if stuck_killed:
+                    task.add_log(
+                        "OpenHands killed task: агент зациклился "
+                        "(AgentStuckInLoopError) — ретрай не помог"
+                    )
+                else:
+                    task.add_log(f"OpenHands failed: {error_msg}")
                 await self._finalize_cost(task)
                 self.state.save(task)
                 log_text = "\n".join(task.log[-15:]) if task.log else ""
-                self._notify_author(
-                    task,
-                    f"❌ OpenHands завершился с ошибкой.\n\n"
-                    f"Ошибка: {error_msg}\n\n"
-                    f"Лог выполнения:\n{log_text}",
-                )
+                if stuck_killed:
+                    # OpenHands сам убил задачу — пишем это явно и автору, и
+                    # в issue (для GH-задач _notify_author = комментарий), и
+                    # админу отдельным уведомлением.
+                    kill_text = (
+                        "🪓 OpenHands остановил и убил задачу: агент зациклился "
+                        "(AgentStuckInLoopError).\n\n"
+                        "Ретрай с перезапуском разговора не помог. Написанная "
+                        "работа сохранена в контейнере; после перезапуска задачи "
+                        "можно продолжить с того же места или изменить формулировку "
+                        "задачи, чтобы выйти из цикла.\n\n"
+                        f"Лог выполнения:\n{log_text}"
+                    )
+                    self._notify_author(task, kill_text)
+                    if task.source == TaskSource.GITHUB:
+                        self._notify_admin(
+                            f"🪓 Задача из GitHub убита OpenHands "
+                            f"(зацикливание агента):\n"
+                            f"{self._repo_full(task)}#"
+                            f"{task.source_id} «{task.title[:60]}»"
+                        )
+                else:
+                    self._notify_author(
+                        task,
+                        f"❌ OpenHands завершился с ошибкой.\n\n"
+                        f"Ошибка: {error_msg}\n\n"
+                        f"Лог выполнения:\n{log_text}",
+                    )
                 return
 
             # stopped — разговор погашен. Причины разные: агент уже отчитался
@@ -2958,6 +3031,20 @@ class Scheduler:
             return False
         lowered = reason.lower()
         return any(marker.lower() in lowered for marker in cls._TRANSIENT_ERROR_MARKERS)
+
+    @staticmethod
+    def _is_stuck_loop_error(reason: str) -> bool:
+        """OpenHands сам остановил агента за зацикливание?"""
+        lowered = (reason or "").lower()
+        return "agentstuckinloop" in lowered or "stuck in a loop" in lowered
+
+    @staticmethod
+    def _killed_by_openhands(task: Task) -> bool:
+        """Задача была убита OpenHands (след в логе задачи)."""
+        return any(
+            "AgentStuckInLoopError" in entry or "OpenHands killed task" in entry
+            for entry in task.log
+        )
 
     # Подталкивание агенту, вставшему на паузу без вопроса (объявил намерение
     # и замолчал): даём ему ясный протокол — работать, спросить или отчитаться.
