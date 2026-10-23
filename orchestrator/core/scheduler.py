@@ -676,6 +676,11 @@ class Scheduler:
                 f"🚀 Задача принята в работу: «{title[:60]}»\n"
                 "Если понадобятся уточнения — спрошу здесь, в комментариях.",
             )
+            self._notify_admin(
+                f"🆕 Новый issue с меткой {self.config.github_label}: "
+                f"«{title[:80]}» (автор: {author or 'unknown'})\n"
+                f"{issue.get('url') or ''}".rstrip()
+            )
             self._enqueue_task(task)
 
     def _poll_github_clarification_answers(self) -> None:
