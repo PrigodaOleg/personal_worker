@@ -79,6 +79,8 @@ class Scheduler:
         # Ожидающие ответа пользователя ВОПРОСЫ АГЕНТА (в процессе работы):
         # task.id -> {task, conversation_id, options, future, asked_at}.
         self._pending_agent_questions: dict[str, dict] = {}
+        # Режим «админ отвечает на вопрос агента из Telegram»: chat_id → task_id.
+        self._admin_answer_chat: dict[str, str] = {}
         self._pending_notifications: set = set()  # фоновые отправки в Telegram
         self._background_tasks: set = set()  # фоновые asyncio-задачи (держим ссылку)
         self._llm_configured: bool = False
@@ -915,6 +917,24 @@ class Scheduler:
             await self._handle_telegram_command(chat_id, text, username=msg.get("username"))
             return
 
+        # Ответ админа на вопрос агента (режим после кнопки «✍️ Ответить»)
+        answer_task_id = self._admin_answer_chat.get(chat_id)
+        if answer_task_id:
+            self._admin_answer_chat.pop(chat_id, None)
+            if text.strip() == "×":
+                await self.telegram.send_message(int(chat_id), "↩️ Ответ отменён.")
+                return
+            qinfo = self._pending_agent_questions.get(answer_task_id)
+            fut = (qinfo or {}).get("future")
+            if fut and not fut.done():
+                fut.set_result(text)
+                await self.telegram.send_message(int(chat_id), "✅ Ответ отправлен агенту.")
+            else:
+                await self.telegram.send_message(
+                    int(chat_id), "⌛ Вопрос уже закрыт, ответ не потребовался."
+                )
+            return
+
         # Ответ на вопрос АГЕНТА (задан в процессе работы) — отправляем ему.
         for _tid, qinfo in self._pending_agent_questions.items():
             qtask = qinfo["task"]
@@ -1291,6 +1311,9 @@ class Scheduler:
 
     def _task_actions_keyboard(self, task: Task):
         rows: list[list[tuple[str, str]]] = []
+        # Висящий вопрос агента: ответить можно прямо отсюда.
+        if self._has_pending_question(task.id):
+            rows.append([("✍️ Ответить на вопрос", f"qask:{task.id}")])
         # Упавшая после работы агента задача: подтолкнуть дешевле, чем перезапускать.
         if self._can_nudge_finalization(task):
             rows.append([("📤 Подтолкнуть", f"nudge:{task.id}")])
@@ -1318,6 +1341,15 @@ class Scheduler:
         emoji = self._task_status_emoji(task.status)
         layers = await self._layer_status_block(task)
         activity = await self._collect_task_logs(task, lines=6)
+        pending = ""
+        if self._has_pending_question(task.id):
+            q = self._strip_tool_markup(
+                str(self._pending_agent_questions[task.id].get("question") or "")
+            ).strip()
+            pending = (
+                f"\n\n❓ Ждёт ответа: {self._short_cmd(q, max_len=300)}\n"
+                "Ответь кнопкой ниже — или комментарием в issue."
+            )
         text = (
             f"{emoji} Задача: «{task.title[:60]}»\n"
             f"Статус: {self._task_status_label(task.status)}\n"
@@ -1326,11 +1358,14 @@ class Scheduler:
             f"PR: {task.pr_url or '—'}\n\n"
             f"📊 Слои:\n{layers}\n\n"
             f"📋 Что делает агент:\n{activity}"
+            f"{pending}"
         )
         return text, self._task_actions_keyboard(task)
 
     def _task_card(self, task: Task) -> str:
         emoji = self._task_status_emoji(task.status)
+        if self._has_pending_question(task.id):
+            emoji = "❓"
         pr = task.pr_url or "—"
         model = self._effective_model(task)
         created = task.created_at.strftime("%Y-%m-%d %H:%M")
@@ -1373,6 +1408,8 @@ class Scheduler:
         lines = [f"📋 Задачи ({len(tasks)}), стр. {page + 1}/{pages}:\n"]
         for t in chunk:
             emoji = self._task_status_emoji(t.status)
+            if self._has_pending_question(t.id):
+                emoji = "❓"  # висит вопрос агента — требует внимания
             pr = t.pr_url or "—"
             lines.append(f"{emoji} {self._source_tag(t)} {t.title[:55]}\n     PR: {pr}\n")
         text = "\n".join(lines)
@@ -1543,9 +1580,35 @@ class Scheduler:
                     fut = qinfo["future"]
                     if fut and not fut.done():
                         fut.set_result(answer)
-                    await self.telegram.answer_callback_query(
-                        query["callback_query_id"], f"✅ {answer[:32]}"
-                    )
+                        await self.telegram.answer_callback_query(
+                            query["callback_query_id"], f"✅ {answer[:32]}"
+                        )
+                    else:
+                        await self.telegram.answer_callback_query(
+                            query["callback_query_id"], "⌛ Вопрос уже закрыт"
+                        )
+            return
+
+        if data.startswith("qask:"):
+            # Ответ админа на вопрос агента следующим сообщением.
+            task_id = data[len("qask:"):]
+            if not self._is_admin(query.get("username")):
+                await self.telegram.answer_callback_query(
+                    query.get("callback_query_id", ""), "🔒 Только для админа"
+                )
+                return
+            if not self._has_pending_question(task_id):
+                await self.telegram.answer_callback_query(
+                    query.get("callback_query_id", ""), "⌛ Вопрос уже закрыт"
+                )
+                return
+            self._admin_answer_chat[chat_id_str] = task_id
+            qtask = self._pending_agent_questions[task_id]["task"]
+            await self.telegram.send_message(
+                chat_id_int,
+                "✍️ Напиши ответ следующим сообщением (× — отменить) — "
+                f"отправлю агенту задачи «{qtask.title[:40]}…».",
+            )
             return
 
         if data == "menu":
@@ -2406,6 +2469,7 @@ class Scheduler:
         qinfo = self._pending_agent_questions[task.id] = {
             "task": task,
             "conversation_id": conversation_id,
+            "question": text,
             "options": options,
             "future": fut,
             "asked_at": datetime.utcnow(),
@@ -2447,6 +2511,9 @@ class Scheduler:
                 qinfo["github_after_comment_id"] = question_comment_id
             except Exception as exc:  # noqa: BLE001
                 logger.error("[agent-question] github comment failed: %s", exc)
+            # Админ: уведомление о вопросе + возможность ответить из Telegram
+            # (в issue комментарий уже ушёл автору).
+            self._notify_admin_question(task, text, options)
 
         logger.info("[agent-question] task %s waiting for user answer", task.id)
         try:
@@ -2520,6 +2587,43 @@ class Scheduler:
             )
         except Exception as exc:  # noqa: BLE001
             logger.error("[agent-question] github comment update failed: %s", exc)
+
+    def _has_pending_question(self, task_id: str) -> bool:
+        """По задаче сейчас ждётся ответ на вопрос агента."""
+        qinfo = self._pending_agent_questions.get(task_id)
+        fut = (qinfo or {}).get("future")
+        return bool(qinfo and fut and not fut.done())
+
+    def _notify_admin_question(self, task: Task, question: str, options: list[str]) -> None:
+        """Админу: вопрос агента по задаче из issue + кнопки ответа.
+
+        Варианты из вопроса — кнопками (обрабатываются общим ans:-колбэком),
+        плюс «Свой ответ» (qask) — следующим сообщением в чат. Для Telegram-
+        задач не вызывается: вопрос уже ушёл автору в его чат.
+        """
+        admin_chat = self.config.telegram_admin_chat_id
+        if not admin_chat:
+            return
+        repo = self._repo_full(task)
+        body = (
+            f"❓ Вопрос агента по задаче «{task.title[:60]}»\n"
+            f"{repo} · issue #{task.source_id}\n\n"
+            f"{question[:600]}"
+        )
+        rows = [
+            [(opt[:48], f"ans:{task.id}:{i}")] for i, opt in enumerate(options[:4])
+        ]
+        rows.append([("✍️ Свой ответ", f"qask:{task.id}")])
+        try:
+            fut = asyncio.ensure_future(
+                self.telegram.send_message(
+                    int(admin_chat), body, keyboard=self.telegram.build_keyboard(rows)
+                )
+            )
+            self._pending_notifications.add(fut)
+            fut.add_done_callback(self._pending_notifications.discard)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("[agent-question] admin notify failed: %s", exc)
 
     async def _monitor_openhands(self, task: Task, conversation_id: str, client_dir: str) -> None:
         """Мониторит сессию OpenHands: уточнения, завершение, ошибки.
