@@ -93,10 +93,11 @@ jobs:
 
       - name: Run tests (smoke)
         run: |
+          set -euo pipefail
           cd /mnt/ssd/personal_worker
           # Тесты гоняем на РАЗВЁРТЫВАЕМОМ коде: workspace джобы чистый.
           python3 -m venv .venv-deploy-check
-          .venv-deploy-check/bin/pip install -q -r requirements.txt
+          .venv-deploy-check/bin/pip install -q -r requirements.txt -r requirements-dev.txt
           .venv-deploy-check/bin/pytest tests -q
           rm -rf .venv-deploy-check
 
