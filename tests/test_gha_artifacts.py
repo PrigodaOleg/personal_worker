@@ -6,7 +6,6 @@
 """
 
 import os
-import sys
 
 from orchestrator.core.scheduler import Scheduler
 

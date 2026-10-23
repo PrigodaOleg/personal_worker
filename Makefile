@@ -81,7 +81,7 @@ secrets:
 	@echo "Подробности: deploy/SECRETS.md"
 
 lint:
-	$(PIP) install ruff 2>/dev/null; $(VENV)/bin/ruff check orchestrator tests 2>/dev/null || echo "ruff not installed"
+	$(PIP) install ruff 2>/dev/null; $(VENV)/bin/ruff check orchestrator tests
 
 fmt:
 	$(VENV)/bin/ruff format orchestrator tests 2>/dev/null || echo "ruff not installed"

@@ -85,6 +85,18 @@ sudo ./deploy/install.sh
 Сервис поднимет Docker, запустит оркестратор и будет перезапускаться при сбоях
 и при загрузке ОС. Состояние восстанавливается из SQLite.
 
+## CI/CD (GitHub Actions)
+
+| Workflow | Когда | Что делает |
+|----------|-------|------------|
+| **PR check** | на каждый PR/пуш в main | ruff + pytest на self-hosted раннере этой машины |
+| **Deploy to worker** | кнопка «Run workflow» | деплой main на эту машину: rsync кода → pip → тесты → рестарт сервиса |
+
+Раннер регистрируется один раз: `bash deploy/setup_deploy_runner.sh <TOKEN>`
+(токен: GitHub → Settings → Actions → Runners → New self-hosted runner).
+Для подтверждения деплоя создайте окружение `deploy` с required reviewers:
+GitHub → Settings → Environments → New environment → `deploy` → Required reviewers.
+
 ## ❗ Что нужно сделать перед первым запуском
 
 | Что | Где |
