@@ -76,6 +76,7 @@ def make_scheduler() -> Scheduler:
         imac_user=None,
         imac_ssh_key="",
         github_repo="PrigodaOleg/social_mind",
+        telegram_admin_chat_id=None,
     )
     return s
 
