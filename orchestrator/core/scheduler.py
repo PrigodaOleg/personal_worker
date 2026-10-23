@@ -607,7 +607,7 @@ class Scheduler:
         nav: list[tuple[str, str]] = []
         if page > 0:
             nav.append(("⬅️", f"mp:{target}:{page - 1}:{mode}"))
-        nav.append((f"📄 {page + 1}/{pages}", f"noop"))
+        nav.append(("📄 {}/{}".format(page + 1, pages), "noop"))
         if page < pages - 1:
             nav.append(("➡️", f"mp:{target}:{page + 1}:{mode}"))
         rows.append(nav)
@@ -1280,7 +1280,6 @@ class Scheduler:
 
     async def _restart_task(self, task: Task, query: dict) -> None:
         cqid = query.get("callback_query_id", "")
-        chat_id_int = int(query.get("chat_id") or 0)
         if task.status == TaskStatus.RUNNING:
             await self.telegram.answer_callback_query(cqid, "⚠️ Задача уже выполняется")
             return
