@@ -36,12 +36,10 @@ jobs:
           # (/mnt/ssd/personal_worker/.venv) ничего ставить нельзя.
           python3 -m venv .venv-ci
           .venv-ci/bin/pip install -q --upgrade pip
-          .venv-ci/bin/pip install -q -r requirements.txt
+          .venv-ci/bin/pip install -q -r requirements.txt -r requirements-dev.txt
 
       - name: Lint (ruff)
-        run: |
-          .venv-ci/bin/pip install -q ruff
-          .venv-ci/bin/ruff check orchestrator tests
+        run: .venv-ci/bin/ruff check orchestrator tests
 
       - name: Tests (pytest)
         run: .venv-ci/bin/pytest tests -q

@@ -9,7 +9,7 @@ OVPN_CONFIG := ~/.config/germany.ovpn
 install:
 	python3 -m venv $(VENV)
 	$(PIP) install --upgrade pip
-	$(PIP) install -r requirements.txt
+	$(PIP) install -r requirements.txt -r requirements-dev.txt
 
 # Запуск OpenVPN (если tun0 не существует)
 vpn-up:
@@ -81,7 +81,7 @@ secrets:
 	@echo "Подробности: deploy/SECRETS.md"
 
 lint:
-	$(PIP) install ruff 2>/dev/null; $(VENV)/bin/ruff check orchestrator tests
+	$(VENV)/bin/ruff check orchestrator tests
 
 fmt:
 	$(VENV)/bin/ruff format orchestrator tests 2>/dev/null || echo "ruff not installed"
