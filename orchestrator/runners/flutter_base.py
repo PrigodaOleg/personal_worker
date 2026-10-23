@@ -50,7 +50,7 @@ class FlutterBaseRunner:
         return res
 
     async def build_linux(self, workspace: str) -> dict:
-        logger.info("[flutter] flutter build linux in %s", project_dir if False else self._project_dir(workspace))
+        logger.info("[flutter] flutter build linux in %s", self._project_dir(workspace))
         return await self._docker_exec(workspace, ["flutter", "build", "linux"])
 
     async def build_web(self, workspace: str) -> dict:

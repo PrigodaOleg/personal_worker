@@ -44,8 +44,11 @@ config/
 # Build secrets (Firebase / CLOSERS_*) — кладёт self-hosted runner, НЕ в git
 secrets/
 
-# GitHub Actions self-hosted runner (скачанный бинарь, машинно-специфичный)
+# GitHub Actions self-hosted runners (скачанный бинарь, машинно-специфичный).
+# actions-runner/ — раннер social_mind, actions-runner-deploy/ — деплой-раннер
+# personal_worker (deploy/setup_deploy_runner.sh).
 actions-runner/
+actions-runner-deploy/
 
 # State / logs
 *.db

@@ -1,0 +1,150 @@
+# Деплой personal_worker на эту машину — по кнопке «Run workflow».
+#
+# GitHub → Actions → «Deploy to worker» → Run workflow.
+# Защита: окружение deploy с required reviewers (Settings → Environments →
+# deploy → Required reviewers) — кнопка попросит подтверждение.
+#
+# Что делает: останавливает сервис, забирает ветку main, обновляет
+# зависимости, ставит systemd-юнит, запускает обратно, проверяет живость.
+# Разворачиваемся ровно там, где и работаем: /mnt/ssd/personal_worker.
+name: Deploy to worker
+
+on:
+  workflow_dispatch:            # кнопка в UI GitHub Actions
+    inputs:
+      restart_openhands:
+        description: "Пересобрать и поднять OpenHands (медленно)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-worker
+  cancel-in-progress: false     # деплой не должен идти параллельно сам с собой
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, personal-worker]
+    environment: deploy         # кнопка подтверждения (required reviewers)
+    timeout-minutes: 30
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          # ВАЖНО: это живой проект. git сам не мешает — workspace джобы
+          # другой (actions-runner-deploy/_work), оттуда мы rsync-им код
+          # в /mnt/ssd/personal_worker, минуя .git, state, secrets, venv.
+
+      - name: Preflight — репозиторий и права
+        run: |
+          set -euo pipefail
+          test -d /mnt/ssd/personal_worker/orchestrator \
+            || { echo "❌ /mnt/ssd/personal_worker не похож на каталог personal_worker"; exit 1; }
+          # Сервис обязан существовать: деплоим именно его.
+          systemctl cat personal_worker >/dev/null 2>&1 \
+            || { echo "❌ systemd-сервис personal_worker не найден"; exit 1; }
+
+      - name: Stop orchestrator
+        run: |
+          if systemctl is-active --quiet personal_worker; then
+            sudo systemctl stop personal_worker
+            echo "сервис остановлен"
+          else
+            echo "сервис уже не активен ($(systemctl is-active personal_worker))"
+          fi
+
+      - name: Sync code to /mnt/ssd/personal_worker
+        run: |
+          set -euo pipefail
+          SRC="$GITHUB_WORKSPACE"
+          DST=/mnt/ssd/personal_worker
+          # rsync только кода и метаданных деплоя. На месте остаются:
+          #   .env, .git, .venv, state/ (SQLite), secrets/, workspaces/,
+          #   config/ (ключи), actions-runner*/ (сами раннеры), .pytest_cache
+          rsync -a --delete \
+            --exclude '.env' \
+            --exclude '.git' \
+            --exclude '.venv' \
+            --exclude '.venv-ci' \
+            --exclude '.pytest_cache' \
+            --exclude 'state/' \
+            --exclude 'secrets/' \
+            --exclude 'workspaces/' \
+            --exclude 'config/' \
+            --exclude 'actions-runner/' \
+            --exclude 'actions-runner-deploy/' \
+            --exclude 'openhands_venv/' \
+            --exclude '__pycache__/' \
+            "$SRC/" "$DST/"
+          echo "Код синхронизирован: $(git -C "$SRC" rev-parse --short HEAD)"
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          cd /mnt/ssd/personal_worker
+          # Обновляем зависимости в живом venv сервиса. requirements.txt
+          # меняется редко — pip сам разберётся, что ставить.
+          .venv/bin/pip install -q -r requirements.txt
+          .venv/bin/python -m py_compile orchestrator/core/scheduler.py
+
+      - name: Run tests (smoke)
+        run: |
+          cd /mnt/ssd/personal_worker
+          # Тесты гоняем на РАЗВЁРТЫВАЕМОМ коде: workspace джобы чистый.
+          python3 -m venv .venv-deploy-check
+          .venv-deploy-check/bin/pip install -q -r requirements.txt
+          .venv-deploy-check/bin/pytest tests -q
+          rm -rf .venv-deploy-check
+
+      - name: Install systemd unit
+        run: |
+          cd /mnt/ssd/personal_worker
+          if ! diff -q deploy/personal_worker.service /etc/systemd/system/personal_worker.service >/dev/null 2>&1; then
+            sudo cp deploy/personal_worker.service /etc/systemd/system/
+            sudo systemctl daemon-reload
+            echo "systemd-юнит обновлён"
+          else
+            echo "systemd-юнит без изменений"
+          fi
+
+      - name: Start orchestrator
+        run: |
+          sudo systemctl start personal_worker
+          for i in $(seq 1 30); do
+            if systemctl is-active --quiet personal_worker; then
+              # Даём стартовать Telegram-поллинг: в логе должна появиться строка старта.
+              if journalctl -u personal_worker --since "1 minute ago" --no-pager \
+                   | grep -q "polling started"; then
+                echo "✅ сервис поднялся, Telegram-поллинг активен"
+                exit 0
+              fi
+            fi
+            sleep 2
+          done
+          echo "❌ сервис не поднялся за 60с, логи:"
+          journalctl -u personal_worker --no-pager -n 50
+          exit 1
+
+      - name: Rebuild OpenHands (optional)
+        if: ${{ inputs.restart_openhands }}
+        run: |
+          cd /mnt/ssd/personal_worker
+          sudo docker compose up -d --build
+          sudo docker compose ps
+
+      - name: Deploy summary
+        run: |
+          cd /mnt/ssd/personal_worker
+          {
+            echo "## 🚀 Deploy"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Коммит | \`$(git rev-parse --short HEAD)\` |"
+            echo "| Сервис | $(systemctl is-active personal_worker) |"
+            echo "| OpenHands | $(sudo docker inspect -f '{{.State.Health.Status}}' openhands-flutter 2>/dev/null || echo 'не проверялся') |"
+          } >> "$GITHUB_STEP_SUMMARY"

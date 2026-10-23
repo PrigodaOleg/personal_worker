@@ -135,9 +135,7 @@ def test_monitor_does_not_reask_same_message():
     пока агент не вышел из awaiting_user_input."""
 
     async def scenario():
-        s = make_scheduler()
-        # answered_msg-логика живёт в _monitor_openhands; проверяем её ядро:
-        # одинаковое сообщение в awaiting_user_input должно пропускаться.
+        make_scheduler()  # проверки в тесте чисто логические — экземпляр не нужен
         answered_msg = "Какой вариант?"
         message = "Какой вариант?"
         assert message == answered_msg  # условие guard в _monitor_openhands

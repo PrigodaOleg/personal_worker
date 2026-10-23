@@ -12,7 +12,7 @@ from typing import Optional
 from github import Github
 from github.Auth import AppAuth
 
-from orchestrator.core.task import Task, TaskSource, TaskStatus
+from orchestrator.core.task import Task, TaskStatus
 
 
 class GitHubAdapter:

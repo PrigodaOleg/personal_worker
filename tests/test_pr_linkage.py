@@ -4,8 +4,6 @@
 issue при влитии PR в дефолтную ветку — закрытие делает сам GitHub.
 """
 
-import asyncio
-import types
 
 from orchestrator.adapters.github import GitHubAdapter
 from orchestrator.core.scheduler import Scheduler

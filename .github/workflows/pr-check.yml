@@ -1,0 +1,45 @@
+# Валидация PR в personal_worker: тесты + линт.
+#
+# Выполняется на self-hosted раннере этой машины (метка personal-worker):
+# репозиторий приватный, у сторонних раннеров доступа нет, зато здесь уже
+# есть .venv со всеми зависимостями — джоба переиспользует его вместо
+# свежей установки (быстрее и без походов в интернет за пакетами).
+#
+# Раннер регистрируется скриптом deploy/setup_deploy_runner.sh.
+name: PR check
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+concurrency:
+  group: pr-check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: [self-hosted, personal-worker]
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # ref пуша или merge-коммит PR — GHA подставляет нужный сам
+          fetch-depth: 0
+
+      - name: Create venv
+        run: |
+          set -euo pipefail
+          # Свежий venv в workspace джобы: в РАБОЧУЮ копию сервиса
+          # (/mnt/ssd/personal_worker/.venv) ничего ставить нельзя.
+          python3 -m venv .venv-ci
+          .venv-ci/bin/pip install -q --upgrade pip
+          .venv-ci/bin/pip install -q -r requirements.txt -r requirements-dev.txt
+
+      - name: Lint (ruff)
+        run: .venv-ci/bin/ruff check orchestrator tests
+
+      - name: Tests (pytest)
+        run: .venv-ci/bin/pytest tests -q

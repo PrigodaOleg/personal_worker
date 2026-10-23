@@ -9,8 +9,6 @@ accumulated_token_usage в новейшем событии есть итог в�
 Тесты не ходят в сеть: httpx.AsyncClient подменяется фейком.
 """
 
-import json
-from unittest.mock import MagicMock
 
 from orchestrator.adapters.openhands import OpenHandsAdapter
 from orchestrator.core import pricing
