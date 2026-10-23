@@ -2,3 +2,5 @@
 # но Makefile и CI ставят их из одного места.
 pytest==9.1.1
 ruff==0.17.2
+pynacl==1.5.0
+requests==2.32.3

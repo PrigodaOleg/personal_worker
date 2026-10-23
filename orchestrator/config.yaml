@@ -1,6 +1,8 @@
-# Конфигурация personal_worker (восстановлен после сбоя деплоя 2026-10-23).
-# Все чувствительные значения берутся из .env (Config._env перекрывает yaml).
-# В этом файле только структурные значения по умолчанию.
+# Конфигурация personal_worker — в git (секретов здесь НЕТ).
+# Чувствительные значения (токены, ключи) живут в GitHub Secrets репозитория
+# и при деплое рендерятся в .env шагом «Render secrets» (deploy/render_secrets.py).
+# Config._env читает .env ПЕРВЫМ: значения из окружения перекрывают этот файл.
+# Локальные переопределения — в .env (в git не попадает).
 
 scheduler:
   poll_interval_seconds: 60
@@ -8,23 +10,32 @@ scheduler:
   clarification_timeout_seconds: 172800  # 2 суток
 
 github:
-  repo: PrigodaOleg/social_mind   # перекрыто GITHUB_REPO из .env
+  app_id: 5366648
+  installation_id: 172641927
+  # PEM-ключ записывается деплоем из секрета GITHUB_APP_PRIVATE_KEY.
+  private_key_path: /mnt/ssd/personal_worker/config/github-app.private-key.pem
+  repo: PrigodaOleg/social_mind
   label: aitask
+  poll_interval_seconds: 60
 
 telegram:
-  admin_username: prigodaoleg     # перекрыто TELEGRAM_ADMIN_USERNAME из .env
-  allowed_usernames: []           # пусто = все разрешены (см. TELEGRAM_ALLOWED_USERNAMES)
+  admin_username: prigodaoleg
+  allowed_usernames: []  # пусто = все разрешены
 
 openhands:
   base_url: http://localhost:3000
-  # модель/ключи LLM — в .env (OPENHANDS_LLM_MODEL, OPENHANDS_LLM_API_KEY)
+  # api_key, llm_api_key — секреты (GitHub Secrets → .env при деплое).
+  llm_base_url: https://api.provod.ai/v1
+  # Префикс openai/ обязателен: сообщает LiteLLM, что эндпоинт [OI]-совместимый.
+  llm_model: openai/
 
 imac:
-  host: 192.168.88.19             # перекрыто IMAC_HOST из .env
-  user: pwworker                  # перекрыто IMAC_USER из .env
-  ssh_key: ~/.ssh/id_ed25519
+  host: 192.168.88.19
+  user: pwworker
+  ssh_key: ~/.ssh/id_ed25519_pwworker
   work_dir: /Users/pwworker/personal_worker
 
 paths:
   work_dir: /mnt/ssd/personal_worker/workspaces
   state_db: /mnt/ssd/personal_worker/state/orchestrator.sqlite
+  secrets_dir: /mnt/ssd/personal_worker/secrets

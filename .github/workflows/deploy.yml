@@ -96,6 +96,17 @@ jobs:
           .venv/bin/pip install -q -r requirements.txt
           .venv/bin/python -m py_compile orchestrator/core/scheduler.py
 
+      - name: Render secrets (.env + App key)
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          OPENHANDS_API_KEY: ${{ secrets.OPENHANDS_API_KEY }}
+          OPENHANDS_LLM_API_KEY: ${{ secrets.OPENHANDS_LLM_API_KEY }}
+          GH_APP_PRIVATE_KEY: ${{ secrets.GH_APP_PRIVATE_KEY }}
+        run: |
+          # .env и PEM-ключ собираются из секретов репозитория: развёртывание
+          # с нуля = репозиторий + GitHub Secrets. Значения маскируются в логах.
+          python3 deploy/render_secrets.py --project /mnt/ssd/personal_worker
+
       - name: Run tests (smoke)
         run: |
           set -euo pipefail

@@ -32,7 +32,7 @@ class Config:
     # --- GitHub ---
     @property
     def github_app_id(self) -> int | None:
-        v = self._env("GITHUB_APP_ID")
+        v = self._env("GITHUB_APP_ID", self._raw_get("github", "app_id"))
         try:
             return int(v) if v else None
         except (ValueError, TypeError):
@@ -40,11 +40,16 @@ class Config:
 
     @property
     def github_private_key_path(self) -> str | None:
-        return self._env("GITHUB_APP_PRIVATE_KEY_PATH")
+        return self._env(
+            "GITHUB_APP_PRIVATE_KEY_PATH",
+            self._raw_get("github", "private_key_path"),
+        )
 
     @property
     def github_installation_id(self) -> int | None:
-        v = self._env("GITHUB_APP_INSTALLATION_ID")
+        v = self._env(
+            "GITHUB_APP_INSTALLATION_ID", self._raw_get("github", "installation_id")
+        )
         try:
             return int(v) if v else None
         except (ValueError, TypeError):
