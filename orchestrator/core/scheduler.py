@@ -28,6 +28,7 @@ import shutil
 import tempfile
 import time
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Optional
 
 import yaml
@@ -3217,7 +3218,25 @@ class Scheduler:
         gha-artifacts-* заменяется на версию с прямыми ссылками на файлы.
         Ограничены по времени (GHA_WATCH_TIMEOUT_SECONDS), чтобы не висеть
         вечно на зависшей сборке.
+
+        Пока вотчер жив, в state/gha_watchers/ лежит маркер <run_id>.watch:
+        деплой по нему ждёт окончания «хвоста» перед остановкой сервиса.
         """
+        watchers_dir = Path(self.config.state_db).parent / "gha_watchers"
+        marker = watchers_dir / f"{run_id}.watch"
+        try:
+            watchers_dir.mkdir(parents=True, exist_ok=True)
+            marker.touch()
+        except OSError:
+            logger.warning("[gha] не удалось создать маркер %s", marker)
+        try:
+            await self._watch_gha_artifacts_loop(task, comment_id, comment_body, run_id)
+        finally:
+            marker.unlink(missing_ok=True)
+
+    async def _watch_gha_artifacts_loop(
+        self, task: Task, comment_id: int, comment_body: str, run_id: int
+    ) -> None:
         deadline = time.monotonic() + self.gha_watch_timeout_seconds
         while True:
             await asyncio.sleep(self.gha_watch_poll_seconds)

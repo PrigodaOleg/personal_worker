@@ -16,6 +16,10 @@ on:
         description: "Пересобрать и поднять OpenHands (медленно)"
         type: boolean
         default: false
+      max_wait_minutes:
+        description: "Сколько ждать окончания задач и GHA-хвостов (мин)"
+        type: number
+        default: 60
 
 permissions:
   contents: read
@@ -28,7 +32,8 @@ jobs:
   deploy:
     runs-on: [self-hosted, personal-worker]
     environment: deploy         # кнопка подтверждения (required reviewers)
-    timeout-minutes: 30
+    # 30 мин сам деплой + запас на ожидание окончания задач (max_wait_minutes).
+    timeout-minutes: 120
     steps:
       - name: Checkout main
         uses: actions/checkout@v4
@@ -47,6 +52,17 @@ jobs:
           # Сервис обязан существовать: деплоим именно его.
           systemctl cat personal_worker >/dev/null 2>&1 \
             || { echo "❌ systemd-сервис personal_worker не найден"; exit 1; }
+
+      - name: Wait for idle — задачи и GHA-хвосты
+        run: |
+          set -euo pipefail
+          # Не останавливаем сервис, пока работает задача или фоновый вотчер
+          # GHA-сборки (правит финальный комментарий в issue после done).
+          # Таймаут — инпут max_wait_minutes; при превышении джоба падает,
+          # сервис остаётся работать, решение за человеком.
+          MAX_WAIT=$(( ( ${{ inputs.max_wait_minutes || 60 }} ) * 60 ))
+          python3 deploy/wait_idle.py --project /mnt/ssd/personal_worker \
+            --max-wait-seconds "$MAX_WAIT"
 
       - name: Stop orchestrator
         run: |
