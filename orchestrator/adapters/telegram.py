@@ -33,6 +33,7 @@ logger = logging.getLogger(__name__)
 MENU_COMMANDS: dict[str, str] = {
     "📊 Статус": "/status",
     "📋 Задачи": "/tasks",
+    "📤 Подтолкнуть": "/nudge",
     "🧠 Модель": "/model",
     "🚫 Отмена": "/cancel",
     "❓ Помощь": "/help",

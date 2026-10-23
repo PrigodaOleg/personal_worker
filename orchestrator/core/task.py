@@ -53,6 +53,10 @@ class Task:
     cost_rub: float = 0.0
     # ID сообщения с кнопками (меню/карточкой), чтобы обновлять его in-place.
     ui_message_id: Optional[int] = None
+    # Разовый флаг «подталкивания»: пропустить агента и сразу финализировать
+    # (ветка → пуш → PR) из уже готовой рабочей копии. Ставится кнопкой
+    # «Подтолкнуть», когда задача упала после работы агента — на коммите/пуше.
+    finalize_only: bool = False
 
     def add_log(self, message: str) -> None:
         self.log.append(f"[{datetime.utcnow().isoformat()}] {message}")

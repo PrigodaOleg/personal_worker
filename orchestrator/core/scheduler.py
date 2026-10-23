@@ -1016,6 +1016,7 @@ class Scheduler:
                 "🤖 Доступные команды (или кнопки меню):\n"
                 "📊 Статус — состояние текущей задачи\n"
                 "📋 Задачи — все задачи, результаты и ссылки на PR\n"
+                "📤 Подтолкнуть — продолжить упавшую задачу с этапа коммита/пуша (без перезапуска агента)\n"
                 "🧠 Модель — модель LLM по умолчанию\n"
                 "🚫 Отмена — отменить текущую задачу\n"
                 "❓ Помощь — эта справка\n"
@@ -1038,6 +1039,10 @@ class Scheduler:
             current = self._default_model()
             text, rows = self._model_picker("default", 0, "s", current)
             await self.telegram.send_message(chat_id_int, text, keyboard=self.telegram.build_keyboard(rows))
+            return
+
+        if cmd == "/nudge":
+            await self._handle_nudge_command(chat_id)
             return
 
         if cmd == "/cancel":
@@ -1073,14 +1078,19 @@ class Scheduler:
             await self.telegram.send_message(chat_id, text, keyboard)
 
     def _task_actions_keyboard(self, task: Task):
-        return self.telegram.build_keyboard([
+        rows: list[list[tuple[str, str]]] = []
+        # Упавшая после работы агента задача: подтолкнуть дешевле, чем перезапускать.
+        if self._can_nudge_finalization(task):
+            rows.append([("📤 Подтолкнуть", f"nudge:{task.id}")])
+        rows += [
             [("🔄 Обновить", f"refresh:{task.id}")],
             [("🔁 Перезапустить", f"restart:{task.id}"),
              ("🧠 Модель", f"model:{task.id}")],
             [("📖 Логи", f"logs:{task.id}"),
              ("📋 К списку", "tasks:0")],
             [("🗑 Удалить", f"delask:{task.id}")],
-        ])
+        ]
+        return self.telegram.build_keyboard(rows)
 
     def _source_tag(self, task: Task) -> str:
         return "🐙" if task.source == TaskSource.GITHUB else "💬"
@@ -1182,6 +1192,92 @@ class Scheduler:
         text = f"{self._task_card(task)}\n\n📋 Последняя активность:\n{activity}"
         await self._reply(query, text, self._task_actions_keyboard(task))
 
+    # Признаки того, что агент закончил работу, а упало уже после — на
+    # синхронизации/ветке/пуше/PR (финализация). Такие задачи можно
+    # «подтолкнуть»: повторить финализацию без перезапуска агента.
+    _FINALIZE_FAILURE_MARKERS = (
+        "Из контейнера:",                          # правки вытащены — упали дальше
+        "git/push failed",                         # упали на ветке/пуше
+        "Синхронизация из контейнера не удалась",  # упали на синхронизации
+        "Финализация упала",                       # упали на PR/ревьюерах/артефактах
+    )
+
+    @classmethod
+    def _can_nudge_finalization(cls, task: Task) -> bool:
+        """Задача упала после работы агента — на коммите/пуше/PR.
+
+        Условия: задача failed (или done, но PR так и не создался — например,
+        create_pr упал уже после пуша), PR нет, и в логе есть след упавшей
+        финализации. Полный перезапуск такой задачи неоправданно дорог
+        (агент уже сделал всю работу) — вместо этого «подталкиваем»:
+        ветка → пуш → PR из готовой рабочей копии.
+        """
+        if task.pr_url:
+            return False
+        if task.status not in (TaskStatus.FAILED, TaskStatus.DONE):
+            return False
+        log_text = "\n".join(task.log)
+        return any(marker in log_text for marker in cls._FINALIZE_FAILURE_MARKERS)
+
+    def _start_nudge(self, task: Task) -> None:
+        """Включить режим подталкивания: финализация без перезапуска агента.
+
+        Порядок в очереди общий (задачи выполняются строго по одной);
+        workspace, ветку и попытку НЕ трогаем — пуш уйдёт в ту же ветку.
+        """
+        task.status = TaskStatus.RUNNING
+        task.finalize_only = True
+        task.add_log("Подталкивание: повторная финализация (ветка → пуш → PR)")
+        self.state.save(task)
+        logger.info("[nudge] task %s queued for finalization", task.id)
+
+    async def _handle_nudge_command(self, chat_id: str) -> None:
+        """Кнопка «Подтолкнуть» / команда /nudge.
+
+        Берём свежую упавшую после работы агента задачу этого чата; если своей
+        нет (например, упала GitHub-задача) — последнюю подходящую из недавних.
+        """
+        chat_id_int = int(chat_id)
+        candidates = [
+            t for t in self.state.list_for_chat(chat_id, limit=20)
+            if self._can_nudge_finalization(t)
+        ]
+        fallback_note = ""
+        if not candidates:
+            candidates = [
+                t for t in self.state.list_recent(limit=20)
+                if self._can_nudge_finalization(t)
+            ]
+            fallback_note = "\n(задач этого чата нет — взята последняя упавшая)"
+        if not candidates:
+            await self.telegram.send_message(
+                chat_id_int,
+                "🆕 Задач для подталкивания нет.\n\n"
+                "Подталкивание продолжает задачу, упавшую ПОСЛЕ работы агента "
+                "(на коммите/пуше/PR). Для остальных есть «🔁 Перезапустить» "
+                "в карточке задачи.",
+            )
+            return
+        task = candidates[0]
+        active = self._get_any_active_task()
+        if active:
+            await self.telegram.send_message(
+                chat_id_int,
+                f"⚠️ Сейчас выполняется «{(active.title or '')[:40]}…» — "
+                "подтолкнуть можно, когда она завершится.",
+            )
+            return
+        self._start_nudge(task)
+        position = self._task_queue.qsize() + 1
+        queue_note = f"Позиция в очереди: {position}. " if position > 1 else ""
+        await self.telegram.send_message(
+            chat_id_int,
+            f"📤 Подталкиваю {self._source_tag(task)} «{task.title[:50]}…» — "
+            f"продолжаю с этапа коммита/пуша, агента заново НЕ запускаю.\n"
+            f"{queue_note}Сообщу о результате.{fallback_note}",
+        )
+        self._enqueue_task(task)
+
     async def _restart_task(self, task: Task, query: dict) -> None:
         cqid = query.get("callback_query_id", "")
         chat_id_int = int(query.get("chat_id") or 0)
@@ -1199,6 +1295,7 @@ class Scheduler:
         task.status = TaskStatus.READY
         task.pr_url = None
         task.conversation_id = None
+        task.finalize_only = False  # перезапуск — это снова полный прогон агента
         task.clarification_question = None
         task.clarification_answer = None
         model = self._effective_model(task)
@@ -1284,6 +1381,24 @@ class Scheduler:
             if task:
                 await self._restart_task(task, query)
                 await self._send_task_detail(query, task)
+            return
+
+        if data.startswith("nudge:"):
+            task = self.state.get(data.split(":", 1)[1])
+            if task:
+                cqid = query.get("callback_query_id", "")
+                if task.status == TaskStatus.RUNNING:
+                    await self.telegram.answer_callback_query(
+                        cqid, "⚠️ Задача уже выполняется")
+                elif self._get_any_active_task(exclude_id=task.id):
+                    await self.telegram.answer_callback_query(
+                        cqid, "⚠️ Занята другая задача — дождитесь")
+                else:
+                    self._start_nudge(task)
+                    await self.telegram.answer_callback_query(
+                        cqid, "📤 Подталкиваю: ветка → пуш → PR")
+                    self._enqueue_task(task)
+                    await self._send_task_detail(query, task)
             return
 
         if data.startswith("delask:"):
@@ -1382,6 +1497,29 @@ class Scheduler:
         if fresh is not None:
             task = fresh
         logger.info("[task] %s status=%s", task.id, task.status.value)
+
+        if task.finalize_only:
+            # Подталкивание: агент уже отработал, правки в рабочей копии —
+            # сразу финализация (ветка → пуш → PR), без запуска агента.
+            task.finalize_only = False  # one-shot: сбрасываем до финализации
+            self.state.save(task)
+            ws = self._ensure_workspace(task)
+            client_dir = os.path.join(ws, "social_mind")
+            task.add_log("Финализация без агента: ветка → пуш → PR")
+            self.state.save(task)
+            try:
+                await self._build_ios_and_create_pr(task, client_dir, nudged=True)
+            except Exception as exc:  # noqa: BLE001 — не оставлять задачу в RUNNING
+                logger.error("[nudge] task %s finalize crashed: %s", task.id, exc)
+                task.status = TaskStatus.FAILED
+                task.add_log(f"Финализация упала: {exc}")
+                self.state.save(task)
+                self._notify_author(
+                    task,
+                    f"❌ Не удалось подтолкнуть задачу (этап коммита/пуша/PR).\n\n"
+                    f"Ошибка: {exc}",
+                )
+            return
 
         if task.status == TaskStatus.NEW:
             if not self._has_enough_info(task):
@@ -2730,7 +2868,9 @@ class Scheduler:
         )
         return "\n".join(parts)
 
-    async def _build_ios_and_create_pr(self, task: Task, client_dir: str) -> None:
+    async def _build_ios_and_create_pr(
+        self, task: Task, client_dir: str, nudged: bool = False
+    ) -> None:
         # Считаем стоимость отработанной модели до итоговых действий.
         await self._finalize_cost(task)
         # Сначала вытаскиваем правки агента из runtime-контейнера на хост,
@@ -2742,17 +2882,28 @@ class Scheduler:
                 f"удалено {sync.get('removed')}"
             )
         elif sync.get("status") == "error":
-            task.status = TaskStatus.FAILED
-            task.add_log(f"Синхронизация из контейнера не удалась: {sync.get('error')}")
-            self.state.save(task)
-            log_text = "\n".join(task.log[-15:]) if task.log else ""
-            self._notify_author(
-                task,
-                "❌ Не удалось забрать правки агента из runtime-контейнера.\n\n"
-                f"Ошибка: {sync.get('error')}\n\n"
-                f"Лог выполнения:\n{log_text}",
-            )
-            return
+            # При подталкивании runtime-контейнер может быть уже погашен,
+            # а коммит с правками агента — уже лежать в рабочей копии
+            # (упали позже, на пуше). Тогда синхронизация не нужна:
+            # пушим то, что есть. Иначе — честная ошибка.
+            ahead = await self._git_ahead_count(client_dir)
+            if nudged and ahead > 0:
+                task.add_log(
+                    f"Синхронизация из контейнера пропущена "
+                    f"({sync.get('error')}) — коммит с правками уже в рабочей копии"
+                )
+            else:
+                task.status = TaskStatus.FAILED
+                task.add_log(f"Синхронизация из контейнера не удалась: {sync.get('error')}")
+                self.state.save(task)
+                log_text = "\n".join(task.log[-15:]) if task.log else ""
+                self._notify_author(
+                    task,
+                    "❌ Не удалось забрать правки агента из runtime-контейнера.\n\n"
+                    f"Ошибка: {sync.get('error')}\n\n"
+                    f"Лог выполнения:\n{log_text}",
+                )
+                return
         else:
             task.add_log(f"Синхронизация пропущена: {sync.get('reason')}")
         self.state.save(task)
