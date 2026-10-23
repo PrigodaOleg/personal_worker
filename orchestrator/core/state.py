@@ -57,6 +57,9 @@ class StateStore:
             self._conn.execute(
                 "ALTER TABLE tasks ADD COLUMN finalize_only INTEGER NOT NULL DEFAULT 0"
             )
+        if "repo" not in existing:
+            # Репозиторий-источник задачи (owner/name); NULL = дефолтный репо.
+            self._conn.execute("ALTER TABLE tasks ADD COLUMN repo TEXT")
         # Ключ-значение для настроек UI (например, модель по умолчанию).
         self._conn.execute(
             "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)"
@@ -162,8 +165,8 @@ class StateStore:
             (id, source, source_id, title, description, status,
              clarification_question, clarification_answer, created_at, pr_url, log,
              conversation_id, model, attempt, tokens_prompt, tokens_completion,
-             tokens_cache_read, cost_rub, ui_message_id, finalize_only)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             tokens_cache_read, cost_rub, ui_message_id, finalize_only, repo)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 task.id,
@@ -186,6 +189,7 @@ class StateStore:
                 task.cost_rub,
                 task.ui_message_id,
                 int(task.finalize_only),
+                task.repo,
             ),
         )
         self._conn.commit()
@@ -262,6 +266,7 @@ class StateStore:
             cost_rub=_num("cost_rub"),
             ui_message_id=row["ui_message_id"],
             finalize_only=bool(_num("finalize_only")),
+            repo=row["repo"],
         )
 
     def close(self) -> None:

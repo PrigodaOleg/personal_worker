@@ -36,9 +36,15 @@ def make_scheduler(issues) -> tuple[Scheduler, list, FakeTelegram]:
     enqueued = []
     s.github = FakeGitHub(issues)
     s.telegram = FakeTelegram()
-    s.state = types.SimpleNamespace(get=lambda _id: None, save=lambda t: None)
+    s.state = types.SimpleNamespace(
+        get=lambda _id: None,
+        save=lambda t: None,
+        get_setting=lambda key, default=None: default,
+        set_setting=lambda key, value: None,
+    )
     s.config = types.SimpleNamespace(
         github_label="aitask",
+        github_repo="PrigodaOleg/social_mind",
         telegram_admin_chat_id="111",
     )
     # Тяжёлые части опроса не тестируем здесь — глушим.

@@ -65,12 +65,17 @@ def make_scheduler() -> Scheduler:
     s.github = FakeGitHub()
     s.openhands = FakeOpenHands()
     s.telegram = FakeTelegram()
-    s.state = types.SimpleNamespace(save=lambda t: None)
+    s.state = types.SimpleNamespace(
+        save=lambda t: None,
+        get_setting=lambda key, default=None: default,
+        set_setting=lambda key, value: None,
+    )
     s.config = types.SimpleNamespace(
         clarification_timeout_seconds=60,
         imac_host=None,
         imac_user=None,
         imac_ssh_key="",
+        github_repo="PrigodaOleg/social_mind",
     )
     return s
 

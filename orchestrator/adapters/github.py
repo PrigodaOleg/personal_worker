@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 import time
 from typing import Optional
@@ -13,6 +14,8 @@ from github import Github
 from github.Auth import AppAuth
 
 from orchestrator.core.task import Task, TaskStatus
+
+logger = logging.getLogger("personal_worker")
 
 
 class GitHubAdapter:
@@ -33,6 +36,126 @@ class GitHubAdapter:
         self._repo = None
         self._auth_token: Optional[str] = None
         self._token_expires_at: float = 0
+
+    # ------------------------------------------------------------------ #
+    # Несколько репозиториев
+    # ------------------------------------------------------------------ #
+    def for_repo(self, repo_full_name: str) -> "GitHubAdapter":
+        """Клон адаптера, привязанный к другому репозиторию.
+
+        Один GitHub App может обслуживать несколько репозиториев и даже
+        несколько installation (по одной на аккаунт). Клиент _gh (токен
+        установки) переиспользуется, если он уже создан для того же
+        installation_id; иначе пересоздаётся лениво.
+        """
+        clone = GitHubAdapter(
+            app_id=self.app_id,
+            private_key_path=self.private_key_path,
+            installation_id=self.installation_id,
+            repo_full_name=repo_full_name,
+            label=self.label,
+        )
+        if self._gh is not None:
+            # Тот же installation_id → токен и клиент валидны, переиспользуем.
+            clone._gh = self._gh
+        return clone
+
+    def with_installation(self, installation_id: int) -> "GitHubAdapter":
+        """Клон адаптера под другой installation (другой аккаунт-владелец)."""
+        clone = self.for_repo(self.repo_full_name)
+        clone.installation_id = installation_id
+        return clone
+
+    def has_repo_access(self, repo_full_name: str) -> bool:
+        """Есть ли у установки доступ к репозиторию (без исключений)."""
+        try:
+            self._repo_obj(repo_full_name)
+            return True
+        except Exception:  # noqa: BLE001 — 404/403 значит «нет доступа»
+            return False
+
+    def _repo_obj(self, repo_full_name: str):
+        """Объект репозитория (проверка доступа). Кэш не нужен: вызовы редки."""
+        self._ensure_auth()
+        assert self._gh is not None
+        return self._gh.get_repo(repo_full_name)
+
+    def ensure_label(self, repo_full_name: Optional[str] = None) -> bool:
+        """Создать метку задач в репозитории, если её там нет.
+
+        True — метка есть (создана или уже существовала), False — не
+        удалось (нет доступа). Цвет дефолтный GitHub-серый; имя берём
+        из self.label.
+        """
+        name = repo_full_name or self.repo_full_name
+        try:
+            repo = self._repo_obj(name)
+            try:
+                repo.get_label(self.label)
+                return True
+            except Exception:  # noqa: BLE001 — метки нет, создаём
+                repo.create_label(name=self.label, color="6e7781", description="Задача для personal_worker")
+                return True
+        except Exception:  # noqa: BLE001
+            logger.warning("[github] не удалось создать метку в %s", name, exc_info=True)
+            return False
+
+    def app_slug(self) -> Optional[str]:
+        """Слаг приложения (для ссылок-инструкций). Нужен app-level JWT."""
+        try:
+            import jwt as pyjwt
+
+            private_key = self._load_private_key()
+            now = int(time.time())
+            payload = {"iat": now - 60, "exp": now + 600, "iss": str(self.app_id)}
+            token = pyjwt.encode(payload, private_key, algorithm="RS256")
+            import requests as _requests
+
+            r = _requests.get(
+                "https://api.github.com/app",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Accept": "application/vnd.github+json",
+                },
+                timeout=30,
+            )
+            if r.status_code == 200:
+                return r.json().get("slug")
+        except Exception:  # noqa: BLE001 — slug не критичен
+            logger.warning("[github] не удалось получить app slug", exc_info=True)
+        return None
+
+    def list_installations(self) -> list[dict]:
+        """Все установки приложения: [{id, account_login, repo_selection}]."""
+        try:
+            import jwt as pyjwt
+            import requests as _requests
+
+            private_key = self._load_private_key()
+            now = int(time.time())
+            payload = {"iat": now - 60, "exp": now + 600, "iss": str(self.app_id)}
+            token = pyjwt.encode(payload, private_key, algorithm="RS256")
+            r = _requests.get(
+                "https://api.github.com/app/installations",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Accept": "application/vnd.github+json",
+                },
+                timeout=30,
+            )
+            if r.status_code != 200:
+                return []
+            return [
+                {
+                    "id": i["id"],
+                    "account_login": (i.get("account") or {}).get("login"),
+                    "repo_selection": i.get("repository_selection"),
+                }
+                for i in r.json()
+            ]
+        except Exception:  # noqa: BLE001
+            logger.warning("[github] не удалось получить список installation", exc_info=True)
+            return []
 
     def _load_private_key(self) -> str:
         with open(self.private_key_path, "r") as f:

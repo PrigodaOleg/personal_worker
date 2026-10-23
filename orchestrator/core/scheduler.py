@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import json
 import logging
 import os
 import re
@@ -115,6 +116,8 @@ class Scheduler:
         # локальные docker-сборки и один iMac параллельную работу не тянут).
         self._task_queue: "asyncio.Queue[Task]" = asyncio.Queue()
         self._queue_worker_started: bool = False
+        # Адаптеры GitHub по репозиториям (мульти-репо): имя → клон self.github.
+        self._repo_adapters: dict[str, GitHubAdapter] = {}
 
     # ------------------------------------------------------------------ #
     # Вспомогательные
@@ -122,6 +125,82 @@ class Scheduler:
     def _task_id(self, source: TaskSource, source_id: str) -> str:
         raw = f"{source.value}:{source_id}"
         return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+    # ------------------------------------------------------------------ #
+    # Несколько репозиториев
+    # ------------------------------------------------------------------ #
+    # Ключ настроек со списком репозиториев (JSON-массив owner/name).
+    REPOS_SETTING_KEY = "repos"
+
+    def configured_repos(self) -> list[str]:
+        """Репозитории, которые опрашиваем на предмет задач.
+
+        Хранятся в settings БД (меняются через Telegram без рестарта).
+        Пусто → дефолтный репозиторий из config.yaml.
+        """
+        raw = self.state.get_setting(self.REPOS_SETTING_KEY)
+        if raw:
+            try:
+                repos = json.loads(raw)
+                if isinstance(repos, list) and repos:
+                    return [str(r) for r in repos]
+            except (ValueError, TypeError):
+                logger.warning("[repos] битый список в settings: %r", raw)
+        return [self.config.github_repo] if self.config.github_repo else []
+
+    def set_configured_repos(self, repos: list[str]) -> None:
+        # Дефолтный репо всегда остаётся в списке: он origin-конфигурации.
+        if self.config.github_repo and self.config.github_repo not in repos:
+            repos.append(self.config.github_repo)
+        self.state.set_setting(self.REPOS_SETTING_KEY, json.dumps(repos))
+
+    def github_for(self, repo: Optional[str]) -> GitHubAdapter:
+        """Адаптер для конкретного репозитория задачи.
+
+        None/дефолт → основной адаптер. Иначе — кэшированный клон с тем же
+        App; если дефолтная установка не даёт доступ к репо (репозиторий на
+        другом аккаунте), подбираем installation из списка установок App.
+        """
+        default = self.config.github_repo
+        if not repo or repo == default:
+            return self.github
+        cached = self._repo_adapters.get(repo)
+        if cached is not None:
+            return cached
+        base = self.github.for_repo(repo)
+        if base.has_repo_access(repo):
+            self._repo_adapters[repo] = base
+            return base
+        # Нет доступа под дефолтной установкой: ищем среди всех установок App.
+        for inst in base.list_installations():
+            candidate = base.with_installation(inst["id"])
+            if candidate.has_repo_access(repo):
+                self._repo_adapters[repo] = candidate
+                logger.info(
+                    "[repos] %s доступен через installation %s (%s)",
+                    repo, inst["id"], inst.get("account_login"),
+                )
+                return candidate
+        # Доступа нет нигде — вернём клон с дефолтной установкой: вызывающий
+        # код получит честную ошибку 404/403 при обращении к API.
+        return base
+
+    def _install_instructions(self, repo: str, slug: Optional[str] = None) -> str:
+        """Инструкция админу: что нажать в GitHub, чтобы подключить репозиторий."""
+        slug = slug or self.github.app_slug() or "<slug-app>"
+        return (
+            "Чтобы я работал с этим репозиторием, нужно в GitHub:\n"
+            f"1. Открыть https://github.com/apps/{slug}/installations/new\n"
+            "   (если App уже установлен на аккаунте — Repository access → "
+            "Select repositories → добавить репозиторий).\n"
+            f"2. Выбрать репозиторий {repo} и подтвердить.\n"
+            f"3. Написать мне /repo check {repo} — я проверю доступ и "
+            f"создам метку {self.config.github_label}, если её нет."
+        )
+
+    def _repo_full(self, task: Task) -> str:
+        """Репозиторий задачи: явный или дефолтный."""
+        return task.repo or self.config.github_repo
 
     def _workspace_for(self, task: Task) -> str:
         return os.path.join(self.config.work_dir, task.id)
@@ -181,15 +260,17 @@ class Scheduler:
         with open(dst, "wb") as fh:
             fh.write(content)
 
-    def _git_auth_args(self) -> list[str]:
+    def _git_auth_args(self, repo: Optional[str] = None) -> list[str]:
         """Аргументы git для аутентификации и авторства коммитов.
 
         Токен передаётся заголовком, а не в URL: иначе он утекает в
         `git remote -v` и в логи ошибок git. Идентичность задаём явно —
         в контейнере git обычно не настроен, и `git commit` падает с
-        "Author identity unknown".
+        "Author identity unknown". Токен установки даёт доступ только к
+        её репозиториям, поэтому для не-дефолтного репо берём токен его
+        адаптера.
         """
-        user, token = self.github.get_git_credentials()
+        user, token = self.github_for(repo).get_git_credentials()
         basic = base64.b64encode(f"{user}:{token}".encode()).decode()
         author = self.config.git_author_name
         email = self.config.git_author_email
@@ -215,7 +296,7 @@ class Scheduler:
             async def _comment_to_issue() -> None:
                 try:
                     num = int(task.source_id)
-                    await asyncio.to_thread(self.github.create_comment, num, text)
+                    await asyncio.to_thread(self.github_for(task.repo).create_comment, num, text)
                     logger.info("[notify] comment added to issue #%s", num)
                 except Exception as exc:
                     logger.error("[notify] github comment failed: %s", exc)
@@ -245,7 +326,7 @@ class Scheduler:
             return None
         try:
             num = int(task.source_id)
-            cid = await asyncio.to_thread(self.github.create_comment, num, text)
+            cid = await asyncio.to_thread(self.github_for(task.repo).create_comment, num, text)
             logger.info("[notify] comment added to issue #%s", num)
             return cid
         except Exception as exc:
@@ -645,43 +726,52 @@ class Scheduler:
         # Ответы на уточнения и вопросы агента: автор отвечает комментарием к issue.
         self._poll_github_clarification_answers()
         self._poll_github_agent_question_answers()
-        try:
-            issues = self.github.fetch_open_issues()
-        except Exception as exc:
-            logger.error("[poll] github fetch failed: %s", exc)
-            return
-
-        for issue in issues:
-            number = str(issue["number"])
-            task_id = self._task_id(TaskSource.GITHUB, number)
-            if self.state.get(task_id):
+        for repo in self.configured_repos():
+            try:
+                issues = self.github_for(repo).fetch_open_issues()
+            except Exception as exc:
+                logger.error("[poll] github fetch failed for %s: %s", repo, exc)
                 continue
 
-            title = issue.get("title", "")
-            body = issue.get("body", "")
-            author = issue.get("author") or "unknown"
+            for issue in issues:
+                number = str(issue["number"])
+                # Дефолтный репо сохраняет старую схему id (совместимость),
+                # остальные — с префиксом, чтобы номера не конфликтовали.
+                if repo == self.config.github_repo:
+                    task_id = self._task_id(TaskSource.GITHUB, number)
+                else:
+                    task_id = self._task_id(
+                        TaskSource.GITHUB, f"{repo}:{number}"
+                    )
+                if self.state.get(task_id):
+                    continue
 
-            task = Task(
-                id=task_id,
-                source=TaskSource.GITHUB,
-                source_id=number,
-                title=title,
-                description=body,
-                status=TaskStatus.NEW,
-            )
-            task.add_log(f"issue #{number} by {author}: {title}")
-            self.state.save(task)
-            self._notify_author(
-                task,
-                f"🚀 Задача принята в работу: «{title[:60]}»\n"
-                "Если понадобятся уточнения — спрошу здесь, в комментариях.",
-            )
-            self._notify_admin(
-                f"🆕 Новый issue с меткой {self.config.github_label}: "
-                f"«{title[:80]}» (автор: {author or 'unknown'})\n"
-                f"{issue.get('url') or ''}".rstrip()
-            )
-            self._enqueue_task(task)
+                title = issue.get("title", "")
+                body = issue.get("body", "")
+                author = issue.get("author") or "unknown"
+
+                task = Task(
+                    id=task_id,
+                    source=TaskSource.GITHUB,
+                    source_id=number,
+                    title=title,
+                    description=body,
+                    status=TaskStatus.NEW,
+                    repo=repo,
+                )
+                task.add_log(f"issue #{number} by {author} in {repo}: {title}")
+                self.state.save(task)
+                self._notify_author(
+                    task,
+                    f"🚀 Задача принята в работу: «{title[:60]}»\n"
+                    "Если понадобятся уточнения — спрошу здесь, в комментариях.",
+                )
+                self._notify_admin(
+                    f"🆕 Новый issue с меткой {self.config.github_label} в {repo}: "
+                    f"«{title[:80]}» (автор: {author or 'unknown'})\n"
+                    f"{issue.get('url') or ''}".rstrip()
+                )
+                self._enqueue_task(task)
 
     def _poll_github_clarification_answers(self) -> None:
         """Забрать ответы на уточнения из комментариев GitHub issues.
@@ -696,7 +786,7 @@ class Scheduler:
             if issue_number is None or task is None or task.clarification_answer:
                 continue
             try:
-                comments = self.github.fetch_issue_comments(
+                comments = self.github_for(task.repo).fetch_issue_comments(
                     issue_number,
                     after_comment_id=info.get("github_after_comment_id"),
                 )
@@ -730,7 +820,7 @@ class Scheduler:
             if issue_number is None or fut is None or fut.done():
                 continue
             try:
-                comments = self.github.fetch_issue_comments(
+                comments = self.github_for(qinfo["task"].repo).fetch_issue_comments(
                     issue_number,
                     after_comment_id=qinfo.get("github_after_comment_id"),
                 )
@@ -779,7 +869,7 @@ class Scheduler:
                 if task.source != TaskSource.GITHUB:
                     continue
                 try:
-                    issue_state = self.github.fetch_issue_state(int(task.source_id))
+                    issue_state = self.github_for(task.repo).fetch_issue_state(int(task.source_id))
                 except Exception as exc:  # noqa: BLE001
                     if self._issue_gone(exc):
                         # Issue удалён (или стал недоступен) — задача-сирота.
@@ -822,7 +912,7 @@ class Scheduler:
 
         # Команды бота — обрабатываем синхронно, не блокируем
         if text.startswith("/"):
-            await self._handle_telegram_command(chat_id, text)
+            await self._handle_telegram_command(chat_id, text, username=msg.get("username"))
             return
 
         # Ответ на вопрос АГЕНТА (задан в процессе работы) — отправляем ему.
@@ -997,7 +1087,9 @@ class Scheduler:
         cmd = (cmd or "").strip().replace("\n", " ⏎ ")
         return cmd if len(cmd) <= max_len else cmd[: max_len - 1] + "…"
 
-    async def _handle_telegram_command(self, chat_id: str, text: str) -> None:
+    async def _handle_telegram_command(
+        self, chat_id: str, text: str, username: Optional[str] = None
+    ) -> None:
         """Обработка команд бота: /status, /cancel, /help."""
         parts = text.split()
         cmd = parts[0].lower() if parts else ""
@@ -1024,6 +1116,8 @@ class Scheduler:
                 "📋 Задачи — все задачи, результаты и ссылки на PR\n"
                 "📤 Подтолкнуть — продолжить упавшую задачу с этапа коммита/пуша (без перезапуска агента)\n"
                 "🧠 Модель — модель LLM по умолчанию\n"
+                "🗂 Репозитории — какие репозитории опрашиваю на задачи\n"
+                "/repo add|check|del <owner/name> — подключить/проверить/убрать репозиторий (админ)\n"
                 "🚫 Отмена — отменить текущую задачу\n"
                 "❓ Помощь — эта справка\n"
                 "\nПросто напишите задачу в свободной форме — и я начну её выполнять.",
@@ -1066,9 +1160,111 @@ class Scheduler:
             )
             return
 
+        if cmd == "/repos":
+            await self._handle_repos_command(chat_id_int)
+            return
+
+        if cmd in ("/repo", "/repo_add", "/repo_check", "/repo_del"):
+            await self._handle_repo_command(chat_id_int, cmd, parts, username)
+            return
+
         await self.telegram.send_message(
             chat_id_int,
             "❓ Неизвестная команда. Используйте /help для справки.",
+        )
+
+    # ------------------------------------------------------------------ #
+    # Управление репозиториями (только админ)
+    # ------------------------------------------------------------------ #
+    def _is_admin(self, username: Optional[str]) -> bool:
+        admin = self.config.telegram_admin_username
+        return bool(admin) and (username or "").lstrip("@").lower() == admin.lstrip("@").lower()
+
+    async def _handle_repos_command(self, chat_id_int: int) -> None:
+        repos = self.configured_repos()
+        default = self.config.github_repo
+        lines = ["🗂 Репозитории, которые я опрашиваю на задачи:"]
+        for r in repos:
+            marker = " (дефолт из config.yaml)" if r == default else ""
+            lines.append(f"  • {r}{marker}")
+        lines.append("")
+        lines.append(
+            "Добавить: /repo add <owner/name>\n"
+            "Проверить доступ и метку: /repo check <owner/name>\n"
+            "Убрать: /repo del <owner/name>"
+        )
+        await self.telegram.send_message(chat_id_int, "\n".join(lines))
+
+    async def _handle_repo_command(
+        self, chat_id_int: int, cmd: str, parts: list[str], username: Optional[str]
+    ) -> None:
+        if not self._is_admin(username):
+            await self.telegram.send_message(
+                chat_id_int, "🔒 Управление репозиториями доступно только админу."
+            )
+            return
+        name = parts[1] if len(parts) > 1 else ""
+        if not re.fullmatch(r"[\w.-]+/[\w.-]+", name):
+            await self.telegram.send_message(
+                chat_id_int,
+                "Формат: <owner>/<name>, например /repo add PrigodaOleg/social_mind",
+            )
+            return
+
+        repos = [r for r in self.configured_repos() if r != self.config.github_repo]
+
+        if cmd == "/repo_del":
+            if name not in repos:
+                await self.telegram.send_message(
+                    chat_id_int, f"ℹ️ {name} и так не в списке (в списке: {repos})."
+                )
+                return
+            repos.remove(name)
+            self.set_configured_repos(repos)
+            await self.telegram.send_message(
+                chat_id_int,
+                f"🗑 {name} убран из опроса. Задачи из него, созданные ранее, "
+                "не тронуты — доделаются. Опять подключить: /repo add " + name,
+            )
+            return
+
+        # add и check: проверяем доступ; при отсутствии — инструкция.
+        if cmd == "/repo_add" and name in repos:
+            await self.telegram.send_message(
+                chat_id_int, f"ℹ️ {name} уже в списке. Проверить доступ: /repo check {name}"
+            )
+            return
+        await self.telegram.send_message(chat_id_int, f"⏳ Проверяю доступ к {name}…")
+        ok, message = await asyncio.to_thread(self._check_repo_access, name)
+        if not ok:
+            slug = await asyncio.to_thread(self.github.app_slug)
+            await self.telegram.send_message(
+                chat_id_int, message + "\n\n" + self._install_instructions(name, slug)
+            )
+            return
+        if cmd in ("/repo_add", "/repo_check") and name != self.config.github_repo:
+            if name not in repos:
+                repos.append(name)
+                self.set_configured_repos(repos)
+            await self.telegram.send_message(chat_id_int, message)
+            return
+        await self.telegram.send_message(chat_id_int, message)
+
+    def _check_repo_access(self, repo: str) -> tuple[bool, str]:
+        """Проверить доступ App к репо и наличие метки. Блокирующий (поток)."""
+        gh = self.github_for(repo)
+        if not gh.has_repo_access(repo):
+            return False, f"❌ У приложения GitHub нет доступа к {repo}."
+        label = gh.label
+        if gh.ensure_label(repo):
+            return True, (
+                f"✅ {repo} подключен, доступ есть.\n"
+                f"Метка {label}: есть. Создавайте issue с меткой {label} — "
+                "задача придёт на ближайшем опросе (раз в минуту)."
+            )
+        return False, (
+            f"⚠️ Доступ к {repo} есть, но создать метку {label} не удалось "
+            "(проверьте права установки)."
         )
 
     # ------------------------------------------------------------------ #
@@ -1608,7 +1804,7 @@ class Scheduler:
             try:
                 num = int(task.source_id)
                 comment_id = await asyncio.to_thread(
-                    self.github.create_comment, num, f"❓ {question}"
+                    self.github_for(task.repo).create_comment, num, f"❓ {question}"
                 )
                 self._pending_clarifications[task.id] = {
                     "task": task,
@@ -1634,7 +1830,7 @@ class Scheduler:
         elif task.source == TaskSource.GITHUB:
             try:
                 await asyncio.to_thread(
-                    self.github.create_comment, int(task.source_id), text
+                    self.github_for(task.repo).create_comment, int(task.source_id), text
                 )
             except Exception as exc:
                 logger.error("[clarify] github confirmation failed: %s", exc)
@@ -1984,11 +2180,11 @@ class Scheduler:
 
         ws = self._ensure_workspace(task)
         client_dir = os.path.join(ws, "social_mind")
-        repo_url = f"https://github.com/{self.config.github_repo}.git"
+        repo_url = f"https://github.com/{self._repo_full(task)}.git"
 
         # Клонируем репозиторий в рабочую директорию
         if not os.path.exists(os.path.join(client_dir, ".git")):
-            clone_cmd = ["git", *self._git_auth_args(), "clone", "--depth", "1", repo_url, client_dir]
+            clone_cmd = ["git", *self._git_auth_args(task.repo), "clone", "--depth", "1", repo_url, client_dir]
             proc = await asyncio.create_subprocess_exec(
                 *clone_cmd,
                 stdout=asyncio.subprocess.PIPE,
@@ -2089,7 +2285,7 @@ class Scheduler:
         # Создаём разговор в OpenHands
         result = await self.openhands.create_conversation(
             instruction=instruction,
-            repository=self.config.github_repo,
+            repository=self._repo_full(task),
             branch="main",
         )
 
@@ -2232,7 +2428,7 @@ class Scheduler:
                 # create_comment — блокирующий вызов PyGithub: уводим в поток,
                 # чтобы не тормозить event loop (и Telegram) на время запроса.
                 question_comment_id = await asyncio.to_thread(
-                    self.github.create_comment, num, "\n".join(lines)
+                    self.github_for(task.repo).create_comment, num, "\n".join(lines)
                 )
                 qinfo["github_issue"] = num
                 # Ответом считаем только комментарии ПОСЛЕ этого вопроса.
@@ -2252,7 +2448,7 @@ class Scheduler:
                                                    "⏰ Время ожидания ответа истекло.")
             elif task.source == TaskSource.GITHUB and question_comment_id:
                 await self._update_github_question_comment(
-                    question_comment_id, text, "⏰ Время ожидания ответа истекло."
+                    task, question_comment_id, text, "⏰ Время ожидания ответа истекло."
                 )
             return False
 
@@ -2268,7 +2464,7 @@ class Scheduler:
                                                f"✅ Ответ принят: {answer[:200]}")
         elif task.source == TaskSource.GITHUB and question_comment_id:
             await self._update_github_question_comment(
-                question_comment_id, text, f"✅ Ответ принят: {answer[:200]}"
+                task, question_comment_id, text, f"✅ Ответ принят: {answer[:200]}"
             )
         try:
             res = await self.openhands.send_message(conversation_id, answer)
@@ -2301,12 +2497,12 @@ class Scheduler:
             logger.error("[agent-question] close question message failed: %s", exc)
 
     async def _update_github_question_comment(
-        self, comment_id: int, question: str, footer: str
+        self, task: Task, comment_id: int, question: str, footer: str
     ) -> None:
         """Дописать итог (ответ/истечение) в комментарий-вопрос issue."""
         try:
             await asyncio.to_thread(
-                self.github.update_comment,
+                self.github_for(task.repo).update_comment,
                 comment_id,
                 f"❓ {question}\n\n{footer}",
             )
@@ -2940,7 +3136,7 @@ class Scheduler:
                  else ["push", "-u", "origin", branch]),
             ):
                 proc = await asyncio.create_subprocess_exec(
-                    "git", "-C", client_dir, *self._git_auth_args(), *git_cmd,
+                    "git", "-C", client_dir, *self._git_auth_args(task.repo), *git_cmd,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
@@ -3013,12 +3209,12 @@ class Scheduler:
         assignees: list[str] = []
         if task.source == TaskSource.GITHUB:
             try:
-                assignees = self.github.get_issue_assignees(int(task.source_id))
+                assignees = self.github_for(task.repo).get_issue_assignees(int(task.source_id))
             except Exception as exc:  # noqa: BLE001
                 logger.warning("[github] assignees fetch failed: %s", exc)
 
         pr_body = self._build_pr_body(task, branch, assignees)
-        pr_url = self.github.create_pr(
+        pr_url = self.github_for(task.repo).create_pr(
             branch=branch,
             base="main",
             title=f"[AI] {task.title}",
@@ -3030,7 +3226,7 @@ class Scheduler:
 
         if assignees:
             try:
-                self.github.request_reviewers(pr_url, assignees)
+                self.github_for(task.repo).request_reviewers(pr_url, assignees)
                 task.add_log(f"Ревьюеры запрошены: {', '.join(assignees)}")
             except Exception as exc:  # noqa: BLE001 — PR уже создан, не валить
                 logger.warning("[github] reviewers request failed: %s", exc)
@@ -3137,7 +3333,7 @@ class Scheduler:
         if sha:
             try:
                 run = await asyncio.to_thread(
-                    self.github.find_workflow_run, sha, 40, 8.0
+                    self.github_for(task.repo).find_workflow_run, sha, 40, 8.0
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("[gha] find_workflow_run failed: %s", exc)
@@ -3151,7 +3347,7 @@ class Scheduler:
             )
         elif sha:
             checks = (
-                f"https://github.com/{self.config.github_repo}"
+                f"https://github.com/{self._repo_full(task)}"
                 f"/commit/{sha}/checks"
             )
             lines.append(f"🔧 Сборка: {checks}")
@@ -3250,7 +3446,9 @@ class Scheduler:
                 self.state.save(task)
                 return
             try:
-                run = await asyncio.to_thread(self.github.get_workflow_run, run_id)
+                run = await asyncio.to_thread(
+                    self.github_for(task.repo).get_workflow_run, run_id
+                )
             except Exception as exc:  # noqa: BLE001 — сеть/API, попробуем снова
                 logger.warning("[gha] get_workflow_run failed: %s", exc)
                 continue
@@ -3258,22 +3456,24 @@ class Scheduler:
                 continue
             conclusion = run.get("conclusion")
             run_url = run.get("html_url") or (
-                f"https://github.com/{self.config.github_repo}/actions/runs/{run_id}"
+                f"https://github.com/{self._repo_full(task)}/actions/runs/{run_id}"
             )
             artifacts: list[dict] = []
             if conclusion == "success":
                 try:
                     artifacts = await asyncio.to_thread(
-                        self.github.list_run_artifacts, run_id
+                        self.github_for(task.repo).list_run_artifacts, run_id
                     )
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("[gha] list_run_artifacts failed: %s", exc)
             new_section = self.format_artifacts_section(
-                run_id, run_url, conclusion, artifacts, self.config.github_repo
+                run_id, run_url, conclusion, artifacts, self._repo_full(task)
             )
             new_body = self.replace_marker_section(comment_body, new_section)
             try:
-                await asyncio.to_thread(self.github.update_comment, comment_id, new_body)
+                await asyncio.to_thread(
+                    self.github_for(task.repo).update_comment, comment_id, new_body
+                )
             except Exception as exc:
                 logger.error("[gha] update_comment failed: %s", exc)
                 return
@@ -3343,7 +3543,7 @@ class Scheduler:
                     num = int(task.source_id)
                     record["github_issue"] = num
                     record["github_after_comment_id"] = await asyncio.to_thread(
-                        self.github.last_bot_comment_id, num
+                        self.github_for(task.repo).last_bot_comment_id, num
                     )
                 except Exception as exc:  # noqa: BLE001
                     logger.warning(
