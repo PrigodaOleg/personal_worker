@@ -38,7 +38,9 @@ Thumbs.db
 .env.*.local
 
 # Config with secrets
-orchestrator/config.yaml
+# config/ содержит приватный ключ GitHub App — НЕ в git.
+# orchestrator/config.yaml в git ЕСТЬ (без секретов: все ключи в .env),
+# rsync в деплое дополнительно исключает его от сноса.
 config/
 
 # Build secrets (Firebase / CLOSERS_*) — кладёт self-hosted runner, НЕ в git

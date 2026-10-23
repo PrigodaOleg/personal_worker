@@ -1,0 +1,30 @@
+# Конфигурация personal_worker (восстановлен после сбоя деплоя 2026-10-23).
+# Все чувствительные значения берутся из .env (Config._env перекрывает yaml).
+# В этом файле только структурные значения по умолчанию.
+
+scheduler:
+  poll_interval_seconds: 60
+  clarification_poll_seconds: 30
+  clarification_timeout_seconds: 172800  # 2 суток
+
+github:
+  repo: PrigodaOleg/social_mind   # перекрыто GITHUB_REPO из .env
+  label: aitask
+
+telegram:
+  admin_username: prigodaoleg     # перекрыто TELEGRAM_ADMIN_USERNAME из .env
+  allowed_usernames: []           # пусто = все разрешены (см. TELEGRAM_ALLOWED_USERNAMES)
+
+openhands:
+  base_url: http://localhost:3000
+  # модель/ключи LLM — в .env (OPENHANDS_LLM_MODEL, OPENHANDS_LLM_API_KEY)
+
+imac:
+  host: 192.168.88.19             # перекрыто IMAC_HOST из .env
+  user: pwworker                  # перекрыто IMAC_USER из .env
+  ssh_key: ~/.ssh/id_ed25519
+  work_dir: /Users/pwworker/personal_worker
+
+paths:
+  work_dir: /mnt/ssd/personal_worker/workspaces
+  state_db: /mnt/ssd/personal_worker/state/orchestrator.sqlite
