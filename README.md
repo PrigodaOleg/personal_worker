@@ -90,12 +90,33 @@ sudo ./deploy/install.sh
 | Workflow | Когда | Что делает |
 |----------|-------|------------|
 | **PR check** | на каждый PR/пуш в main | ruff + pytest на self-hosted раннере этой машины |
-| **Deploy to worker** | кнопка «Run workflow» | деплой main на эту машину: rsync кода → pip → тесты → рестарт сервиса |
+| **Deploy to worker** | кнопка «Run workflow» | деплой main на эту машину: rsync кода → секреты из GH → pip → тесты → рестарт сервиса |
 
 Раннер регистрируется один раз: `bash deploy/setup_deploy_runner.sh <TOKEN>`
 (токен: GitHub → Settings → Actions → Runners → New self-hosted runner).
 Для подтверждения деплоя создайте окружение `deploy` с required reviewers:
 GitHub → Settings → Environments → New environment → `deploy` → Required reviewers.
+
+### Секреты
+
+Секреты живут в GitHub (Settings → Secrets and variables → Actions) и при деплое
+рендерятся в `.env` + PEM-ключ автоматически (`deploy/render_secrets.py`) —
+разворачивание с нуля: репозиторий + GitHub Secrets. Не-секретная конфигурация —
+в `orchestrator/config.yaml` (в git).
+
+| Секрет | Что это |
+|--------|---------|
+| `TELEGRAM_BOT_TOKEN` | токен Telegram-бота |
+| `OPENHANDS_API_KEY` | ключ API сервера OpenHands |
+| `OPENHANDS_LLM_API_KEY` | ключ провайдера LLM (provod.ai) |
+| `GITHUB_APP_PRIVATE_KEY` | приватный ключ GitHub App (PEM целиком) |
+
+Залить/обновить с машины, где есть старый `.env`:
+
+```bash
+python3 deploy/sync_secrets.py            # через GitHub App (нужно право Secrets: write)
+GH_TOKEN=... python3 deploy/sync_secrets.py   # или через PAT (repo scope)
+```
 
 ## ❗ Что нужно сделать перед первым запуском
 
