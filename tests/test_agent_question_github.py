@@ -339,6 +339,36 @@ def test_real_question_is_recognized():
     assert Scheduler._classify_agent_pause("Мне нужно уточнение по формату ключа") == "question"
     assert Scheduler._classify_agent_pause("Should I proceed with option 2?") == "question"
 
+def test_tool_markup_is_ignored_in_classification():
+    """Псевдо-вызов инструмента текстом: модель напечатала
+    `<function=str_replace_editor>...` в сообщении, а в дарт-коде внутри
+    разметки встретилась фраза «which would break current clients» —
+    маркер вопроса срабатывал, объявление намерения считалось вопросом,
+    задача уходила в ожидание ответа на два суток (issue #43)."""
+    pseudo = (
+        "Инфраструктура ясна. Создаю: 1) тест, 2) CI-workflow. "
+        "<function=str_replace_editor><parameter=command>create</parameter>"
+        "<parameter=file_text>// which would break current clients\n"
+        "void main() {}\n</parameter></str_replace_editor>"
+    )
+    assert Scheduler._classify_agent_pause(pseudo) == "announce"
+
+def test_unterminated_tool_markup_is_stripped():
+    """Разметка без закрывающего </function> (обрезана) тоже вычищается."""
+    pseudo = (
+        "Пишу тест. <function=execute_bash><parameter=command>ls -la\n"
+        "// should i continue? yes"
+    )
+    assert Scheduler._classify_agent_pause(pseudo) == "announce"
+
+def test_real_question_with_code_is_still_question():
+    """Вопрос вне разметки не глохнет: маркер в обычном тексте работает."""
+    msg = (
+        "Создаю файл. <function=str_replace_editor><parameter=command>create</parameter>"
+        "</function> Какой вариант предпочитаете?"
+    )
+    assert Scheduler._classify_agent_pause(msg) == "question"
+
 
 # --------------------------------------------------------------------------- #
 # Маркеры будущего — по границам слов (issue #5: зависание в цикле подталкиваний)

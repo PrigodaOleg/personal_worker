@@ -2385,7 +2385,9 @@ class Scheduler:
         принимается. Ответ уходит в тот же разговор через send_message, чтобы
         агент продолжил работу. True — ответ доставлен.
         """
-        text, options = self._parse_question_options(question)
+        text, options = self._parse_question_options(
+            self._strip_tool_markup(question)
+        )
         fut = asyncio.get_event_loop().create_future()
         # ВАЖНО: держим ссылку qinfo на запись — в GitHub-ветке в неё
         # прописываются github_issue/github_after_comment_id, по которым
@@ -2900,6 +2902,21 @@ class Scheduler:
         r"\b(?:" + "|".join(re.escape(m) for m in _FUTURE_MARKERS) + r")\b"
     )
 
+    _TOOL_CALL_RE = re.compile(r"<function=[^>]*>.*?(?:</function>|$)", re.DOTALL)
+
+    @classmethod
+    def _strip_tool_markup(cls, message: str) -> str:
+        """Убрать из сообщения агента разметку вызовов инструментов.
+
+        Модель иногда печатает вызов инструмента обычным текстом внутри
+        сообщения (`<function=str_replace_editor>...`). Такой текст — не
+        обращение к пользователю, а в коде внутри разметки встречаются
+        вопросительные фразы ("which would break current clients"),
+        которые ломали классификацию: объявление намерения считалось
+        вопросом, задача уходила в ожидание ответа на два суток (issue #43).
+        """
+        return cls._TOOL_CALL_RE.sub(" ", message).strip()
+
     @classmethod
     def _classify_agent_pause(cls, message: str) -> str:
         """Классифицировать паузу агента в awaiting_user_input.
@@ -2910,6 +2927,7 @@ class Scheduler:
         - "announce" — промежуточное сообщение/объявление намерения
           («начну с изучения файлов»), ввода не просит.
         """
+        message = cls._strip_tool_markup(message)
         if not message:
             return "announce"
         lowered = message.lower()
