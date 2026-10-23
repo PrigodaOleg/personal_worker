@@ -57,6 +57,10 @@ class Task:
     # (ветка → пуш → PR) из уже готовой рабочей копии. Ставится кнопкой
     # «Подтолкнуть», когда задача упала после работы агента — на коммите/пуше.
     finalize_only: bool = False
+    # Репозиторий-источник (owner/name). None — репозиторий по умолчанию
+    # (config.github_repo). Поддерживается несколько репозиториев: каждый
+    # issue обрабатывается в своём репо (PR, комментарии, артефакты GHA).
+    repo: Optional[str] = None
 
     def add_log(self, message: str) -> None:
         self.log.append(f"[{datetime.utcnow().isoformat()}] {message}")

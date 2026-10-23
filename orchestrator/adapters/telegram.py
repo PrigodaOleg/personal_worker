@@ -35,6 +35,7 @@ MENU_COMMANDS: dict[str, str] = {
     "📋 Задачи": "/tasks",
     "📤 Подтолкнуть": "/nudge",
     "🧠 Модель": "/model",
+    "🗂 Репозитории": "/repos",
     "🚫 Отмена": "/cancel",
     "❓ Помощь": "/help",
 }
