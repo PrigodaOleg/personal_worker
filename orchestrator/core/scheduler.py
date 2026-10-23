@@ -98,6 +98,14 @@ class Scheduler:
         # вопроса (объявил намерение и замолчал). Когда лимит исчерпан —
         # вопрос автору задачи.
         self.max_auto_continues: int = int(os.getenv("OPENHANDS_MAX_AUTO_CONTINUES", "4"))
+        # Временные ошибки агента (недоступность LLM: 503/429/таймаут/обрыв
+        # связи) — не повод хоронить задачу: ждём и продолжаем разговор.
+        self.max_error_retries: int = int(os.getenv("OPENHANDS_MAX_ERROR_RETRIES", "5"))
+        # Сколько секунд ждать между ретраями временной ошибки — провайдеру
+        # LLM нужно время, чтобы подняться.
+        self.error_retry_wait_seconds: int = int(
+            os.getenv("OPENHANDS_ERROR_RETRY_WAIT_SECONDS", "300")
+        )
         # Слежение за сборкой GitHub Actions для финального комментария:
         # период опроса статуса запуска и общий лимит ожидания.
         self.gha_watch_poll_seconds: int = int(os.getenv("GHA_WATCH_POLL_SECONDS", "60"))
@@ -2182,6 +2190,9 @@ class Scheduler:
         auto_continues = 0
         # Сколько раз будили разговор, погасший во время ожидания ответа.
         stop_restarts = 0
+        # Сколько раз продолжали работу агента после временной ошибки
+        # (недоступность LLM: 503/429/таймаут).
+        error_retries = 0
         # «Рабочие» события траектории на момент последней паузы агента.
         # Рост этого числа между паузами = агент реально работал (команды,
         # правки) — значит это нормальный рабочий ритм, а не зацикливание.
@@ -2370,6 +2381,41 @@ class Scheduler:
 
             if state_val in ("error", "rejected"):
                 error_msg = (info.get("message") or f"агент в состоянии {state_val}")
+                reason = info.get("error_reason") or ""
+                if state_val == "error" and self._is_transient_agent_error(reason):
+                    if error_retries >= self.max_error_retries:
+                        task.status = TaskStatus.FAILED
+                        task.add_log(
+                            "OpenHands failed (temporary error): "
+                            f"{reason or error_msg} — attempts exhausted "
+                            f"({self.max_error_retries})"
+                        )
+                        await self._finalize_cost(task)
+                        self.state.save(task)
+                        log_text = "\n".join(task.log[-15:]) if task.log else ""
+                        self._notify_author(
+                            task,
+                            f"❌ OpenHands завершился с ошибкой.\n\n"
+                            f"Ошибка: {reason or error_msg}\n\n"
+                            f"Временная ошибка не устранена за "
+                            f"{self.max_error_retries} попыток. "
+                            f"Лог выполнения:\n{log_text}",
+                        )
+                        return
+                    error_retries += 1
+                    task.add_log(
+                        f"OpenHands temporary error: {reason or error_msg} — "
+                        f"retrying in {self.error_retry_wait_seconds}s "
+                        f"({error_retries}/{self.max_error_retries})"
+                    )
+                    self.state.save(task)
+                    await asyncio.sleep(self.error_retry_wait_seconds)
+                    await self.openhands.start_conversation(conversation_id)
+                    await self.openhands.send_message(
+                        conversation_id, self._CONTINUE_NUDGE
+                    )
+                    await asyncio.sleep(self.config.clarification_poll_seconds)
+                    continue
                 task.status = TaskStatus.FAILED
                 task.add_log(f"OpenHands failed: {error_msg}")
                 await self._finalize_cost(task)
@@ -2436,6 +2482,27 @@ class Scheduler:
                 return
 
             await asyncio.sleep(self.config.clarification_poll_seconds)
+
+    # Признаки временной ошибки агента (недоступность LLM-провайдера):
+    # связаны с сетью/квотами/доступностью — сами проходят со временем.
+    _TRANSIENT_ERROR_MARKERS = (
+        "ServiceUnavailable", "Service Unavailable",
+        "temporarily unavailable", "temporarily_unavailable",
+        "overloaded", "rate limit", "RateLimit", "RateLimitError",
+        "429", "503", "502", "504", "500",
+        "bad gateway", "Bad Gateway", "internal server error",
+        "timeout", "timed out", "Timeout", "TimeoutError",
+        "connection error", "Connection error", "ConnectionError",
+        "APIConnectionError", "connect", "unreachable", "reset by peer",
+    )
+
+    @classmethod
+    def _is_transient_agent_error(cls, reason: str) -> bool:
+        """Временная ли это ошибка агента (по тексту причины из OpenHands)."""
+        if not reason:
+            return False
+        lowered = reason.lower()
+        return any(marker.lower() in lowered for marker in cls._TRANSIENT_ERROR_MARKERS)
 
     # Подталкивание агенту, вставшему на паузу без вопроса (объявил намерение
     # и замолчал): даём ему ясный протокол — работать, спросить или отчитаться.
