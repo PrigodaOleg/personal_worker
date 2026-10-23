@@ -1032,11 +1032,14 @@ class Scheduler:
         return "\n".join(rows[-lines:])
 
     async def _collect_task_logs(self, task: Optional[Task], lines: int = 3) -> str:
-        """Что агент реально выполнял в runtime-контейнере.
+        """Что агент реально делает: реплики и команды.
 
-        Команды и их коды выхода из событий разговора (`/events`). Показываем и
-        завершённые команды, и текущую (ещё выполняющуюся, помечена 🔄) — чтобы
-        было видно, что агент делает прямо сейчас (например, идёт сборка APK).
+        Из событий разговора (`/events`): команды с кодами выхода ($ ...),
+        текущая выполняющаяся команда (🔄) и текстовые реплики агента (💬) —
+        «Проверю workflows…», «Инфраструктура ясна, создаю тест…». Без реплик
+        по одним командам непонятно, ЗАЧЕМ агент их выполняет. Служебные
+        сообщения (Running command, I am thinking) и псевдо-вызовы
+        инструментов в реплики не попадают.
         """
         if not task or not task.conversation_id:
             return "— задача ещё не запускалась в контейнере"
@@ -1072,14 +1075,21 @@ class Scheduler:
                 if code is None:
                     m = re.search(r"exit code (-?\d+)", msg)
                     code = m.group(1) if m else "?"
-                done.append(f"$ {self._short_cmd(cmd)}\n  → exit {code}")
+                cmd = (cmd or "").strip()
+                if cmd:
+                    done.append(f"$ {self._short_cmd(cmd)}\n  → exit {code}")
                 running = None
+            elif action is None and event.get("source") == "agent":
+                # Текстовая реплика агента — что он собирается делать и почему.
+                cleaned = self._strip_tool_markup(msg).strip()
+                if cleaned and not self._AGENT_NOISE_RE.match(cleaned):
+                    done.append(f"💬 {self._short_cmd(cleaned, max_len=160)}")
 
         rows = list(done[-lines:])
         if running:
             rows.append(f"🔄 {running} — выполняется…")
         if not rows:
-            return "— агент ещё не выполнял команд"
+            return "— агент ещё не выполнял команд и не писал реплик"
         return "\n".join(rows)
 
     @staticmethod
@@ -2903,6 +2913,13 @@ class Scheduler:
     )
 
     _TOOL_CALL_RE = re.compile(r"<function=[^>]*>.*?(?:</function>|$)", re.DOTALL)
+
+    # Служебные сообщения агента, дублирующие команды/мысли — в реплики
+    # для Telegram их не показываем (команды видны отдельно как $ ...).
+    _AGENT_NOISE_RE = re.compile(
+        r"^(?:Running command:|Command `.*` executed|I am thinking|"
+        r"Your thought has been logged|No observation|Code executed)"
+    )
 
     @classmethod
     def _strip_tool_markup(cls, message: str) -> str:
