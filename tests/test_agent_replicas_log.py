@@ -44,14 +44,18 @@ def run(s: Scheduler, task: Task) -> str:
 
 
 def test_remarks_shown_between_commands():
+    # Реальная форма событий OpenHands: реплика агента приходит как
+    # action="message" (см. дамп /events), а не как событие без action.
     events = [
-        {"source": "agent", "message": "Проверю workflows на уровне репозитория."},
+        {"source": "agent", "action": "message",
+         "message": "Проверю workflows на уровне репозитория."},
         {"action": "run", "args": {"command": "ls .github/workflows"}},
         {"observation": "run", "extras": {
             "command": "ls .github/workflows",
             "metadata": {"exit_code": 0},
         }},
-        {"source": "agent", "message": "Workflows нашёл, теперь изучу тесты правил."},
+        {"source": "agent", "action": "message",
+         "message": "Workflows нашёл, теперь изучу тесты правил."},
     ]
     out = run(make_scheduler(events), make_task())
     assert "💬 Проверю workflows на уровне репозитория." in out
@@ -71,7 +75,9 @@ def test_noise_and_user_messages_not_shown_as_remarks():
         {"source": "agent", "message": "Code executed in IPython cell."},
         {"source": "environment", "message": "No observation"},
         {"source": "user", "message": "Продолжай выполнение задачи по исходной инструкции."},
-        {"source": "agent", "message": "Настоящая реплика агента."},
+        # Реплика в реальной форме (action="message") + шум тоже под action="message".
+        {"source": "agent", "action": "message", "message": "Running command: git status"},
+        {"source": "agent", "action": "message", "message": "Настоящая реплика агента."},
     ]
     out = run(make_scheduler(events), make_task())
     assert out == "💬 Настоящая реплика агента."
@@ -80,7 +86,7 @@ def test_noise_and_user_messages_not_shown_as_remarks():
 def test_tool_markup_stripped_from_remark():
     events = [
         {
-            "source": "agent",
+            "source": "agent", "action": "message",
             "message": (
                 "Инфраструктура ясна. Создаю: 1) тест, 2) CI-workflow. "
                 "<function=str_replace_editor><parameter=command>create</parameter>"
@@ -97,10 +103,8 @@ def test_tool_markup_stripped_from_remark():
 
 def test_markup_only_message_skipped():
     events = [
-        {
-            "source": "agent",
-            "message": "<function=execute_bash><parameter=command>ls</parameter></function>",
-        },
+        {"source": "agent", "action": "message",
+         "message": "<function=execute_bash><parameter=command>ls</parameter></function>"},
     ]
     out = run(make_scheduler(events), make_task())
     assert out == "— агент ещё не выполнял команд и не писал реплик"
@@ -108,7 +112,7 @@ def test_markup_only_message_skipped():
 
 def test_long_remark_truncated():
     events = [
-        {"source": "agent", "message": "x" * 500},
+        {"source": "agent", "action": "message", "message": "x" * 500},
     ]
     out = run(make_scheduler(events), make_task())
     assert out.startswith("💬 ")
@@ -118,7 +122,7 @@ def test_long_remark_truncated():
 
 def test_running_command_still_marked():
     events = [
-        {"source": "agent", "message": "Запускаю сборку APK."},
+        {"source": "agent", "action": "message", "message": "Запускаю сборку APK."},
         {"action": "run", "args": {"command": "flutter build apk"}},
     ]
     out = run(make_scheduler(events), make_task())
