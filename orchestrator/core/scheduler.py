@@ -1099,8 +1099,13 @@ class Scheduler:
                 if cmd:
                     done.append(f"$ {self._short_cmd(cmd)}\n  → exit {code}")
                 running = None
-            elif action is None and event.get("source") == "agent":
+            elif (
+                (action == "message" or (action is None and obs is None))
+                and event.get("source") == "agent"
+            ):
                 # Текстовая реплика агента — что он собирается делать и почему.
+                # В API OpenHands реплика приходит как action="message"; события
+                # без action оставлены для совместимости со старыми тестами.
                 cleaned = self._strip_tool_markup(msg).strip()
                 if cleaned and not self._AGENT_NOISE_RE.match(cleaned):
                     done.append(f"💬 {self._short_cmd(cleaned, max_len=160)}")
