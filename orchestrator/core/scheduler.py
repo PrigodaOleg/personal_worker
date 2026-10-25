@@ -3548,7 +3548,7 @@ class Scheduler:
         if run_id and comment_id:
             self._spawn(
                 self._watch_gha_artifacts(
-                    task, comment_id, notify_text, run_id, client_dir
+                    task, comment_id, notify_text, run_id, client_dir, branch
                 )
             )
 
@@ -3709,7 +3709,7 @@ class Scheduler:
 
     async def _watch_gha_artifacts(
         self, task: Task, comment_id: int, comment_body: str, run_id: int,
-        client_dir: Optional[str] = None,
+        client_dir: Optional[str] = None, branch: Optional[str] = None,
     ) -> None:
         """Дождаться завершения сборки GHA и дописать прямые ссылки.
 
@@ -3734,14 +3734,14 @@ class Scheduler:
             logger.warning("[gha] не удалось создать маркер %s", marker)
         try:
             await self._watch_gha_artifacts_loop(
-                task, comment_id, comment_body, run_id, client_dir
+                task, comment_id, comment_body, run_id, client_dir, branch
             )
         finally:
             marker.unlink(missing_ok=True)
 
     async def _watch_gha_artifacts_loop(
         self, task: Task, comment_id: int, comment_body: str, run_id: int,
-        client_dir: Optional[str] = None,
+        client_dir: Optional[str] = None, branch: Optional[str] = None,
     ) -> None:
         old_sha = None
         if client_dir:
@@ -3850,9 +3850,10 @@ class Scheduler:
                         "доставить не удалось."
                     )
                 return
-            # Агент чинит и допушивает — ищем новый прогон CI.
-            new_run = await self._wait_for_new_ci_run(
-                task, client_dir, old_sha, run_id
+            # Агент поправил файлы в контейнере — пушит ОРКЕСТРАТОР:
+            # синхронизируем правки на хост и допушиваем в ветку PR.
+            new_run = await self._sync_and_push_ci_fix(
+                task, client_dir, branch, old_sha
             )
             if not new_run:
                 self._notify_author(
@@ -3873,6 +3874,85 @@ class Scheduler:
             )
             self.state.save(task)
             run_id = new_run["id"]
+            old_sha = new_run.get("head_sha") or old_sha
+
+    async def _sync_and_push_ci_fix(
+        self, task: Task, client_dir: Optional[str],
+        branch: Optional[str], old_sha: Optional[str],
+    ) -> Optional[dict]:
+        """Забрать правки агента из контейнера и допушить в ветку PR.
+
+        Агент не пушит сам (у него нет токена, и он работает в собственном
+        клоне внутри контейнера) — пуш всегда делает оркестратор:
+        синхронизация из контейнера на хост → commit → push → новый прогон.
+        Возвращаем dict нового запуска CI или None (не дождались).
+        """
+        if not client_dir or not branch:
+            return None
+        # Ждём, пока агент закончит правки (разговор снова idle/finished)
+        # — до 20 минут; обычно хватает пары минут.
+        await self._wait_agent_settled(task)
+        sync = await self._sync_changes_from_runtime(task, client_dir)
+        if sync.get("status") == "error":
+            logger.error("[gha-fix] sync failed: %s", sync.get("error"))
+            return None
+        task.add_log(
+            f"Правки агента после падения CI: изменено {sync.get('copied')}, "
+            f"удалено {sync.get('removed')}"
+        )
+        try:
+            for git_cmd in (
+                ["add", "-A", "--", ".",
+                 ":(exclude,glob)**/build.env",
+                 ":(exclude,glob)**/google-services.json"],
+                ["commit", "-m", f"AI task: {task.title} (CI fix)"],
+                ["push", "-u", "origin", branch],
+            ):
+                proc = await asyncio.create_subprocess_exec(
+                    "git", "-C", client_dir, *self._git_auth_args(task.repo), *git_cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                out, err = await asyncio.wait_for(proc.communicate(), timeout=300)
+                if proc.returncode != 0:
+                    msg = (err.decode("utf-8", errors="replace").strip()
+                           or out.decode("utf-8", errors="replace").strip())
+                    if git_cmd[0] == "commit" and "nothing to commit" in msg:
+                        task.add_log("git: агент ничего не изменил после логов CI")
+                        self.state.save(task)
+                        return None
+                    raise RuntimeError(f"git {' '.join(git_cmd)}: {msg}")
+        except Exception as exc:  # noqa: BLE001
+            logger.error("[gha-fix] push failed: %s", exc)
+            task.add_log(f"Допуш после падения CI не удался: {exc}")
+            self.state.save(task)
+            return None
+        return await self._wait_for_new_ci_run(task, client_dir, old_sha, 0)
+
+    async def _wait_agent_settled(
+        self, task: Task, max_wait_s: int = 1200
+    ) -> bool:
+        """Дождаться, пока агент закончит правки после наших логов.
+
+        Пока разговор не вернулся в idle/finished/stopped/awaiting — агент
+        ещё работает. True — успокоился, False — таймаут.
+        """
+        conversation_id = task.conversation_id
+        if not conversation_id:
+            return True
+        settled_states = {"idle", "finished", "stopped", "awaiting_user_input",
+                          "error"}
+        deadline = time.monotonic() + max_wait_s
+        while time.monotonic() < deadline:
+            await asyncio.sleep(20)
+            try:
+                info = await self.openhands.get_agent_state(conversation_id)
+            except Exception:  # noqa: BLE001
+                continue
+            state = info.get("agent_state")
+            if state in settled_states:
+                return True
+        return False
 
     async def _wait_ci_run_completion(self, task: Task, run_id: int) -> Optional[str]:
         """Дождаться завершения прогона CI. conclusion или None (таймаут)."""
@@ -3932,11 +4012,13 @@ class Scheduler:
         message = (
             "⚠️ CI на GitHub провалился для твоего PR. Ниже хвосты логов "
             "упавших джоб.\n\n"
-            "Разберись в причине, исправь код или workflow в своём рабочем "
-            "окружении, закоммить и запушь в ТУ ЖЕ ветку PR. PR не "
-            "пересоздавай. После пуша CI перезапустится — о результате "
-            "сообщу отдельно. Если проблема вне твоего контроля — задай "
-            "вопрос со знаком вопроса.\n\n" + "\n\n".join(chunks)
+            "Разберись в причине и исправь код или workflow в своём рабочем "
+            "окружении (/workspace/social_mind). ПУШИТЬ НЕ НУЖНО: просто "
+            "внеси правки (можно закоммитить) и сообщи, что готово. "
+            "Оркестратор сам заберёт изменения и допушит в ветку PR — CI "
+            "перезапустится, о результате сообщу отдельно. Если проблема "
+            "вне твоего контроля — задай вопрос со знаком вопроса.\n\n"
+            + "\n\n".join(chunks)
         )
         res = await self.openhands.send_message(conversation_id, message)
         if res.get("status") == "error" or res.get("success") is False:
@@ -3974,10 +4056,10 @@ class Scheduler:
         self, task: Task, client_dir: Optional[str],
         old_sha: Optional[str], old_run_id: int,
     ) -> Optional[dict]:
-        """Дождаться нового прогона CI после допуша агента.
+        """Дождаться нового прогона CI после допуша оркестратора.
 
-        Смотрим head-коммит рабочей копии: пока агент не запушил, sha не
-        меняется. Новый прогон ищем по новому sha (до 30 мин).
+        Смотрим head-коммит рабочей копии на хосте: до пуша он не меняется.
+        Новый прогон ищем по новому sha (до ci_new_run_wait_seconds).
         """
         if not client_dir:
             return None

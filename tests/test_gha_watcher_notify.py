@@ -144,7 +144,7 @@ def test_ci_failure_logs_forwarded_to_agent():
     # Логи ушли агенту, включая хвост с ошибкой.
     assert len(s.openhands.messages) == 1
     msg = s.openhands.messages[0]
-    assert "ТУ ЖЕ ветку" in msg
+    assert "ПУШИТЬ НЕ НУЖНО" in msg
     assert "##[error]" in msg
     assert "Джоба «build-ios»" in msg
     # В логе задачи зафиксирован раунд исправления.
