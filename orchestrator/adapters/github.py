@@ -10,6 +10,7 @@ import re
 import time
 from typing import Optional
 
+import requests
 from github import Github
 from github.Auth import AppAuth
 
@@ -272,12 +273,45 @@ class GitHubAdapter:
     def get_workflow_run(self, run_id: int) -> Optional[dict]:
         """Статус запуска GitHub Actions (status/conclusion/html_url)."""
         data = self._gh_api("GET", f"/actions/runs/{run_id}")
-        return {
-            "id": data.get("id"),
-            "html_url": data.get("html_url"),
-            "status": data.get("status"),
-            "conclusion": data.get("conclusion"),
-        }
+        return data or None
+
+    def list_run_jobs(self, run_id: int) -> list[dict]:
+        """Джобы запуска GHA: id, имя, conclusion (для разбора падений)."""
+        data = self._gh_api("GET", f"/actions/runs/{run_id}/jobs?per_page=30")
+        out = []
+        for j in data.get("jobs") or []:
+            out.append({
+                "id": j.get("id"),
+                "name": j.get("name"),
+                "conclusion": j.get("conclusion"),
+                "html_url": j.get("html_url"),
+            })
+        return out
+
+    _FAILED_JOB_CONCLUSIONS = ("failure", "cancelled", "timed_out")
+
+    def get_job_logs(self, job_id: int) -> Optional[str]:
+        """Полный лог джобы (plain text). Логи GHA отдаются редиректом
+        на подписанный URL — нужен запрос с allow_redirects."""
+        self._ensure_auth()
+        assert self._repo is not None
+        token = self._repo.requester.auth.token
+        try:
+            r = requests.get(
+                f"https://api.github.com/repos/{self._repo.full_name}"
+                f"/actions/jobs/{job_id}/logs",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Accept": "application/vnd.github+json",
+                },
+                allow_redirects=True,
+                timeout=60,
+            )
+            if r.status_code != 200:
+                return None
+            return r.text
+        except requests.RequestException:
+            return None
 
     def list_run_artifacts(self, run_id: int) -> list[dict]:
         """Артефакты запуска: [{id, name, size_in_bytes}] (загруженные)."""
