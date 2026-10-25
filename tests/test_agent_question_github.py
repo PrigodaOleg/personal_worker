@@ -72,12 +72,20 @@ def make_scheduler() -> Scheduler:
     )
     s.config = types.SimpleNamespace(
         clarification_timeout_seconds=60,
+        clarification_poll_seconds=0.001,
         imac_host=None,
         imac_user=None,
         imac_ssh_key="",
         github_repo="PrigodaOleg/social_mind",
         telegram_admin_chat_id=None,
     )
+    # Атрибуты планировщика (обычно задаёт __init__, который в тесте не звался).
+    s.error_retry_wait_seconds = 0.001
+    s.loading_startup_timeout_seconds = 0.001  # холодный старт не тормозим
+    s.max_stop_restarts = 3
+    s.max_auto_continues = 4
+    s.max_error_retries = 5
+    s.max_state_misses = 3
     return s
 
 

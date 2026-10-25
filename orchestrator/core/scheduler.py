@@ -92,6 +92,11 @@ class Scheduler:
         # Сколько опросов подряд терпеть недоступное состояние агента,
         # прежде чем считать задачу упавшей.
         self.max_state_misses: int = int(os.getenv("OPENHANDS_MAX_STATE_MISSES", "10"))
+        # Сколько секунд ждать выхода разговора из loading при холодном
+        # старте, прежде чем перезапускать/пересоздавать разговор.
+        self.loading_startup_timeout_seconds: int = int(
+            os.getenv("OPENHANDS_LOADING_TIMEOUT_SECONDS", "600")
+        )
         # Сколько раз подряд можно авто-перезапускать прерванную задачу после
         # сбоя/перезагрузки, прежде чем пометить её failed (защита от зацикливания).
         self.max_resume_attempts: int = int(os.getenv("OPENHANDS_MAX_RESUME_ATTEMPTS", "3"))
@@ -2655,6 +2660,14 @@ class Scheduler:
         поэтому по нему результат не определить.
         """
         state_misses = 0
+        # «Холодный старт»: сколько опросов подряд агент висит в loading и в
+        # траектории нет ни одного события. Рантайм обычно готов за пару минут;
+        # если за loading_timeout агент так и не начал работу — разговор
+        # «пустой» (был реальный случай: runtime ready, но начальное сообщение
+        # не обработано, разговор висел в loading 35 минут до ручной отмены).
+        # Пересоздаём разговор с той же инструкцией.
+        loading_polls = 0
+        loading_deadline = time.monotonic() + self.loading_startup_timeout_seconds
         # Текст вопроса, на который только что отправили ответ. Нужен, чтобы не
         # задать тот же вопрос повторно: после доставки ответа агент ещё какое-то
         # время остаётся в awaiting_user_input со старым сообщением.
@@ -2755,6 +2768,50 @@ class Scheduler:
                 continue
 
             state_misses = 0
+
+            # «Холодный старт»: разговор в loading без единого события дольше
+            # допустимого — агентский цикл не обработал начальное сообщение.
+            # Стартуем разговор заново; если не помогло — пересоздаём.
+            if (
+                state_val == "loading"
+                and info.get("work_events", 0) == 0
+                and time.monotonic() > loading_deadline
+            ):
+                loading_polls += 1
+                if loading_polls <= 2:
+                    task.add_log(
+                        "Разговор висит в loading без работы — перезапускаю "
+                        f"разговор ({loading_polls}/2)"
+                    )
+                    self.state.save(task)
+                    await self.openhands.start_conversation(conversation_id)
+                    loading_deadline = (
+                        time.monotonic() + self.loading_startup_timeout_seconds
+                    )
+                    await asyncio.sleep(self.config.clarification_poll_seconds)
+                    continue
+                task.status = TaskStatus.FAILED
+                task.add_log(
+                    "OpenHands: разговор не стартовал (вечный loading, "
+                    "начальное сообщение не обработано) — ретраи исчерпаны"
+                )
+                await self._finalize_cost(task)
+                self.state.save(task)
+                self._notify_author(
+                    task,
+                    "❌ Разговор OpenHands не смог стартовать: агент так и не "
+                    "начал работу после запуска (вечный loading).\n\n"
+                    "Перезапуски не помогли. Попробуй перезапустить задачу — "
+                    "обычно это разовый сбой OpenHands.",
+                )
+                if task.source == TaskSource.GITHUB:
+                    self._notify_admin(
+                        f"❌ Задача {self._repo_full(task)}#{task.source_id} "
+                        f"«{task.title[:60]}» не стартовала: разговор "
+                        "OpenHands завис в loading (начальное сообщение "
+                        "не обработано)."
+                    )
+                return
 
             # Агент возобновил работу после ответа/подталкивания — снимаем
             # защиту от повторного вопроса и повторного подталкивания.
@@ -3675,6 +3732,26 @@ class Scheduler:
             if time.monotonic() >= deadline:
                 task.add_log("Сборка GHA не завершилась за время слежения — ссылки не дописаны")
                 self.state.save(task)
+                # Раньше вотчер молча сдавался (запись только в task.log):
+                # автор не узнавал, что сборка так и не закончилась.
+                run_url = (
+                    f"https://github.com/{self._repo_full(task)}"
+                    f"/actions/runs/{run_id}"
+                )
+                self._notify_author(
+                    task,
+                    "⏳ Сборка GHA не завершилась за время слежения "
+                    f"({self.gha_watch_timeout_seconds // 60} мин) — "
+                    "проверь её статус вручную:\n"
+                    f"{run_url}\n\n"
+                    "PR и код задачи в порядке; артефакты могут появиться позже.",
+                )
+                if task.source == TaskSource.GITHUB:
+                    self._notify_admin(
+                        f"⏳ GHA-сборка задачи {self._repo_full(task)}"
+                        f"#{task.source_id} не завершилась за время слежения:\n"
+                        f"{run_url}"
+                    )
                 return
             try:
                 run = await asyncio.to_thread(
@@ -3713,6 +3790,20 @@ class Scheduler:
                 f"(сборка: {conclusion}, артефактов: {len(artifacts)})"
             )
             self.state.save(task)
+            if conclusion != "success":
+                # Сборка провалилась/отменена — автор должен узнать об этом
+                # сразу, а не находить красный крестик в issue постфактум.
+                self._notify_author(
+                    task,
+                    f"❌ GHA-сборка завершилась с результатом «{conclusion}».\n"
+                    f"{run_url}\n\n"
+                    "Код в PR на месте — сборку можно перезапустить вручную.",
+                )
+                if task.source == TaskSource.GITHUB:
+                    self._notify_admin(
+                        f"❌ GHA-сборка задачи {self._repo_full(task)}"
+                        f"#{task.source_id}: {conclusion}\n{run_url}"
+                    )
             return
 
     # ------------------------------------------------------------------ #
