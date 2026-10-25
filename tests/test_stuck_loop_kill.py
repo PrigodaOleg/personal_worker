@@ -115,6 +115,7 @@ def make_monitor_scheduler(source: TaskSource):
     s._notify_admin = notify_admin
     # Атрибуты планировщика (обычно задаёт __init__, который в тесте не звался).
     s.error_retry_wait_seconds = 0.001
+    s.loading_startup_timeout_seconds = 0.001  # холодный старт не тормозим
     s.max_stop_restarts = 3
     s.max_auto_continues = 4
     s.max_error_retries = 5
