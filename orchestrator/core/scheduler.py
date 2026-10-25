@@ -728,6 +728,8 @@ class Scheduler:
         # Ответы на уточнения и вопросы агента: автор отвечает комментарием к issue.
         self._poll_github_clarification_answers()
         self._poll_github_agent_question_answers()
+        # Ревью PR завершённых задач → агенту (с внутренним троттлингом).
+        self._poll_pr_review_feedback()
         for repo in self.configured_repos():
             try:
                 issues = self.github_for(repo).fetch_open_issues()
@@ -853,6 +855,131 @@ class Scheduler:
             if 0 <= idx < len(options):
                 return options[idx]
         return stripped
+
+    # ------------------------------------------------------------------ #
+    # Ревью PR → агенту: комментарии/ревью/инлайн-замечания по изменениям
+    # ------------------------------------------------------------------ #
+
+    _REVIEW_FEEDBACK_INTERVAL = 120  # опрашивать PR не чаще, чем раз в 2 мин
+
+    def _poll_pr_review_feedback(self) -> None:
+        """Новые ревью-комментарии по PR завершённых задач → агенту.
+
+        Задача в DONE, но жизнь PR продолжается: ревьюер оставляет
+        замечания. Их получает агент (в тот же разговор), он правит код в
+        контейнере, оркестратор допушивает в ветку PR. Состояние опроса —
+        «после какого комментария» — в settings БД (переживает рестарт).
+        """
+        now = time.time()
+        last_run = float(
+            self.state.get_setting("pr_review_last_poll", "0") or 0
+        )
+        if now - last_run < float(
+            getattr(self, "review_poll_min_interval", self._REVIEW_FEEDBACK_INTERVAL)
+        ):
+            return
+        self.state.set_setting("pr_review_last_poll", str(now))
+        for task in self.state.list_by_status(TaskStatus.DONE):
+            if task.status != TaskStatus.DONE or not task.pr_url:
+                continue
+            if "/pull/" not in (task.pr_url or ""):
+                continue  # dry-run или «нет изменений»
+            key = f"pr_review_last_id:{task.id}"
+            after = int(self.state.get_setting(key, "0") or 0)
+            try:
+                feedback = self.github_for(task.repo).fetch_pr_feedback(
+                    task.pr_url, after_comment_id=after
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "[pr-review] fetch failed for %s: %s", task.id, exc
+                )
+                continue
+            if not feedback:
+                continue
+            max_id = max(f["id"] for f in feedback)
+            self.state.set_setting(key, str(max_id))
+            self._spawn(self._handle_pr_feedback(task, feedback))
+
+    async def _handle_pr_feedback(self, task: Task, feedback: list[dict]) -> None:
+        """Переслать замечания ревью агенту и допушить исправления."""
+        parts = []
+        for f in feedback:
+            head = f"--- {f['kind']} от @{f.get('author') or 'unknown'}"
+            if f.get("path"):
+                head += f" ({f['path']})"
+            parts.append(f"{head} ---\n{(f.get('body') or '').strip()[:2000]}")
+        message = (
+            "💬 По твоему PR появились комментарии ревью. Ниже — замечания "
+            "людей к твоим изменениям.\n\n"
+            "Разберись в каждом замечании и внеси правки в своём рабочем "
+            "окружении (/workspace/social_mind). ПУШИТЬ НЕ НУЖНО: просто "
+            "исправь код и сообщи, что готово — оркестратор сам допушит в "
+            "ветку PR. Если замечание кажется спорным — объясни свою "
+            "позицию текстом, я передам его ревьюеру. Если замечания "
+            "требуют решения владельца — задай вопрос со знаком вопроса."
+            "\n\n" + "\n\n".join(parts)
+        )
+        task.add_log(
+            f"Ревью PR: {len(feedback)} новых комментариев — отправляю агенту"
+        )
+        self.state.save(task)
+        conversation_id = task.conversation_id
+        if not conversation_id:
+            logger.warning(
+                "[pr-review] нет conversation_id у задачи %s", task.id
+            )
+            return
+        res = await self.openhands.send_message(conversation_id, message)
+        if res.get("status") == "error" or res.get("success") is False:
+            # Разговор погас после завершения задачи — будим и повторяем.
+            await self.openhands.start_conversation(conversation_id)
+            res = await self.openhands.send_message(conversation_id, message)
+            if res.get("status") == "error" or res.get("success") is False:
+                logger.error(
+                    "[pr-review] не удалось доставить ревью агенту: %s", res
+                )
+                self._notify_author(
+                    task,
+                    "💬 По твоему PR есть новые комментарии ревью, но "
+                    "передать их агенту не удалось (разговор закрыт?). "
+                    "Разберись вручную или перезапусти задачу.",
+                )
+                return
+        # Агент получил замечания — ждём правки и допушиваем.
+        branch = self.github_for(task.repo).fetch_pr_head_branch(task.pr_url)
+        if not branch:
+            logger.error(
+                "[pr-review] не удалось получить ветку PR для %s", task.id
+            )
+            return
+        client_dir = os.path.join(self._ensure_workspace(task), "social_mind")
+        new_run = await self._sync_and_push_ci_fix(
+            task, client_dir, branch, old_sha=None
+        )
+        if new_run:
+            task.add_log(
+                f"Правки по ревью запушены — прогон CI: "
+                f"{new_run.get('html_url') or new_run.get('id')}"
+            )
+            self.state.save(task)
+            self._spawn(self._watch_gha_artifacts(
+                task,
+                comment_id=self.github_for(task.repo).last_bot_comment_id(
+                    int(task.source_id)
+                ) or 0,
+                comment_body="",
+                run_id=new_run["id"],
+                client_dir=client_dir,
+                branch=branch,
+            ))
+        else:
+            self._notify_author(
+                task,
+                "💬 Комментарии ревью отправлены агенту, но правок он не "
+                "внёс (или допуш не удался). Возможно, агент ответил "
+                "пояснением — посмотри диалог в задаче.",
+            )
 
     def _cancel_tasks_for_closed_issues(self) -> None:
         """Закрытый issue = отмена задачи: автор закрыл issue — значит, не нужно.
