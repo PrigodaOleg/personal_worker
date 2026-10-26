@@ -1305,8 +1305,7 @@ class Scheduler:
             await self.telegram.send_message(
                 chat_id_int,
                 "🤖 Доступные команды (или кнопки меню):\n"
-                "📋 Задачи — все задачи, результаты и ссылки на PR; отмена активной — кнопкой «🚫» в списке\n"
-                "📤 Подтолкнуть — продолжить упавшую задачу с этапа коммита/пуша (без перезапуска агента)\n"
+                "📋 Задачи — все задачи, результаты и ссылки на PR; отмена и «подтолкнуть» — кнопками в карточке\n"
                 "🧠 Модель — модель LLM по умолчанию\n"
                 "🗂 Репозитории — какие репозитории опрашиваю на задачи\n"
                 "/repo add|check|del <owner/name> — подключить/проверить/убрать репозиторий (админ)\n"
@@ -3328,10 +3327,24 @@ class Scheduler:
 
     @staticmethod
     def _killed_by_openhands(task: Task) -> bool:
-        """Задача была убита OpenHands (след в логе задачи)."""
+        """Задача была убита OpenHands и НЕ перезапущена после этого.
+
+        След ищем в логе задачи, но с учётом попыток: маркер смерти,
+        найденный ПОСЛЕ последнего «Перезапуск #N», относится к прошлой
+        попытке и статус текущей не описывает (иначе после перезапуска
+        задача навсегда показывалась как 🪓-убитая, хотя жива и работает).
+        """
+        last_restart = -1
+        for i, entry in enumerate(task.log):
+            if "Перезапуск #" in entry:
+                last_restart = i
         return any(
-            "AgentStuckInLoopError" in entry or "OpenHands killed task" in entry
-            for entry in task.log
+            i > last_restart
+            and (
+                "AgentStuckInLoopError" in entry
+                or "OpenHands killed task" in entry
+            )
+            for i, entry in enumerate(task.log)
         )
 
     # Подталкивание агенту, вставшему на паузу без вопроса (объявил намерение

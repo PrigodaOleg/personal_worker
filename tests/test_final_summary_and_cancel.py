@@ -156,3 +156,33 @@ def test_task_keyboard_has_cancel_for_active():
     kb2 = s._task_actions_keyboard(done)
     flat2 = [lbl for row in kb2 for lbl, _ in row]
     assert not any("Отменить" in lbl for lbl in flat2)
+
+
+def test_killed_flag_ignores_old_attempt():
+    """Маркер смерти из прошлой попытки не помечает убитой текущую.
+
+    После перезапуска лог задачи хранит смерть attempt 1 — раньше карточка
+    навсегда показывала «🪓 убита», хотя задача работала (bug report).
+    """
+    s, _, _ = make_scheduler()
+    t = make_task(TaskStatus.RUNNING)
+    t.log = [
+        "[2026-10-26T10:44:35] issue #46: e2e тесты",
+        "[2026-10-26T12:35:21] OpenHands killed task: агент зациклился "
+        "(AgentStuckInLoopError) — ретрай не помог",
+        "[2026-10-26T12:40:00] Перезапуск #2, модель: openai/x",
+        "[2026-10-26T12:41:00] OpenHands conversation created: new-cid",
+    ]
+    assert s._killed_by_openhands(t) is False
+
+    # Маркер ПОСЛЕ перезапуска — задача действительно убита.
+    t.log.append(
+        "[2026-10-26T13:00:00] OpenHands killed task: агент зациклился "
+        "(AgentStuckInLoopError) — ретрай не помог"
+    )
+    assert s._killed_by_openhands(t) is True
+
+    # Без перезапусков — как раньше.
+    t2 = make_task(TaskStatus.FAILED)
+    t2.log = ["[x] OpenHands killed task: агент зациклился"]
+    assert s._killed_by_openhands(t2) is True

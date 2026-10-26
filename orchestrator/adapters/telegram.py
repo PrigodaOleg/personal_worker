@@ -32,7 +32,6 @@ logger = logging.getLogger(__name__)
 # поэтому он же используется для маршрутизации к команде.
 MENU_COMMANDS: dict[str, str] = {
     "📋 Задачи": "/tasks",
-    "📤 Подтолкнуть": "/nudge",
     "🧠 Модель": "/model",
     "🗂 Репозитории": "/repos",
     "🚫 Отмена": "/cancel",
