@@ -38,6 +38,7 @@ def make_watcher_scheduler(source: TaskSource, run: dict):
         telegram_admin_chat_id="999",
     )
     s.state = types.SimpleNamespace(save=lambda t: None)
+    s._repo_adapters = {}
     s.github = FakeGitHub(run=run)
     s._repo_adapters = {}
     s._notify_author_calls: list = []
@@ -86,19 +87,6 @@ def test_timeout_notifies_author_and_admin():
                for t in s._notify_author_calls + s._notify_admin_calls)
 
 
-def test_failed_run_notifies_author_and_admin():
-    s = make_watcher_scheduler(
-        TaskSource.GITHUB,
-        run={"status": "completed", "conclusion": "cancelled",
-             "html_url": "https://github.com/PrigodaOleg/social_mind/actions/runs/40143766467"},
-    )
-    s.gha_watch_timeout_seconds = 60  # дедлайн не мешает: run уже completed
-    task = make_task(TaskSource.GITHUB)
-    watch(s, task)
-    assert any("«cancelled»" in t for t in s._notify_author_calls)
-    assert any("cancelled" in t for t in s._notify_admin_calls)
-
-
 def test_success_run_no_kill_notification():
     s = make_watcher_scheduler(
         TaskSource.GITHUB,
@@ -110,3 +98,65 @@ def test_success_run_no_kill_notification():
     watch(s, task)
     assert s._notify_admin_calls == []
     assert s._notify_author_calls == []
+
+
+def test_ci_failure_logs_forwarded_to_agent():
+    """Замкнутый цикл: падение CI → логи агенту → допуш → новый прогон."""
+    s = make_watcher_scheduler(
+        TaskSource.GITHUB,
+        run={"status": "completed", "conclusion": "failure",
+             "html_url": "https://github.com/PrigodaOleg/social_mind/actions/runs/1"},
+    )
+    s.gha_watch_timeout_seconds = 60
+    s.max_ci_fix_rounds = 2
+
+    class JobbedGitHub(FakeGitHub):
+        def __init__(self):
+            super().__init__(run={
+                "status": "completed", "conclusion": "failure",
+                "html_url": "https://github.com/PrigodaOleg/social_mind/actions/runs/1",
+            })
+
+        def list_run_jobs(self, run_id):
+            return [{"id": 5, "name": "build-ios", "conclusion": "failure",
+                     "html_url": ""}]
+
+        def get_job_logs(self, job_id):
+            return "line1\n##[error]Process completed with exit code 1.\ntail"
+
+    s.github = JobbedGitHub()
+
+    class AgentOH:
+        def __init__(self):
+            self.messages: list[str] = []
+
+        async def send_message(self, conversation_id, message):
+            self.messages.append(message)
+            return {"success": True}
+
+        async def start_conversation(self, conversation_id):
+            return {"status": "ok"}
+
+    s.openhands = AgentOH()
+    task = make_task(TaskSource.GITHUB)
+    # client_dir нет → после отправки логов цикл завершится уведомлением.
+    watch(s, task, run_id=1)
+    # Логи ушли агенту, включая хвост с ошибкой.
+    assert len(s.openhands.messages) == 1
+    msg = s.openhands.messages[0]
+    assert "ПУШИТЬ НЕ НУЖНО" in msg
+    assert "##[error]" in msg
+    assert "Джоба «build-ios»" in msg
+    # В логе задачи зафиксирован раунд исправления.
+    assert any("раунд 1/2" in e for e in task.log)
+
+
+def test_ci_log_excerpt_window():
+    text = Scheduler._ci_log_excerpt(
+        "j", "\n".join(f"l{i}" for i in range(200)) + "\n##[error]boom"
+    )
+    assert "##[error]boom" in text
+    assert len(text) < 7000
+    assert "--- Джоба «j»" in text
+    empty = Scheduler._ci_log_excerpt("j", "")
+    assert "недоступен" in empty

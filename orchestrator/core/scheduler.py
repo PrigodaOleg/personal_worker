@@ -97,6 +97,13 @@ class Scheduler:
         self.loading_startup_timeout_seconds: int = int(
             os.getenv("OPENHANDS_LOADING_TIMEOUT_SECONDS", "600")
         )
+        # CI-автоисправление: сколько раундов «логи → агент → допуш»
+        # разрешено после провала GHA-сборки.
+        self.max_ci_fix_rounds: int = int(os.getenv("GHA_FIX_MAX_ROUNDS", "2"))
+        # Сколько секунд ждать нового прогона CI после допуша агента.
+        self.ci_new_run_wait_seconds: int = int(
+            os.getenv("GHA_NEW_RUN_WAIT_SECONDS", "1800")
+        )
         # Сколько раз подряд можно авто-перезапускать прерванную задачу после
         # сбоя/перезагрузки, прежде чем пометить её failed (защита от зацикливания).
         self.max_resume_attempts: int = int(os.getenv("OPENHANDS_MAX_RESUME_ATTEMPTS", "3"))
@@ -3540,7 +3547,9 @@ class Scheduler:
         comment_id = await self._notify_author_with_comment_id(task, notify_text)
         if run_id and comment_id:
             self._spawn(
-                self._watch_gha_artifacts(task, comment_id, notify_text, run_id)
+                self._watch_gha_artifacts(
+                    task, comment_id, notify_text, run_id, client_dir, branch
+                )
             )
 
     # ------------------------------------------------------------------ #
@@ -3699,7 +3708,8 @@ class Scheduler:
         )
 
     async def _watch_gha_artifacts(
-        self, task: Task, comment_id: int, comment_body: str, run_id: int
+        self, task: Task, comment_id: int, comment_body: str, run_id: int,
+        client_dir: Optional[str] = None, branch: Optional[str] = None,
     ) -> None:
         """Дождаться завершения сборки GHA и дописать прямые ссылки.
 
@@ -3707,6 +3717,10 @@ class Scheduler:
         gha-artifacts-* заменяется на версию с прямыми ссылками на файлы.
         Ограничены по времени (GHA_WATCH_TIMEOUT_SECONDS), чтобы не висеть
         вечно на зависшей сборке.
+
+        Провал сборки — не конец: логи упавших джоб отправляются агенту в
+        тот же разговор, он чинит и допушивает в ветку PR, вотчер следит за
+        новым прогоном (до GHA_FIX_MAX_ROUNDS раундов).
 
         Пока вотчер жив, в state/gha_watchers/ лежит маркер <run_id>.watch:
         деплой по нему ждёт окончания «хвоста» перед остановкой сервиса.
@@ -3719,25 +3733,36 @@ class Scheduler:
         except OSError:
             logger.warning("[gha] не удалось создать маркер %s", marker)
         try:
-            await self._watch_gha_artifacts_loop(task, comment_id, comment_body, run_id)
+            await self._watch_gha_artifacts_loop(
+                task, comment_id, comment_body, run_id, client_dir, branch
+            )
         finally:
             marker.unlink(missing_ok=True)
 
     async def _watch_gha_artifacts_loop(
-        self, task: Task, comment_id: int, comment_body: str, run_id: int
+        self, task: Task, comment_id: int, comment_body: str, run_id: int,
+        client_dir: Optional[str] = None, branch: Optional[str] = None,
     ) -> None:
-        deadline = time.monotonic() + self.gha_watch_timeout_seconds
+        old_sha = None
+        if client_dir:
+            try:
+                old_sha = await self._git_head_sha(client_dir)
+            except Exception:  # noqa: BLE001 — sha нужен только для ретрая
+                old_sha = None
+        fix_rounds = 0
         while True:
-            await asyncio.sleep(self.gha_watch_poll_seconds)
-            if time.monotonic() >= deadline:
-                task.add_log("Сборка GHA не завершилась за время слежения — ссылки не дописаны")
-                self.state.save(task)
-                # Раньше вотчер молча сдавался (запись только в task.log):
-                # автор не узнавал, что сборка так и не закончилась.
-                run_url = (
-                    f"https://github.com/{self._repo_full(task)}"
-                    f"/actions/runs/{run_id}"
+            conclusion = await self._wait_ci_run_completion(task, run_id)
+            run_url = (
+                f"https://github.com/{self._repo_full(task)}"
+                f"/actions/runs/{run_id}"
+            )
+            if conclusion is None:
+                # Таймаут слежения: сборка так и не завершилась.
+                task.add_log(
+                    "Сборка GHA не завершилась за время слежения — "
+                    "ссылки не дописаны"
                 )
+                self.state.save(task)
                 self._notify_author(
                     task,
                     "⏳ Сборка GHA не завершилась за время слежения "
@@ -3753,19 +3778,7 @@ class Scheduler:
                         f"{run_url}"
                     )
                 return
-            try:
-                run = await asyncio.to_thread(
-                    self.github_for(task.repo).get_workflow_run, run_id
-                )
-            except Exception as exc:  # noqa: BLE001 — сеть/API, попробуем снова
-                logger.warning("[gha] get_workflow_run failed: %s", exc)
-                continue
-            if not run or run.get("status") != "completed":
-                continue
-            conclusion = run.get("conclusion")
-            run_url = run.get("html_url") or (
-                f"https://github.com/{self._repo_full(task)}/actions/runs/{run_id}"
-            )
+            # Сборка завершилась — обновляем секцию артефактов в комментарии.
             artifacts: list[dict] = []
             if conclusion == "success":
                 try:
@@ -3777,10 +3790,10 @@ class Scheduler:
             new_section = self.format_artifacts_section(
                 run_id, run_url, conclusion, artifacts, self._repo_full(task)
             )
-            new_body = self.replace_marker_section(comment_body, new_section)
+            comment_body = self.replace_marker_section(comment_body, new_section)
             try:
                 await asyncio.to_thread(
-                    self.github_for(task.repo).update_comment, comment_id, new_body
+                    self.github_for(task.repo).update_comment, comment_id, comment_body
                 )
             except Exception as exc:
                 logger.error("[gha] update_comment failed: %s", exc)
@@ -3790,21 +3803,282 @@ class Scheduler:
                 f"(сборка: {conclusion}, артефактов: {len(artifacts)})"
             )
             self.state.save(task)
-            if conclusion != "success":
-                # Сборка провалилась/отменена — автор должен узнать об этом
-                # сразу, а не находить красный крестик в issue постфактум.
+            if conclusion == "success":
+                return
+            # Сборка провалилась. Раньше — только уведомление; теперь цикл
+            # замкнут: логи упавших джоб → агенту → допуш → новый прогон.
+            if fix_rounds >= self.max_ci_fix_rounds:
+                task.add_log(
+                    f"GHA-сборка провалилась ({conclusion}) — лимит раундов "
+                    f"исправлений ({self.max_ci_fix_rounds}) исчерпан"
+                )
+                self.state.save(task)
                 self._notify_author(
                     task,
-                    f"❌ GHA-сборка завершилась с результатом «{conclusion}».\n"
+                    f"❌ GHA-сборка снова провалилась ({conclusion}) после "
+                    f"{self.max_ci_fix_rounds} раундов автоисправлений.\n"
                     f"{run_url}\n\n"
-                    "Код в PR на месте — сборку можно перезапустить вручную.",
+                    "Разберись в логах вручную или перезапусти задачу.",
                 )
                 if task.source == TaskSource.GITHUB:
                     self._notify_admin(
                         f"❌ GHA-сборка задачи {self._repo_full(task)}"
-                        f"#{task.source_id}: {conclusion}\n{run_url}"
+                        f"#{task.source_id} не починена за "
+                        f"{self.max_ci_fix_rounds} раунда: {conclusion}\n"
+                        f"{run_url}"
                     )
-            return
+                return
+            fix_rounds += 1
+            task.add_log(
+                f"GHA-сборка провалилась ({conclusion}) — отправляю логи "
+                f"агенту на исправление (раунд {fix_rounds}/"
+                f"{self.max_ci_fix_rounds})"
+            )
+            self.state.save(task)
+            sent = await self._send_ci_failure_to_agent(task, run_id)
+            if not sent:
+                self._notify_author(
+                    task,
+                    f"❌ GHA-сборка провалилась ({conclusion}), но передать "
+                    "логи агенту не удалось (разговор закрыт?).\n"
+                    f"{run_url}",
+                )
+                if task.source == TaskSource.GITHUB:
+                    self._notify_admin(
+                        f"❌ GHA-сборка {self._repo_full(task)}"
+                        f"#{task.source_id}: {conclusion}; логи агенту "
+                        "доставить не удалось."
+                    )
+                return
+            # Агент поправил файлы в контейнере — пушит ОРКЕСТРАТОР:
+            # синхронизируем правки на хост и допушиваем в ветку PR.
+            new_run = await self._sync_and_push_ci_fix(
+                task, client_dir, branch, old_sha
+            )
+            if not new_run:
+                self._notify_author(
+                    task,
+                    "⏳ Агент получил логи падения, но новый запуск CI так и "
+                    "не появился за время ожидания. Проверь PR и логи агента "
+                    "вручную.",
+                )
+                if task.source == TaskSource.GITHUB:
+                    self._notify_admin(
+                        f"⏳ {self._repo_full(task)}#{task.source_id}: агент "
+                        "не допушил исправление после падения CI."
+                    )
+                return
+            task.add_log(
+                f"Агент допушил исправление — новый прогон CI: "
+                f"{new_run.get('html_url') or new_run.get('id')}"
+            )
+            self.state.save(task)
+            run_id = new_run["id"]
+            old_sha = new_run.get("head_sha") or old_sha
+
+    async def _sync_and_push_ci_fix(
+        self, task: Task, client_dir: Optional[str],
+        branch: Optional[str], old_sha: Optional[str],
+    ) -> Optional[dict]:
+        """Забрать правки агента из контейнера и допушить в ветку PR.
+
+        Агент не пушит сам (у него нет токена, и он работает в собственном
+        клоне внутри контейнера) — пуш всегда делает оркестратор:
+        синхронизация из контейнера на хост → commit → push → новый прогон.
+        Возвращаем dict нового запуска CI или None (не дождались).
+        """
+        if not client_dir or not branch:
+            return None
+        # Ждём, пока агент закончит правки (разговор снова idle/finished)
+        # — до 20 минут; обычно хватает пары минут.
+        await self._wait_agent_settled(task)
+        sync = await self._sync_changes_from_runtime(task, client_dir)
+        if sync.get("status") == "error":
+            logger.error("[gha-fix] sync failed: %s", sync.get("error"))
+            return None
+        task.add_log(
+            f"Правки агента после падения CI: изменено {sync.get('copied')}, "
+            f"удалено {sync.get('removed')}"
+        )
+        try:
+            for git_cmd in (
+                ["add", "-A", "--", ".",
+                 ":(exclude,glob)**/build.env",
+                 ":(exclude,glob)**/google-services.json"],
+                ["commit", "-m", f"AI task: {task.title} (CI fix)"],
+                ["push", "-u", "origin", branch],
+            ):
+                proc = await asyncio.create_subprocess_exec(
+                    "git", "-C", client_dir, *self._git_auth_args(task.repo), *git_cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                out, err = await asyncio.wait_for(proc.communicate(), timeout=300)
+                if proc.returncode != 0:
+                    msg = (err.decode("utf-8", errors="replace").strip()
+                           or out.decode("utf-8", errors="replace").strip())
+                    if git_cmd[0] == "commit" and "nothing to commit" in msg:
+                        task.add_log("git: агент ничего не изменил после логов CI")
+                        self.state.save(task)
+                        return None
+                    raise RuntimeError(f"git {' '.join(git_cmd)}: {msg}")
+        except Exception as exc:  # noqa: BLE001
+            logger.error("[gha-fix] push failed: %s", exc)
+            task.add_log(f"Допуш после падения CI не удался: {exc}")
+            self.state.save(task)
+            return None
+        return await self._wait_for_new_ci_run(task, client_dir, old_sha, 0)
+
+    async def _wait_agent_settled(
+        self, task: Task, max_wait_s: int = 1200
+    ) -> bool:
+        """Дождаться, пока агент закончит правки после наших логов.
+
+        Пока разговор не вернулся в idle/finished/stopped/awaiting — агент
+        ещё работает. True — успокоился, False — таймаут.
+        """
+        conversation_id = task.conversation_id
+        if not conversation_id:
+            return True
+        settled_states = {"idle", "finished", "stopped", "awaiting_user_input",
+                          "error"}
+        deadline = time.monotonic() + max_wait_s
+        while time.monotonic() < deadline:
+            await asyncio.sleep(20)
+            try:
+                info = await self.openhands.get_agent_state(conversation_id)
+            except Exception:  # noqa: BLE001
+                continue
+            state = info.get("agent_state")
+            if state in settled_states:
+                return True
+        return False
+
+    async def _wait_ci_run_completion(self, task: Task, run_id: int) -> Optional[str]:
+        """Дождаться завершения прогона CI. conclusion или None (таймаут)."""
+        deadline = time.monotonic() + self.gha_watch_timeout_seconds
+        while True:
+            await asyncio.sleep(self.gha_watch_poll_seconds)
+            if time.monotonic() >= deadline:
+                return None
+            try:
+                run = await asyncio.to_thread(
+                    self.github_for(task.repo).get_workflow_run, run_id
+                )
+            except Exception as exc:  # noqa: BLE001 — сеть/API, попробуем снова
+                logger.warning("[gha] get_workflow_run failed: %s", exc)
+                continue
+            if not run or run.get("status") != "completed":
+                continue
+            return run.get("conclusion")
+
+    # Выводы упавших джоб — кандидаты на отправку агенту.
+    _CI_FAILED_CONCLUSIONS = ("failure", "cancelled", "timed_out")
+
+    async def _send_ci_failure_to_agent(self, task: Task, run_id: int) -> bool:
+        """Отправить агенту логи упавших джоб прогона CI.
+
+        True — сообщение доставлено в разговор; агенту предлагается
+        исправить и допушить в ту же ветку PR.
+        """
+        conversation_id = task.conversation_id
+        if not conversation_id:
+            return False
+        try:
+            jobs = await asyncio.to_thread(
+                self.github_for(task.repo).list_run_jobs, run_id
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[gha] list_run_jobs failed: %s", exc)
+            jobs = []
+        chunks: list[str] = []
+        for job in jobs:
+            if (job.get("conclusion") or "") not in self._CI_FAILED_CONCLUSIONS:
+                continue
+            logs = None
+            try:
+                logs = await asyncio.to_thread(
+                    self.github_for(task.repo).get_job_logs, job["id"]
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[gha] get_job_logs failed: %s", exc)
+            chunks.append(self._ci_log_excerpt(
+                job.get("name") or f"job-{job.get('id')}", logs or ""
+            ))
+        if not chunks:
+            chunks.append(
+                "(логи упавших джоб недоступны — посмотри run по ссылке выше)"
+            )
+        message = (
+            "⚠️ CI на GitHub провалился для твоего PR. Ниже хвосты логов "
+            "упавших джоб.\n\n"
+            "Разберись в причине и исправь код или workflow в своём рабочем "
+            "окружении (/workspace/social_mind). ПУШИТЬ НЕ НУЖНО: просто "
+            "внеси правки (можно закоммитить) и сообщи, что готово. "
+            "Оркестратор сам заберёт изменения и допушит в ветку PR — CI "
+            "перезапустится, о результате сообщу отдельно. Если проблема "
+            "вне твоего контроля — задай вопрос со знаком вопроса.\n\n"
+            + "\n\n".join(chunks)
+        )
+        res = await self.openhands.send_message(conversation_id, message)
+        if res.get("status") == "error" or res.get("success") is False:
+            # Разговор мог погаснуть после завершения задачи — будим.
+            await self.openhands.start_conversation(conversation_id)
+            res = await self.openhands.send_message(conversation_id, message)
+            if res.get("status") == "error" or res.get("success") is False:
+                logger.error(
+                    "[gha-fix] не удалось доставить логи агенту: %s", res
+                )
+                return False
+        return True
+
+    @staticmethod
+    def _ci_log_excerpt(job_name: str, logs: str, max_chars: int = 6000) -> str:
+        """Хвост лога джобы: вокруг первой ошибки или последние строки."""
+        lines = logs.splitlines()
+        if lines:
+            err_idx = next(
+                (i for i, ln in enumerate(lines) if "##[error]" in ln), None
+            )
+            if err_idx is not None:
+                start = max(0, err_idx - 15)
+                window = lines[start : err_idx + 45]
+            else:
+                window = lines[-50:]
+            text = "\n".join(window).strip()
+            if len(text) > max_chars:
+                text = text[-max_chars:]
+        else:
+            text = "(лог пуст или недоступен)"
+        return f"--- Джоба «{job_name}» (хвост лога) ---\n{text}"
+
+    async def _wait_for_new_ci_run(
+        self, task: Task, client_dir: Optional[str],
+        old_sha: Optional[str], old_run_id: int,
+    ) -> Optional[dict]:
+        """Дождаться нового прогона CI после допуша оркестратора.
+
+        Смотрим head-коммит рабочей копии на хосте: до пуша он не меняется.
+        Новый прогон ищем по новому sha (до ci_new_run_wait_seconds).
+        """
+        if not client_dir:
+            return None
+        deadline = time.monotonic() + self.ci_new_run_wait_seconds
+        while time.monotonic() < deadline:
+            await asyncio.sleep(30)
+            try:
+                sha = await self._git_head_sha(client_dir)
+                if not sha or sha == old_sha:
+                    continue
+                run = await asyncio.to_thread(
+                    self.github_for(task.repo).find_workflow_run, sha, 10, 5.0
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[gha] new run poll failed: %s", exc)
+                continue
+            if run and run.get("id") and int(run["id"]) != int(old_run_id):
+                return run
+        return None
 
     # ------------------------------------------------------------------ #
     # Главный цикл
