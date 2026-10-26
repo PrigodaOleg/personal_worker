@@ -34,6 +34,8 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       - ${WORK_DIR}:/opt/openhands/workspace
       - openhands_state:/home/openhands/.local/share/openhands
+      # Конфиг сервера (проброс /dev/kvm в runtime-контейнеры — см. файл).
+      - ./docker/openhands-flutter/config.toml:/app/config.toml:ro
     restart: always
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:3000/"]
