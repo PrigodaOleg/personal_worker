@@ -2468,7 +2468,7 @@ class Scheduler:
                 "     1) запусти Firebase-эмулятор на iMac (если тестам он "
                 "нужен): "
                 f"{ssh} 'cd {imac_workdir}/client && "
-                "nohup npx firebase-tools emulators:start --only auth,firestore "
+                "nohup firebase emulators:start --only auth,firestore "
                 "> /tmp/firebase_emulator.log 2>&1 &'\n"
                 "     2) загрузи симулятор и найди UDID:\n"
                 f"        {ssh} 'xcrun simctl boot \"iPhone 16\"; "
