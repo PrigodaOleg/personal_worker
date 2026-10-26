@@ -2490,11 +2490,14 @@ class Scheduler:
             logger.warning("[cleanup] %s remove failed: %s", container, exc)
 
     async def _gc_runtime_containers(self) -> None:
-        """Чистка осиротевших runtime-контейнеров (раз в час).
+        """Чистка осиротевших ЗАПУЩЕННЫХ runtime-контейнеров (раз в час).
 
-        Контейнер удаляем, если разговор не принадлежит активной задаче
-        (NEW/CLARIFYING/READY/RUNNING) И его задача с PR не покрыта живым
-        GHA-вотчером (маркер .watch) — иначе сломаем цикл допуша.
+        Память хоста едят только контейнеры в состоянии running (gradle-/
+        kotlin-daemon — до 6 ГБ); остановленные почти бесплатны — только
+        диск. Поэтому GC удаляет исключительно осиротевшие running:
+        остановленные контейнеры PR-задач остаются жить на случай цикла
+        ревью (комментарии могут прийти через дни после снятия маркера
+        вотчера), не-PR убираются сразу в _cleanup_runtime_container.
         """
         active_cids = {
             t.conversation_id
@@ -2507,23 +2510,18 @@ class Scheduler:
             for t in self.state.list_by_status(status)
             if t.conversation_id
         }
-        # Задачи с PR под живым вотчером: их контейнеры не трогаем.
-        watchers_dir = Path(self.config.state_db).parent / "gha_watchers"
-        watched = False
-        try:
-            watched = any(watchers_dir.glob("*.watch"))
-        except OSError:
-            pass
-        if watched:
-            # Есть живой вотчер — не рискуем: PR-задачи могут использовать
-            # контейнер в любой момент. Чистим только безусловно-мёртвые.
-            pass
-
         code, out, _ = await self._docker(
-            "ps", "-a", "--format", "{{.ID}} {{.Names}}", timeout=30
+            "ps", "--filter", "status=running",
+            "--format", "{{.ID}} {{.Names}}", timeout=30,
         )
         if code != 0:
             return
+        # PR-задачи под живым вотчером защищены всегда (маркер .watch).
+        watchers_dir = Path(self.config.state_db).parent / "gha_watchers"
+        try:
+            watcher_alive = any(watchers_dir.glob("*.watch"))
+        except OSError:
+            watcher_alive = False
         removed = 0
         for line in out.splitlines():
             cid, _, name = line.partition(" ")
@@ -2532,15 +2530,17 @@ class Scheduler:
             conversation_id = name.removeprefix("openhands-runtime-")
             if conversation_id in active_cids:
                 continue
-            if watched and self._task_pr_by_cid(conversation_id):
-                continue  # PR-задача, вотчер жив — контейнер может понадобиться
+            if watcher_alive and self._task_pr_by_cid(conversation_id):
+                continue  # PR-задача, вотчер жив — контейнер нужен циклу допуша
             rc, _, err = await self._docker("rm", "-f", cid, timeout=60)
             if rc == 0:
                 removed += 1
             else:
                 logger.warning("[gc] rm %s failed: %s", name, err.strip()[:100])
         if removed:
-            logger.info("[gc] removed %d orphan runtime container(s)", removed)
+            logger.info(
+                "[gc] removed %d orphan running container(s)", removed
+            )
 
     def _task_pr_by_cid(self, conversation_id: str) -> bool:
         """Есть ли задача с PR и этим разговором (кандидат под вотчером)."""

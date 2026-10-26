@@ -26,6 +26,9 @@ class FakeState:
     def save(self, task):
         self.tasks[task.id] = task
 
+    def list_by_status(self, status):
+        return [t for t in self.tasks.values() if t.status == status]
+
 
 class FakeTelegram:
     def __init__(self):
@@ -63,6 +66,7 @@ def make_scheduler() -> tuple[Scheduler, FakeGitHub, FakeTelegram]:
     s.config = types.SimpleNamespace(
         github_repo="PrigodaOleg/social_mind",
         telegram_admin_chat_id="999",
+        state_db="/tmp/pw-test-state/orchestrator.sqlite",
     )
     return s, s.github, s.telegram
 
@@ -207,3 +211,40 @@ def test_cleanup_skipped_for_pr_tasks():
     t2.pr_url = None
     asyncio.run(s._cleanup_runtime_container(t2))
     assert removed and "rm" in removed[0]
+
+
+def test_gc_removes_only_running_containers():
+    """GC трогает только ЗАПУЩЕННЫЕ осиротевшие контейнеры.
+
+    Остановленные контейнеры PR-задач (вдруг понадобится цикл ревью) и
+    любой контейнер активной задачи не удаляются. Запущенные осиротевшие —
+    единственная реальная угроза памяти — удаляются.
+    """
+    s, _, _ = make_scheduler()
+    removed: list[str] = []
+
+    async def fake_docker(*args, **kw):
+        cmd = args
+        if cmd[0] == "ps":
+            # Реальный docker с "--filter status=running" вернул бы только
+            # запущенные: эмулируем.
+            assert "status=running" in cmd, "GC обязан фильтровать по running"
+            return (
+                0,
+                "id-running-1 openhands-runtime-orphan-running\n"
+                "id-running-2 openhands-runtime-active-running\n",
+                "",
+            )
+        if cmd[0] == "rm":
+            removed.append(cmd[2])
+        return (0, "", "")
+
+    s._docker = fake_docker
+    active = make_task(TaskStatus.RUNNING)
+    active.conversation_id = "active-running"
+    s.state.save(active)
+
+    asyncio.run(s._gc_runtime_containers())
+    assert removed == ["id-running-1"], (
+        "GC должен удалить только запущенный осиротевший контейнер"
+    )
