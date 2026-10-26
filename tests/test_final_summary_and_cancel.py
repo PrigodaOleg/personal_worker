@@ -186,3 +186,24 @@ def test_killed_flag_ignores_old_attempt():
     t2 = make_task(TaskStatus.FAILED)
     t2.log = ["[x] OpenHands killed task: агент зациклился"]
     assert s._killed_by_openhands(t2) is True
+
+
+def test_cleanup_skipped_for_pr_tasks():
+    """Задача с PR не чистится в finally: контейнер нужен CI-вотчеру."""
+    s, _, _ = make_scheduler()
+    removed = []
+
+    async def fake_docker(*args, **kw):
+        removed.append(args)
+        return (0, "", "")
+
+    s._docker = fake_docker
+    t = make_task(TaskStatus.DONE)
+    t.pr_url = "https://github.com/o/r/pull/1"
+    asyncio.run(s._cleanup_runtime_container(t))
+    assert removed == [], "контейнер PR-задачи не должен удаляться"
+
+    t2 = make_task(TaskStatus.FAILED)
+    t2.pr_url = None
+    asyncio.run(s._cleanup_runtime_container(t2))
+    assert removed and "rm" in removed[0]

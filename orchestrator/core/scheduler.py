@@ -2455,6 +2455,100 @@ class Scheduler:
             await self._run_openhands_impl(task)
         finally:
             self._running_tasks.discard(task.id)
+            # Runtime-контейнеры без чистки копятся и съедают память хоста:
+            # один контейнер с Gradle/Kotlin daemon — до 6 ГБ. После 18
+            # накопленных контейнеров активной задаче не хватало памяти,
+            # bash-сервер рантайма умирал (exit code -1 на любых командах)
+            # и OpenHands убивал задачу «за зацикливание».
+            # Задача завершена (любым исходом) — контейнер больше не нужен:
+            # правки агента уже синхронизированы на хост, логи — в БД.
+            await self._cleanup_runtime_container(task)
+
+    async def _cleanup_runtime_container(self, task: Task) -> None:
+        """Удалить runtime-контейнер завершённой задачи (best-effort).
+
+        Исключение — задача с PR: контейнер понадобится CI-вотчеру
+        (замкнутый цикл «упавший CI → правки агента → допуш») и циклу
+        ревью; их чистит отдельный путь (_watch_gha_artifacts_loop /
+        _handle_pr_feedback после использования). Здесь чистим задачи
+        без PR — упавшие, убитые, отменённые, «нет изменений».
+        """
+        if not task.conversation_id:
+            return
+        if task.pr_url:
+            return
+        container = f"openhands-runtime-{task.conversation_id}"
+        try:
+            code, _, _ = await self._docker(
+                "rm", "-f", container, timeout=60
+            )
+            if code == 0:
+                logger.info("[cleanup] runtime container %s removed", container)
+                task.add_log("Runtime-контейнер удалён (память хоста)")
+                self.state.save(task)
+        except Exception as exc:  # noqa: BLE001 — чистка не должна падать
+            logger.warning("[cleanup] %s remove failed: %s", container, exc)
+
+    async def _gc_runtime_containers(self) -> None:
+        """Чистка осиротевших runtime-контейнеров (раз в час).
+
+        Контейнер удаляем, если разговор не принадлежит активной задаче
+        (NEW/CLARIFYING/READY/RUNNING) И его задача с PR не покрыта живым
+        GHA-вотчером (маркер .watch) — иначе сломаем цикл допуша.
+        """
+        active_cids = {
+            t.conversation_id
+            for status in (
+                TaskStatus.NEW,
+                TaskStatus.CLARIFYING,
+                TaskStatus.READY,
+                TaskStatus.RUNNING,
+            )
+            for t in self.state.list_by_status(status)
+            if t.conversation_id
+        }
+        # Задачи с PR под живым вотчером: их контейнеры не трогаем.
+        watchers_dir = Path(self.config.state_db).parent / "gha_watchers"
+        watched = False
+        try:
+            watched = any(watchers_dir.glob("*.watch"))
+        except OSError:
+            pass
+        if watched:
+            # Есть живой вотчер — не рискуем: PR-задачи могут использовать
+            # контейнер в любой момент. Чистим только безусловно-мёртвые.
+            pass
+
+        code, out, _ = await self._docker(
+            "ps", "-a", "--format", "{{.ID}} {{.Names}}", timeout=30
+        )
+        if code != 0:
+            return
+        removed = 0
+        for line in out.splitlines():
+            cid, _, name = line.partition(" ")
+            if not name.startswith("openhands-runtime-"):
+                continue
+            conversation_id = name.removeprefix("openhands-runtime-")
+            if conversation_id in active_cids:
+                continue
+            if watched and self._task_pr_by_cid(conversation_id):
+                continue  # PR-задача, вотчер жив — контейнер может понадобиться
+            rc, _, err = await self._docker("rm", "-f", cid, timeout=60)
+            if rc == 0:
+                removed += 1
+            else:
+                logger.warning("[gc] rm %s failed: %s", name, err.strip()[:100])
+        if removed:
+            logger.info("[gc] removed %d orphan runtime container(s)", removed)
+
+    def _task_pr_by_cid(self, conversation_id: str) -> bool:
+        """Есть ли задача с PR и этим разговором (кандидат под вотчером)."""
+        return any(
+            t.conversation_id == conversation_id and t.pr_url
+            for status in (TaskStatus.DONE,)
+            for t in self.state.list_by_status(status)
+        )
 
     async def _run_openhands_impl(self, task: Task) -> None:
         task.status = TaskStatus.RUNNING
@@ -4426,12 +4520,21 @@ class Scheduler:
         await self._refresh_prices_and_benchmarks()
         price_refresh_interval = 6 * 3600  # обновлять цены/бенчмарки раз в 6 часов
         last_price_refresh = time.time()
+        last_container_gc = time.time()  # чистка runtime-контейнеров — раз в час
 
         while True:
             try:
                 await self.poll_github()
             except Exception as exc:
                 logger.error("[loop] github poll error: %s", exc)
+
+            # Периодически чистим осиротевшие runtime-контейнеры.
+            if time.time() - last_container_gc > 3600:
+                try:
+                    await self._gc_runtime_containers()
+                except Exception as exc:
+                    logger.error("[loop] container gc error: %s", exc)
+                last_container_gc = time.time()
 
             # Периодически обновляем цены и бенчмарки моделей.
             if time.time() - last_price_refresh > price_refresh_interval:
