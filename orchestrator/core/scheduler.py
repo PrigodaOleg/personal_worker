@@ -326,6 +326,25 @@ class Scheduler:
             except Exception as exc:
                 logger.error("[notify] telegram send failed: %s", exc)
 
+    async def _notify_summary(self, task: Task, summary: str) -> None:
+        """Финальное саммари агента отдельным сообщением (до ссылок).
+
+        Для GitHub — комментарий в issue; для Telegram — сообщение автору.
+        Заголовок оформляет оркестратор: сам отчёт агента идёт как есть.
+        """
+        text = (
+            "📝 Саммари проделанной работы:\n\n"
+            f"{summary}"
+        )
+        if task.source == TaskSource.GITHUB:
+            num = int(task.source_id)
+            await asyncio.to_thread(
+                self.github_for(task.repo).create_comment, num, text
+            )
+            logger.info("[summary] comment added to issue #%s", num)
+        else:
+            self._notify_author(task, text)
+
     async def _notify_author_with_comment_id(
         self, task: Task, text: str
     ) -> Optional[int]:
@@ -1286,8 +1305,7 @@ class Scheduler:
             await self.telegram.send_message(
                 chat_id_int,
                 "🤖 Доступные команды (или кнопки меню):\n"
-                "📊 Статус — состояние текущей задачи\n"
-                "📋 Задачи — все задачи, результаты и ссылки на PR\n"
+                "📋 Задачи — все задачи, результаты и ссылки на PR; отмена активной — кнопкой «🚫» в списке\n"
                 "📤 Подтолкнуть — продолжить упавшую задачу с этапа коммита/пуша (без перезапуска агента)\n"
                 "🧠 Модель — модель LLM по умолчанию\n"
                 "🗂 Репозитории — какие репозитории опрашиваю на задачи\n"
@@ -1455,6 +1473,14 @@ class Scheduler:
 
     def _task_actions_keyboard(self, task: Task):
         rows: list[list[tuple[str, str]]] = []
+        # Активную задачу можно отменить прямо из карточки.
+        if task.status in (
+            TaskStatus.NEW,
+            TaskStatus.CLARIFYING,
+            TaskStatus.READY,
+            TaskStatus.RUNNING,
+        ):
+            rows.append([("🚫 Отменить", f"cancel:{task.id}")])
         # Висящий вопрос агента: ответить можно прямо отсюда.
         if self._has_pending_question(task.id):
             rows.append([("✍️ Ответить на вопрос", f"qask:{task.id}")])
@@ -1794,6 +1820,29 @@ class Scheduler:
             task = self.state.get(data.split(":", 1)[1])
             text, keyboard = await self._render_status_view(task)
             await self._reply(query, text, keyboard)
+            return
+
+        if data.startswith("cancel:"):
+            task = self.state.get(data.split(":", 1)[1])
+            if task:
+                cqid = query.get("callback_query_id", "")
+                if task.status not in (
+                    TaskStatus.NEW,
+                    TaskStatus.CLARIFYING,
+                    TaskStatus.READY,
+                    TaskStatus.RUNNING,
+                ):
+                    await self.telegram.answer_callback_query(
+                        cqid, "⚠️ Задача уже завершена"
+                    )
+                else:
+                    self._cancel_task(
+                        task, "Отменено пользователем (кнопка в карточке)"
+                    )
+                    await self.telegram.answer_callback_query(
+                        cqid, "🚫 Задача отменена"
+                    )
+                await self._send_task_detail(query, task)
             return
 
         if data.startswith("t:"):
@@ -2997,7 +3046,15 @@ class Scheduler:
                 # навсегда пересылалось автору как «вопрос» — задача зависала,
                 # пока автор не отвечал фейковыми «да» (issue #38).
                 work_events = info.get("work_events") or 0
-                if last_pause_work is not None and work_events > last_pause_work:
+                # Сброс счётчика только при ЗАМЕТНОМ прогрессе (>=5 рабочих
+                # событий с прошлой паузы): агент работает почти непрерывно,
+                # и рост на 1-2 события между частыми паузами обнулял счётчик
+                # каждый раз — авто-продолжения становились бесконечными,
+                # лог спамился «(1/4)» (разбор задачи #46).
+                if (
+                    last_pause_work is not None
+                    and work_events - last_pause_work >= 5
+                ):
                     auto_continues = 0
                 last_pause_work = work_events
                 kind = self._classify_agent_pause(message)
@@ -3005,8 +3062,10 @@ class Scheduler:
                 if kind == "report":
                     # Отчёт о проделанной работе — не вопрос, ждать ответа
                     # не нужно: завершаем задачу штатно (вплоть до PR).
+                    # Саммари сохраняем: уйдёт отдельным сообщением перед
+                    # коротким уведомлением со ссылками.
+                    task.agent_summary = self._strip_tool_markup(message)[:4000]
                     task.status = TaskStatus.DONE
-                    self.state.save(task)
                     task.add_log("OpenHands completed (final report, no question)")
                     self.state.save(task)
                     await self._build_ios_and_create_pr(task, client_dir)
@@ -3189,8 +3248,12 @@ class Scheduler:
                 # Остановка после отчёта агента — штатное завершение
                 # (OpenHands гасит простаивающий разговор).
                 if info.get("completed"):
+                    # Саммари — последний отчёт агента (если ещё не сохранён).
+                    if not task.agent_summary and info.get("message"):
+                        task.agent_summary = self._strip_tool_markup(
+                            str(info["message"])
+                        )[:4000]
                     task.status = TaskStatus.DONE
-                    self.state.save(task)
                     task.add_log("OpenHands completed (conversation stopped after report)")
                     self.state.save(task)
                     await self._build_ios_and_create_pr(task, client_dir)
@@ -3691,6 +3754,15 @@ class Scheduler:
         artifacts_section, run_id = await self._gha_artifacts_section(
             task, client_dir, branch
         )
+        # Финальное саммари — отдельным сообщением ДО короткого уведомления
+        # со ссылками: полноценный отчёт «что сделано» в духе ревью, а потом
+        # сухие ссылки. Сбой саммари не валит задачу: уведомление важнее.
+        summary = (task.agent_summary or "").strip()
+        if summary:
+            try:
+                await self._notify_summary(task, summary)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[summary] failed for %s: %s", task.id, exc)
         notify_text = f"✅ Задача выполнена! PR создан: {pr_url}\n"
         notify_text += f"Ветка: `{branch}`\n"
         if assignees:
