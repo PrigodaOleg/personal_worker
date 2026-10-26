@@ -1,0 +1,15 @@
+# Конфиг OpenHands-сервера (docker/openhands-flutter).
+#
+# Монтируется в контейнер как /app/config.toml (WORKDIR) — читается при
+# старте сервера (load_openhands_config). Секреты сюда НЕ класть:
+# LLM_* передаются через environment (docker-compose + deploy/sync_secrets).
+#
+# Зачем это нужно: агент запускает Android-эмулятор внутри дочернего
+# runtime-контейнера. Без /dev/kvm qemu работает через чистую программную
+# эмуляцию: эмулятор стартует криво (swiftshader ColorBuffer-ошибки) и
+# умирает, агент получает пустые команды (exit code -1) и зацикливается —
+# OpenHands убивает задачу (AgentStuckInLoopError). /dev/kvm есть на хосте,
+# но OpenHands по умолчанию не пробрасывает устройства в runtime —
+# docker_runtime_kwargs передаётся напрямую в docker containers.run().
+[sandbox]
+docker_runtime_kwargs = { devices = ["/dev/kvm"] }
