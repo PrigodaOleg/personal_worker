@@ -41,6 +41,7 @@ def make_scheduler(issues) -> tuple[Scheduler, list, FakeTelegram]:
         save=lambda t: None,
         get_setting=lambda key, default=None: default,
         set_setting=lambda key, value: None,
+        list_by_status=lambda status: [],
     )
     s.config = types.SimpleNamespace(
         github_label="aitask",
@@ -51,6 +52,7 @@ def make_scheduler(issues) -> tuple[Scheduler, list, FakeTelegram]:
     s._cancel_tasks_for_closed_issues = lambda: None
     s._poll_github_clarification_answers = lambda: None
     s._poll_github_agent_question_answers = lambda: None
+    s._poll_pr_review_feedback = lambda: None
     s._enqueue_task = enqueued.append
     return s, enqueued, s.telegram
 

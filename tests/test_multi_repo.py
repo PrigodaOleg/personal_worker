@@ -32,6 +32,11 @@ class FakeState:
     def save(self, task):
         self.tasks[task.id] = task
 
+    def list_by_status(self, status):
+        return [
+            t for t in self.tasks.values() if t.status == status
+        ]
+
 
 class FakeAdapter:
     """Фейк GitHubAdapter для github_for / poll / repo-команд."""

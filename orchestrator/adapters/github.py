@@ -416,6 +416,87 @@ class GitHubAdapter:
             input={"reviewers": list(reviewers)},
         )
 
+    def fetch_pr_head_branch(self, pr_url: str) -> Optional[str]:
+        """Имя head-ветки PR (для допуша исправлений)."""
+        self._ensure_auth()
+        assert self._repo is not None
+        m = re.search(r"/pull/(\d+)", pr_url)
+        if not m:
+            return None
+        try:
+            pr = self._repo.get_pull(number=int(m.group(1)))
+            return pr.head.ref
+        except Exception:  # noqa: BLE001 — PR могли удалить
+            return None
+
+    def fetch_pr_feedback(
+        self, pr_url: str, after_comment_id: int = 0
+    ) -> list[dict]:
+        """Новые отзывы людей по PR: issue-комментарии + ревью + инлайн-комментарии.
+
+        Возвращает [{id, author, body, kind}] в хронологическом порядке:
+        kind = issue_comment | review | inline. Боты (включая наш
+        финальный комментарий) отфильтрованы. after_comment_id — вернуть
+        только комментарии с id больше него.
+        """
+        self._ensure_auth()
+        assert self._repo is not None
+        m = re.search(r"/pull/(\d+)", pr_url)
+        if not m:
+            return []
+        pr_number = int(m.group(1))
+        out: list[dict] = []
+
+        def _bot(u) -> bool:
+            return bool(u and getattr(u, "type", None) == "Bot")
+
+        # 1) Обычные комментарии PR (issue-комментарии).
+        data = self._gh_api(
+            "GET", f"/issues/{pr_number}/comments?per_page=50&sort=created&direction=asc"
+        )
+        for c in data or []:
+            if c.get("id", 0) <= after_comment_id or _bot(c.get("user")):
+                continue
+            out.append({
+                "id": c["id"],
+                "author": (c.get("user") or {}).get("login"),
+                "body": c.get("body") or "",
+                "kind": "issue_comment",
+            })
+
+        # 2) Ревью с телом (approve/request changes/comments).
+        data = self._gh_api(
+            "GET", f"/pulls/{pr_number}/reviews?per_page=50"
+        )
+        for r in data or []:
+            if r.get("id", 0) <= after_comment_id or _bot(r.get("user")):
+                continue
+            if not (r.get("body") or "").strip():
+                continue
+            out.append({
+                "id": r["id"],
+                "author": (r.get("user") or {}).get("login"),
+                "body": r.get("body") or "",
+                "kind": f"review:{r.get('state', '').lower()}",
+            })
+
+        # 3) Инлайн-комментарии к строкам кода.
+        data = self._gh_api(
+            "GET", f"/pulls/{pr_number}/comments?per_page=50&sort=created&direction=asc"
+        )
+        for c in data or []:
+            if c.get("id", 0) <= after_comment_id or _bot(c.get("user")):
+                continue
+            out.append({
+                "id": c["id"],
+                "author": (c.get("user") or {}).get("login"),
+                "body": (c.get("body") or "").strip(),
+                "kind": "inline",
+                "path": c.get("path"),
+            })
+        out.sort(key=lambda x: x["id"])
+        return out
+
     def task_to_status(self, task: Task) -> TaskStatus:
         """Вспомогательная маппинг (для будущего использования)."""
         return task.status
