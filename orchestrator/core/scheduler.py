@@ -4169,7 +4169,9 @@ class Scheduler:
         # origin-ветку и делаем пустой коммит поверх.
         git_cmds = (
             ["fetch", "origin", branch],
-            ["reset", "--hard", f"origin/{branch}"],
+            # origin/<branch> может не существовать: клон shallow/одноветочный,
+            # fetch кладёт результат в FETCH_HEAD.
+            ["reset", "--hard", "FETCH_HEAD"],
             ["commit", "--allow-empty", "-m",
              "retrigger CI after cancelled run"],
             ["push", "origin", f"HEAD:{branch}"],
