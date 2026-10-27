@@ -326,6 +326,25 @@ class Scheduler:
             except Exception as exc:
                 logger.error("[notify] telegram send failed: %s", exc)
 
+    async def _notify_summary(self, task: Task, summary: str) -> None:
+        """Финальное саммари агента отдельным сообщением (до ссылок).
+
+        Для GitHub — комментарий в issue; для Telegram — сообщение автору.
+        Заголовок оформляет оркестратор: сам отчёт агента идёт как есть.
+        """
+        text = (
+            "📝 Саммари проделанной работы:\n\n"
+            f"{summary}"
+        )
+        if task.source == TaskSource.GITHUB:
+            num = int(task.source_id)
+            await asyncio.to_thread(
+                self.github_for(task.repo).create_comment, num, text
+            )
+            logger.info("[summary] comment added to issue #%s", num)
+        else:
+            self._notify_author(task, text)
+
     async def _notify_author_with_comment_id(
         self, task: Task, text: str
     ) -> Optional[int]:
@@ -1286,9 +1305,7 @@ class Scheduler:
             await self.telegram.send_message(
                 chat_id_int,
                 "🤖 Доступные команды (или кнопки меню):\n"
-                "📊 Статус — состояние текущей задачи\n"
-                "📋 Задачи — все задачи, результаты и ссылки на PR\n"
-                "📤 Подтолкнуть — продолжить упавшую задачу с этапа коммита/пуша (без перезапуска агента)\n"
+                "📋 Задачи — все задачи, результаты и ссылки на PR; отмена и «подтолкнуть» — кнопками в карточке\n"
                 "🧠 Модель — модель LLM по умолчанию\n"
                 "🗂 Репозитории — какие репозитории опрашиваю на задачи\n"
                 "/repo add|check|del <owner/name> — подключить/проверить/убрать репозиторий (админ)\n"
@@ -1455,6 +1472,14 @@ class Scheduler:
 
     def _task_actions_keyboard(self, task: Task):
         rows: list[list[tuple[str, str]]] = []
+        # Активную задачу можно отменить прямо из карточки.
+        if task.status in (
+            TaskStatus.NEW,
+            TaskStatus.CLARIFYING,
+            TaskStatus.READY,
+            TaskStatus.RUNNING,
+        ):
+            rows.append([("🚫 Отменить", f"cancel:{task.id}")])
         # Висящий вопрос агента: ответить можно прямо отсюда.
         if self._has_pending_question(task.id):
             rows.append([("✍️ Ответить на вопрос", f"qask:{task.id}")])
@@ -1794,6 +1819,29 @@ class Scheduler:
             task = self.state.get(data.split(":", 1)[1])
             text, keyboard = await self._render_status_view(task)
             await self._reply(query, text, keyboard)
+            return
+
+        if data.startswith("cancel:"):
+            task = self.state.get(data.split(":", 1)[1])
+            if task:
+                cqid = query.get("callback_query_id", "")
+                if task.status not in (
+                    TaskStatus.NEW,
+                    TaskStatus.CLARIFYING,
+                    TaskStatus.READY,
+                    TaskStatus.RUNNING,
+                ):
+                    await self.telegram.answer_callback_query(
+                        cqid, "⚠️ Задача уже завершена"
+                    )
+                else:
+                    self._cancel_task(
+                        task, "Отменено пользователем (кнопка в карточке)"
+                    )
+                    await self.telegram.answer_callback_query(
+                        cqid, "🚫 Задача отменена"
+                    )
+                await self._send_task_detail(query, task)
             return
 
         if data.startswith("t:"):
@@ -2407,6 +2455,100 @@ class Scheduler:
             await self._run_openhands_impl(task)
         finally:
             self._running_tasks.discard(task.id)
+            # Runtime-контейнеры без чистки копятся и съедают память хоста:
+            # один контейнер с Gradle/Kotlin daemon — до 6 ГБ. После 18
+            # накопленных контейнеров активной задаче не хватало памяти,
+            # bash-сервер рантайма умирал (exit code -1 на любых командах)
+            # и OpenHands убивал задачу «за зацикливание».
+            # Задача завершена (любым исходом) — контейнер больше не нужен:
+            # правки агента уже синхронизированы на хост, логи — в БД.
+            await self._cleanup_runtime_container(task)
+
+    async def _cleanup_runtime_container(self, task: Task) -> None:
+        """Удалить runtime-контейнер завершённой задачи (best-effort).
+
+        Исключение — задача с PR: контейнер понадобится CI-вотчеру
+        (замкнутый цикл «упавший CI → правки агента → допуш») и циклу
+        ревью; их чистит отдельный путь (_watch_gha_artifacts_loop /
+        _handle_pr_feedback после использования). Здесь чистим задачи
+        без PR — упавшие, убитые, отменённые, «нет изменений».
+        """
+        if not task.conversation_id:
+            return
+        if task.pr_url:
+            return
+        container = f"openhands-runtime-{task.conversation_id}"
+        try:
+            code, _, _ = await self._docker(
+                "rm", "-f", container, timeout=60
+            )
+            if code == 0:
+                logger.info("[cleanup] runtime container %s removed", container)
+                task.add_log("Runtime-контейнер удалён (память хоста)")
+                self.state.save(task)
+        except Exception as exc:  # noqa: BLE001 — чистка не должна падать
+            logger.warning("[cleanup] %s remove failed: %s", container, exc)
+
+    async def _gc_runtime_containers(self) -> None:
+        """Чистка осиротевших ЗАПУЩЕННЫХ runtime-контейнеров (раз в час).
+
+        Память хоста едят только контейнеры в состоянии running (gradle-/
+        kotlin-daemon — до 6 ГБ); остановленные почти бесплатны — только
+        диск. Поэтому GC удаляет исключительно осиротевшие running:
+        остановленные контейнеры PR-задач остаются жить на случай цикла
+        ревью (комментарии могут прийти через дни после снятия маркера
+        вотчера), не-PR убираются сразу в _cleanup_runtime_container.
+        """
+        active_cids = {
+            t.conversation_id
+            for status in (
+                TaskStatus.NEW,
+                TaskStatus.CLARIFYING,
+                TaskStatus.READY,
+                TaskStatus.RUNNING,
+            )
+            for t in self.state.list_by_status(status)
+            if t.conversation_id
+        }
+        code, out, _ = await self._docker(
+            "ps", "--filter", "status=running",
+            "--format", "{{.ID}} {{.Names}}", timeout=30,
+        )
+        if code != 0:
+            return
+        # PR-задачи под живым вотчером защищены всегда (маркер .watch).
+        watchers_dir = Path(self.config.state_db).parent / "gha_watchers"
+        try:
+            watcher_alive = any(watchers_dir.glob("*.watch"))
+        except OSError:
+            watcher_alive = False
+        removed = 0
+        for line in out.splitlines():
+            cid, _, name = line.partition(" ")
+            if not name.startswith("openhands-runtime-"):
+                continue
+            conversation_id = name.removeprefix("openhands-runtime-")
+            if conversation_id in active_cids:
+                continue
+            if watcher_alive and self._task_pr_by_cid(conversation_id):
+                continue  # PR-задача, вотчер жив — контейнер нужен циклу допуша
+            rc, _, err = await self._docker("rm", "-f", cid, timeout=60)
+            if rc == 0:
+                removed += 1
+            else:
+                logger.warning("[gc] rm %s failed: %s", name, err.strip()[:100])
+        if removed:
+            logger.info(
+                "[gc] removed %d orphan running container(s)", removed
+            )
+
+    def _task_pr_by_cid(self, conversation_id: str) -> bool:
+        """Есть ли задача с PR и этим разговором (кандидат под вотчером)."""
+        return any(
+            t.conversation_id == conversation_id and t.pr_url
+            for status in (TaskStatus.DONE,)
+            for t in self.state.list_by_status(status)
+        )
 
     async def _run_openhands_impl(self, task: Task) -> None:
         task.status = TaskStatus.RUNNING
@@ -2997,7 +3139,15 @@ class Scheduler:
                 # навсегда пересылалось автору как «вопрос» — задача зависала,
                 # пока автор не отвечал фейковыми «да» (issue #38).
                 work_events = info.get("work_events") or 0
-                if last_pause_work is not None and work_events > last_pause_work:
+                # Сброс счётчика только при ЗАМЕТНОМ прогрессе (>=5 рабочих
+                # событий с прошлой паузы): агент работает почти непрерывно,
+                # и рост на 1-2 события между частыми паузами обнулял счётчик
+                # каждый раз — авто-продолжения становились бесконечными,
+                # лог спамился «(1/4)» (разбор задачи #46).
+                if (
+                    last_pause_work is not None
+                    and work_events - last_pause_work >= 5
+                ):
                     auto_continues = 0
                 last_pause_work = work_events
                 kind = self._classify_agent_pause(message)
@@ -3005,8 +3155,10 @@ class Scheduler:
                 if kind == "report":
                     # Отчёт о проделанной работе — не вопрос, ждать ответа
                     # не нужно: завершаем задачу штатно (вплоть до PR).
+                    # Саммари сохраняем: уйдёт отдельным сообщением перед
+                    # коротким уведомлением со ссылками.
+                    task.agent_summary = self._strip_tool_markup(message)[:4000]
                     task.status = TaskStatus.DONE
-                    self.state.save(task)
                     task.add_log("OpenHands completed (final report, no question)")
                     self.state.save(task)
                     await self._build_ios_and_create_pr(task, client_dir)
@@ -3189,8 +3341,12 @@ class Scheduler:
                 # Остановка после отчёта агента — штатное завершение
                 # (OpenHands гасит простаивающий разговор).
                 if info.get("completed"):
+                    # Саммари — последний отчёт агента (если ещё не сохранён).
+                    if not task.agent_summary and info.get("message"):
+                        task.agent_summary = self._strip_tool_markup(
+                            str(info["message"])
+                        )[:4000]
                     task.status = TaskStatus.DONE
-                    self.state.save(task)
                     task.add_log("OpenHands completed (conversation stopped after report)")
                     self.state.save(task)
                     await self._build_ios_and_create_pr(task, client_dir)
@@ -3265,10 +3421,24 @@ class Scheduler:
 
     @staticmethod
     def _killed_by_openhands(task: Task) -> bool:
-        """Задача была убита OpenHands (след в логе задачи)."""
+        """Задача была убита OpenHands и НЕ перезапущена после этого.
+
+        След ищем в логе задачи, но с учётом попыток: маркер смерти,
+        найденный ПОСЛЕ последнего «Перезапуск #N», относится к прошлой
+        попытке и статус текущей не описывает (иначе после перезапуска
+        задача навсегда показывалась как 🪓-убитая, хотя жива и работает).
+        """
+        last_restart = -1
+        for i, entry in enumerate(task.log):
+            if "Перезапуск #" in entry:
+                last_restart = i
         return any(
-            "AgentStuckInLoopError" in entry or "OpenHands killed task" in entry
-            for entry in task.log
+            i > last_restart
+            and (
+                "AgentStuckInLoopError" in entry
+                or "OpenHands killed task" in entry
+            )
+            for i, entry in enumerate(task.log)
         )
 
     # Подталкивание агенту, вставшему на паузу без вопроса (объявил намерение
@@ -3691,6 +3861,15 @@ class Scheduler:
         artifacts_section, run_id = await self._gha_artifacts_section(
             task, client_dir, branch
         )
+        # Финальное саммари — отдельным сообщением ДО короткого уведомления
+        # со ссылками: полноценный отчёт «что сделано» в духе ревью, а потом
+        # сухие ссылки. Сбой саммари не валит задачу: уведомление важнее.
+        summary = (task.agent_summary or "").strip()
+        if summary:
+            try:
+                await self._notify_summary(task, summary)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[summary] failed for %s: %s", task.id, exc)
         notify_text = f"✅ Задача выполнена! PR создан: {pr_url}\n"
         notify_text += f"Ветка: `{branch}`\n"
         if assignees:
@@ -4341,12 +4520,21 @@ class Scheduler:
         await self._refresh_prices_and_benchmarks()
         price_refresh_interval = 6 * 3600  # обновлять цены/бенчмарки раз в 6 часов
         last_price_refresh = time.time()
+        last_container_gc = time.time()  # чистка runtime-контейнеров — раз в час
 
         while True:
             try:
                 await self.poll_github()
             except Exception as exc:
                 logger.error("[loop] github poll error: %s", exc)
+
+            # Периодически чистим осиротевшие runtime-контейнеры.
+            if time.time() - last_container_gc > 3600:
+                try:
+                    await self._gc_runtime_containers()
+                except Exception as exc:
+                    logger.error("[loop] container gc error: %s", exc)
+                last_container_gc = time.time()
 
             # Периодически обновляем цены и бенчмарки моделей.
             if time.time() - last_price_refresh > price_refresh_interval:

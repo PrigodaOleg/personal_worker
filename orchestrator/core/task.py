@@ -61,6 +61,9 @@ class Task:
     # (config.github_repo). Поддерживается несколько репозиториев: каждый
     # issue обрабатывается в своём репо (PR, комментарии, артефакты GHA).
     repo: Optional[str] = None
+    # Финальное саммари агента (что сделано) — из его последнего отчёта.
+    # Пишется отдельным сообщением перед коротким уведомлением со ссылками.
+    agent_summary: Optional[str] = None
 
     def add_log(self, message: str) -> None:
         self.log.append(f"[{datetime.utcnow().isoformat()}] {message}")

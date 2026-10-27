@@ -31,9 +31,7 @@ logger = logging.getLogger(__name__)
 # Кнопки постоянного меню (ReplyKeyboardMarkup). Текст кнопки = входящее сообщение,
 # поэтому он же используется для маршрутизации к команде.
 MENU_COMMANDS: dict[str, str] = {
-    "📊 Статус": "/status",
     "📋 Задачи": "/tasks",
-    "📤 Подтолкнуть": "/nudge",
     "🧠 Модель": "/model",
     "🗂 Репозитории": "/repos",
     "🚫 Отмена": "/cancel",
