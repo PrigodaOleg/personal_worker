@@ -511,6 +511,20 @@ class Scheduler:
             TaskStatus.CANCELLED: "отменена",
         }.get(status, "—")
 
+    def _display_status(self, task: Task) -> tuple[str, str]:
+        """Парой (эмодзи, подпись) — с учётом хвоста CI-проверки PR.
+
+        Формально задача уже done, но GHA-вотчер ещё жив (цикл
+        автоисправления, дописывание ссылок на артефакты): «зелёное» ✅
+        сбивает с толку — сборка PR может быть красной (PR #53/#54).
+        """
+        if task.ci_pending and task.status is TaskStatus.DONE:
+            return ("⏳", "CI-проверка PR")
+        return (
+            self._task_status_emoji(task.status),
+            self._task_status_label(task.status),
+        )
+
     # ------------------------------------------------------------------ #
     # Модели LLM
     # ------------------------------------------------------------------ #
@@ -1059,6 +1073,18 @@ class Scheduler:
     # ------------------------------------------------------------------ #
     # Приём задач из Telegram
     # ------------------------------------------------------------------ #
+    # Кнопки, ранее жившие в меню: клиенты с неперезапущенной клавиатурой
+    # всё ещё присылают их текст — это НЕ задачи.
+    _RETIRED_MENU_BUTTONS: dict[str, str] = {
+        "📊 Статус": (
+            " Статус и логи — кнопками в карточке задачи: /tasks → задача → "
+            "«🔄 Обновить» / «📖 Логи»."
+        ),
+        "📤 Подтолкнуть": (
+            " «Подтолкнуть» — кнопкой в карточке упавшей задачи: /tasks → задача."
+        ),
+    }
+
     async def _on_telegram_message(self, msg: dict) -> None:
         text = msg.get("text", "").strip()
         if not text:
@@ -1069,6 +1095,22 @@ class Scheduler:
         mapped = MENU_COMMANDS.get(text)
         if mapped:
             text = mapped
+        else:
+            # Устаревшая кнопка из СТАРОЙ клавиатуры клиента (клавиатура
+            # обновляется только после /start, а текст кнопки приходит
+            # обычным сообщением): раньше такие тексты создавали задачи-
+            # мусор («📊 Статус», «📤 Подтолкнуть» — реальные случаи).
+            # Вместо задачи — подсказка и обновление клавиатуры.
+            if text in self._RETIRED_MENU_BUTTONS:
+                await self.telegram.send_message(
+                    int(chat_id),
+                    f"ℹ️ Кнопка «{text}» устарела и удалена из меню."
+                    f"{self._RETIRED_MENU_BUTTONS[text]}\n\n"
+                    "Клавиатура обновлена — нажмите /start, если внизу "
+                    "остались старые кнопки.",
+                    keyboard=self.telegram.build_menu_keyboard(),
+                )
+                return
 
         # Команды бота — обрабатываем синхронно, не блокируем
         if text.startswith("/"):
@@ -1136,7 +1178,7 @@ class Scheduler:
         # (задачи выполняются строго по одной — слабое железо).
         active = self._get_active_task_for_chat(chat_id)
         if active:
-            emoji = self._task_status_emoji(active.status)
+            emoji, _ = self._display_status(active)
             progress = "\n".join(active.log[-3:]) if active.log else ""
             await self.telegram.send_message(
                 int(chat_id),
@@ -1484,7 +1526,7 @@ class Scheduler:
         if self._has_pending_question(task.id):
             rows.append([("✍️ Ответить на вопрос", f"qask:{task.id}")])
         # Упавшая после работы агента задача: подтолкнуть дешевле, чем перезапускать.
-        if self._can_nudge_finalization(task):
+        if self._can_nudge_finalization(task) or self._can_resume_ci(task):
             rows.append([("📤 Подтолкнуть", f"nudge:{task.id}")])
         rows += [
             [("🔄 Обновить", f"refresh:{task.id}")],
@@ -1507,7 +1549,7 @@ class Scheduler:
         """
         if not task:
             return "🆕 У вас нет задач. Напишите задачу — и я начну.", None
-        emoji = self._task_status_emoji(task.status)
+        emoji, status_label = self._display_status(task)
         if self._killed_by_openhands(task):
             emoji = "🪓"
         layers = await self._layer_status_block(task)
@@ -1529,7 +1571,7 @@ class Scheduler:
         )
         text = (
             f"{emoji} Задача: «{task.title[:60]}»\n"
-            f"Статус: {self._task_status_label(task.status)}\n"
+            f"Статус: {status_label}\n"
             f"Модель: {self._effective_model(task)}\n"
             f"Стоимость: {self._cost_line(task)}\n"
             f"PR: {task.pr_url or '—'}\n\n"
@@ -1540,7 +1582,7 @@ class Scheduler:
         return text, self._task_actions_keyboard(task)
 
     def _task_card(self, task: Task) -> str:
-        emoji = self._task_status_emoji(task.status)
+        emoji, status_label = self._display_status(task)
         if self._killed_by_openhands(task):
             emoji = "🪓"
         elif self._has_pending_question(task.id):
@@ -1558,7 +1600,7 @@ class Scheduler:
             f"{emoji} {task.title[:70]}\n"
             f"ID: {task.id}\n"
             f"Источник: {self._source_tag(task)} {src}\n"
-            f"Статус: {self._task_status_label(task.status)}\n"
+            f"Статус: {status_label}\n"
             f"Модель: {model}\n"
             f"Попытка: {task.attempt}\n"
             f"Стоимость: {self._cost_line(task)}\n"
@@ -1591,7 +1633,7 @@ class Scheduler:
 
         lines = [f"📋 Задачи ({len(tasks)}), стр. {page + 1}/{pages}:\n"]
         for t in chunk:
-            emoji = self._task_status_emoji(t.status)
+            emoji, _ = self._display_status(t)
             if self._killed_by_openhands(t):
                 emoji = "🪓"
             elif self._has_pending_question(t.id):
@@ -1604,7 +1646,7 @@ class Scheduler:
         for i in range(0, len(chunk), 2):
             row = []
             for t in chunk[i:i + 2]:
-                emoji = self._task_status_emoji(t.status)
+                emoji, _ = self._display_status(t)
                 row.append((f"{emoji} {t.title[:24]}", f"t:{t.id}"))
             rows.append(row)
 
@@ -1653,6 +1695,21 @@ class Scheduler:
             return False
         log_text = "\n".join(task.log)
         return any(marker in log_text for marker in cls._FINALIZE_FAILURE_MARKERS)
+
+    def _can_resume_ci(self, task: Task) -> bool:
+        """Задача с PR, у которой CI-хвост можно возобновить.
+
+        Сценарий: PR создан, но сборка красная, лимит раундов автоисправления
+        исчерпан — задача «зависла» (PR #53/#54). «Подтолкнуть» здесь отправит
+        логи упавшего прогона агенту и запустит GHA-вотчер заново.
+        """
+        if not task.pr_url or "github.com" not in task.pr_url:
+            return False
+        if task.status not in (TaskStatus.FAILED, TaskStatus.DONE):
+            return False
+        if not task.conversation_id:
+            return False
+        return not task.ci_pending
 
     def _start_nudge(self, task: Task) -> None:
         """Включить режим подталкивания: финализация без перезапуска агента.
@@ -1870,9 +1927,16 @@ class Scheduler:
             task = self.state.get(data.split(":", 1)[1])
             if task:
                 cqid = query.get("callback_query_id", "")
-                if task.status == TaskStatus.RUNNING:
+                if task.status == TaskStatus.RUNNING and not task.finalize_only:
                     await self.telegram.answer_callback_query(
                         cqid, "⚠️ Задача уже выполняется")
+                elif self._can_resume_ci(task):
+                    # Задача с красным PR: «подтолкнуть» = возобновить цикл
+                    # CI-автоисправления (логи → агент → допуш → новый прогон).
+                    await self.telegram.answer_callback_query(
+                        cqid, "📤 Возобновляю CI-цикл: логи → агенту")
+                    self._spawn(self._resume_ci_and_report(task))
+                    await self._send_task_detail(query, task)
                 elif self._get_any_active_task(exclude_id=task.id):
                     await self.telegram.answer_callback_query(
                         cqid, "⚠️ Занята другая задача — дождитесь")
@@ -3958,11 +4022,189 @@ class Scheduler:
             notify_text += f"\n{artifacts_section}"
         comment_id = await self._notify_author_with_comment_id(task, notify_text)
         if run_id and comment_id:
+            # CI-хвост: вотчер жив (артефакты/автофикс/ревью) — задача не
+            # «зелёная», пока хвост не закончится (PR #53/#54).
+            task.ci_pending = True
+            self.state.save(task)
             self._spawn(
                 self._watch_gha_artifacts(
                     task, comment_id, notify_text, run_id, client_dir, branch
                 )
             )
+
+    # ------------------------------------------------------------------ #
+    # Ручной перезапуск CI-цикла для задачи с красным PR
+    # ------------------------------------------------------------------ #
+    async def _resume_ci_and_report(self, task: Task) -> None:
+        """«Подтолкнуть» для задачи с красным PR: возобновить CI-цикл.
+
+        Результат операции уходит автору задачи (и админу при сбое).
+        """
+        try:
+            result = await self._resume_ci_loop(task)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("[nudge] resume CI failed for %s: %s", task.id, exc)
+            result = f"❌ Возобновить CI-цикл не удалось: {exc}"
+        self._notify_author(task, result)
+        if result.startswith("❌") and task.source == TaskSource.GITHUB:
+            self._notify_admin(f"📤 Подталкивание задачи {self._repo_full(task)}"
+                               f"#{task.source_id}: {result}")
+
+    async def _resume_ci_loop(self, task: Task) -> str:
+        """Возобновить цикл автоисправления CI у done/failed задачи.
+
+        Сценарий: лимит раундов исчерпан, PR остался красным (PR #53/#54) —
+        задача «зависла». Команда отправляет логи последнего упавшего прогона
+        агенту и заново запускает GHA-вотчер. Возвращает текст для чата.
+        """
+        if not task.pr_url or "github.com" not in (task.pr_url or ""):
+            return "❌ У задачи нет PR на GitHub — возобновлять CI-цикл нечего."
+        conversation_id = task.conversation_id
+        if not conversation_id:
+            return "❌ Разговор агента не сохранился — нужен перезапуск задачи."
+
+        gh = self.github_for(task.repo)
+        try:
+            branch = await asyncio.to_thread(gh.fetch_pr_head_branch, task.pr_url)
+        except Exception as exc:  # noqa: BLE001
+            return f"❌ Не удалось определить ветку PR: {exc}"
+        if not branch:
+            return "❌ PR не найден (влит или закрыт?) — цикл не возобновить."
+
+        run = await self._find_latest_ci_run(task, branch)
+        if not run:
+            return (
+                f"❌ Для ветки `{branch}` не найден запуск CI — нечего "
+                "отправлять агенту."
+            )
+        run_id, conclusion = run["id"], run.get("conclusion")
+        if conclusion == "success":
+            return (
+                f"✅ Последний прогон CI уже зелёный:\n{run.get('html_url')}\n"
+                "Цикл не запускал."
+            )
+
+        run_url = run.get("html_url") or (
+            f"https://github.com/{self._repo_full(task)}/actions/runs/{run_id}"
+        )
+        if conclusion == "cancelled":
+            # Прогон отменён (рестарт/деплой), а исправления агента уже в
+            # ветке — логи слать некому/нечего. Просто перезапускаем сборку:
+            # пустой коммит → новый прогон, вотчер следит за ним.
+            new_run = await self._retrigger_ci(task, branch, run_url)
+            if not new_run:
+                return (
+                    "❌ Не удалось перезапустить сборку (пустой коммит не "
+                    f"создал новый прогон). Проверь ветку `{branch}` вручную."
+                )
+            task.add_log(
+                f"CI-цикл возобновлён кнопкой «Подтолкнуть»: прогон был "
+                f"отменён, запущен новый {new_run.get('html_url')}"
+            )
+            task.ci_pending = True
+            self.state.save(task)
+            client_dir = os.path.join(self._ensure_workspace(task), "social_mind")
+            self._spawn(self._watch_gha_artifacts(
+                task,
+                comment_id=gh.last_bot_comment_id(int(task.source_id)) or 0,
+                comment_body="",
+                run_id=new_run["id"],
+                client_dir=client_dir,
+                branch=branch,
+            ))
+            return (
+                f"🔄 Прогон был отменён (рестарт/деплой) — перезапустил сборку: "
+                f"{new_run.get('html_url')}"
+            )
+        sent = await self._send_ci_failure_to_agent(task, run_id)
+        if not sent:
+            return (
+                "❌ Логи падения агенту доставить не удалось "
+                "(разговор закрыт?). Перезапусти задачу."
+            )
+        task.add_log(f"CI-цикл возобновлён кнопкой «Подтолкнуть» ({conclusion}): {run_url}")
+        task.ci_pending = True
+        self.state.save(task)
+        client_dir = os.path.join(self._ensure_workspace(task), "social_mind")
+        self._spawn(self._watch_gha_artifacts(
+            task,
+            comment_id=gh.last_bot_comment_id(int(task.source_id)) or 0,
+            comment_body="",
+            run_id=run_id,
+            client_dir=client_dir,
+            branch=branch,
+        ))
+        return (
+            f"🔄 CI-цикл возобновлён: логи прогона ({conclusion}) отправлены "
+            f"агенту, жду исправление и новый прогон.\n{run_url}"
+        )
+
+    async def _retrigger_ci(
+        self, task: Task, branch: str, prev_run_url: str
+    ) -> Optional[dict]:
+        """Перезапустить CI у ветки с уже исправленным кодом.
+
+        Прогон был отменён (рестарт/деплой), а правки агента уже запушены —
+        пересылать логи агенту нечего. Пустой коммит в ветку триггерит новый
+        прогон; возвращаем dict нового запуска или None.
+        """
+        client_dir = os.path.join(self._ensure_workspace(task), "social_mind")
+        git_cmds = (
+            ["commit", "--allow-empty", "-m",
+             "retrigger CI after cancelled run"],
+            ["push", "origin", f"HEAD:{branch}"],
+        )
+        try:
+            for git_cmd in git_cmds:
+                proc = await asyncio.create_subprocess_exec(
+                    "git", "-C", client_dir,
+                    *self._git_auth_args(task.repo), *git_cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                _, err = await asyncio.wait_for(proc.communicate(), timeout=300)
+                if proc.returncode != 0:
+                    raise RuntimeError(
+                        f"git {' '.join(git_cmd)}: "
+                        + err.decode("utf-8", errors="replace").strip()
+                    )
+        except Exception as exc:  # noqa: BLE001
+            logger.error("[nudge] retrigger push failed: %s", exc)
+            return None
+        sha = await self._git_head_sha(client_dir)
+        if not sha:
+            return None
+        try:
+            return await asyncio.to_thread(
+                self.github_for(task.repo).find_workflow_run, sha, 40, 8.0
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[nudge] find retriggered run failed: %s", exc)
+            return None
+
+    async def _find_latest_ci_run(
+        self, task: Task, branch: str
+    ) -> Optional[dict]:
+        """Последний запуск CI для ветки PR (github adapter)."""
+        gh = self.github_for(task.repo)
+
+        def _fetch() -> Optional[dict]:
+            data = gh._gh_api(
+                "GET", f"/actions/runs?branch={branch}&per_page=5"
+            )
+            for r in data.get("workflow_runs") or []:
+                return {
+                    "id": r["id"],
+                    "html_url": r.get("html_url"),
+                    "conclusion": r.get("conclusion"),
+                }
+            return None
+
+        try:
+            return await asyncio.to_thread(_fetch)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[gha] list runs for %s failed: %s", branch, exc)
+            return None
 
     # ------------------------------------------------------------------ #
     # Артефакты GitHub Actions в финальном уведомлении
@@ -4144,12 +4386,18 @@ class Scheduler:
             marker.touch()
         except OSError:
             logger.warning("[gha] не удалось создать маркер %s", marker)
+        task.ci_pending = True
+        self.state.save(task)
         try:
             await self._watch_gha_artifacts_loop(
                 task, comment_id, comment_body, run_id, client_dir, branch
             )
         finally:
             marker.unlink(missing_ok=True)
+            # Хвост закончен (успех / лимит раундов / таймаут) — статус
+            # задачи снова честный: ✅/❌ по итогу последнего прогона.
+            task.ci_pending = False
+            self.state.save(task)
 
     async def _watch_gha_artifacts_loop(
         self, task: Task, comment_id: int, comment_body: str, run_id: int,
@@ -4224,6 +4472,10 @@ class Scheduler:
                     f"GHA-сборка провалилась ({conclusion}) — лимит раундов "
                     f"исправлений ({self.max_ci_fix_rounds}) исчерпан"
                 )
+                # Работа агента сделана и PR создан, но сборка красная:
+                # честный статус — failed (иначе задача выглядит зелёной,
+                # хотя «хвост» провален, PR #53/#54).
+                task.status = TaskStatus.FAILED
                 self.state.save(task)
                 self._notify_author(
                     task,

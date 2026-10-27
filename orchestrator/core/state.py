@@ -63,6 +63,11 @@ class StateStore:
         if "agent_summary" not in existing:
             # Финальное саммари агента (последний kind="report" при паузе).
             self._conn.execute("ALTER TABLE tasks ADD COLUMN agent_summary TEXT")
+        if "ci_pending" not in existing:
+            # CI-проверка PR в процессе (GHA-вотчер жив).
+            self._conn.execute(
+                "ALTER TABLE tasks ADD COLUMN ci_pending INTEGER NOT NULL DEFAULT 0"
+            )
         # Ключ-значение для настроек UI (например, модель по умолчанию).
         self._conn.execute(
             "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)"
@@ -169,8 +174,8 @@ class StateStore:
              clarification_question, clarification_answer, created_at, pr_url, log,
              conversation_id, model, attempt, tokens_prompt, tokens_completion,
              tokens_cache_read, cost_rub, ui_message_id, finalize_only, repo,
-             agent_summary)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             agent_summary, ci_pending)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 task.id,
@@ -195,6 +200,7 @@ class StateStore:
                 int(task.finalize_only),
                 task.repo,
                 task.agent_summary,
+                int(task.ci_pending),
             ),
         )
         self._conn.commit()
@@ -273,6 +279,7 @@ class StateStore:
             finalize_only=bool(_num("finalize_only")),
             repo=row["repo"],
             agent_summary=row["agent_summary"],
+            ci_pending=bool(_num("ci_pending")),
         )
 
     def close(self) -> None:
