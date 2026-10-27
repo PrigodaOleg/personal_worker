@@ -99,7 +99,7 @@ class Scheduler:
         )
         # CI-автоисправление: сколько раундов «логи → агент → допуш»
         # разрешено после провала GHA-сборки.
-        self.max_ci_fix_rounds: int = int(os.getenv("GHA_FIX_MAX_ROUNDS", "2"))
+        self.max_ci_fix_rounds: int = int(os.getenv("GHA_FIX_MAX_ROUNDS", "10"))
         # Сколько секунд ждать нового прогона CI после допуша агента.
         self.ci_new_run_wait_seconds: int = int(
             os.getenv("GHA_NEW_RUN_WAIT_SECONDS", "1800")
