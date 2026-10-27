@@ -541,9 +541,14 @@ def _running_state() -> dict:
 
 def test_monitor_resets_auto_continues_when_agent_works():
     """Агент сообщает промежуточный статус и РЕАЛЬНО работает между паузами
-    (растут рабочие события) — задача не должна зависнуть на вопросах автору:
+    (исполняет команды) — задача не должна зависнуть на вопросах автору:
     счётчик авто-продолжений сбрасывается, каждый статус — просто
-    подталкивание (регресс issue #38: бесконечные «да» от автора)."""
+    подталкивание (регресс issue #38: бесконечные «да» от автора).
+
+    Прогресс = рост исполненных команд (get_events), НЕ work_events:
+    OpenHands обнуляет work_events при каждом запуске агента, из-за чего
+    сброс срабатывал в каждом цикле и подталкивания становились бесконечными
+    (разбор задачи #46, attempt 3)."""
 
     async def scenario():
         s = _monitor_scheduler([
@@ -571,6 +576,15 @@ def test_monitor_resets_auto_continues_when_agent_works():
             return await orig_get_state(conversation_id)
 
         s.openhands.get_agent_state = counting_get_state
+
+        # Исполненные команды копятся: после каждой паузы их больше.
+        async def growing_events(conversation_id, limit=100):
+            return [
+                {"action": "run", "message": "Running command: ls"}
+                for _ in range(s.openhands.counter)
+            ]
+
+        s.openhands.get_events = growing_events
 
         await asyncio.wait_for(
             s._monitor_openhands(task, "conv1", "/tmp/client"), timeout=2
