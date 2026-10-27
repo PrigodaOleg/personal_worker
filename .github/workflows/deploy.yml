@@ -55,6 +55,37 @@ jobs:
           systemctl cat personal_worker >/dev/null 2>&1 \
             || { echo "❌ systemd-сервис personal_worker не найден"; exit 1; }
 
+      - name: Swap — 16G + swappiness=10 (страховка от OOM)
+        run: |
+          set -euo pipefail
+          # Пики gradle+kotlin-daemon+qemu внутри runtime-контейнера съедают
+          # до 6 ГБ поверх ~7 ГБ базовой нагрузки на машине с 15 ГБ RAM:
+          # без swap ядро убивало bash-сервер рантайма (exit -1 на любых
+          # командах), OpenHands признавал это «зацикливанием» и убивал
+          # задачу. Swap даёт ядру запас на пики; swappiness=10 — в swap
+          # уходим только под реальным давлением.
+          if ! swapon --show=NAME --noheadings | grep -q "^/swapfile$"; then
+            if [ ! -f /swapfile ]; then
+              sudo fallocate -l 16G /swapfile \
+                || sudo dd if=/dev/zero of=/swapfile bs=1M count=16384 status=none
+              sudo chmod 600 /swapfile
+              sudo mkswap -q /swapfile
+            fi
+            sudo swapon /swapfile
+            echo "swap 16G включён"
+          else
+            echo "swap уже включён: $(swapon --show=NAME --noheadings | tr '\n' ' ')"
+          fi
+          # Постоянство: строка в fstab (idempotent).
+          grep -q "^/swapfile" /etc/fstab \
+            || echo "/swapfile none swap sw 0 0" | sudo tee -a /etc/fstab >/dev/null
+          # Умеренная swappiness, переживает перезагрузку.
+          sudo sysctl -q -w vm.swappiness=10
+          grep -q "vm.swappiness" /etc/sysctl.d/99-personal-worker.conf 2>/dev/null \
+            || echo "vm.swappiness=10" \
+              | sudo tee /etc/sysctl.d/99-personal-worker.conf >/dev/null
+          free -h | sed -n '1,3p'
+
       - name: Wait for idle — задачи и GHA-хвосты
         run: |
           set -euo pipefail

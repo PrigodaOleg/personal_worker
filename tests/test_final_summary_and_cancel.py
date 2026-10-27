@@ -210,7 +210,9 @@ def test_cleanup_skipped_for_pr_tasks():
     t2 = make_task(TaskStatus.FAILED)
     t2.pr_url = None
     asyncio.run(s._cleanup_runtime_container(t2))
-    assert removed and "rm" in removed[0]
+    assert any(c[0] == "rm" for c in removed), (
+        "контейнер задачи без PR удаляется (после сбора логов)"
+    )
 
 
 def test_gc_removes_only_running_containers():
@@ -247,4 +249,28 @@ def test_gc_removes_only_running_containers():
     asyncio.run(s._gc_runtime_containers())
     assert removed == ["id-running-1"], (
         "GC должен удалить только запущенный осиротевший контейнер"
+    )
+
+
+def test_cleanup_collects_container_logs_before_removal():
+    """Перед удалением контейнера хвосты /tmp/*.log уходят в лог задачи:
+    после rm диагностировать падение не по чему (разбор смерти #46/4)."""
+    s, _, _ = make_scheduler()
+    calls: list[tuple] = []
+
+    async def fake_docker(*args, **kw):
+        cmd = args
+        calls.append(cmd)
+        if cmd[0] == "exec":
+            return (0, "=== /tmp/android_e2e.log ===\nERROR: emulator boot failed", "")
+        return (0, "", "")
+
+    s._docker = fake_docker
+    t = make_task(TaskStatus.FAILED)
+    t.pr_url = None
+    asyncio.run(s._cleanup_runtime_container(t))
+    assert any(c[0] == "start" for c in calls), "остановленный контейнер надо поднять для чтения логов"
+    assert any(c[0] == "rm" for c in calls), "контейнер удаляется после сбора логов"
+    assert any("emulator boot failed" in e for e in t.log), (
+        "хвосты логов контейнера должны попасть в task.log"
     )
