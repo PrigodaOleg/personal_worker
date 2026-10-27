@@ -1,9 +1,9 @@
-"""Команда /ci: возобновление CI-автофикса у задачи с красным PR.
+"""Кнопка «Подтолкнуть» для задачи с красным PR: возобновление CI-автофикса.
 
 Пользовательская проблема (PR #53/#54): лимит раундов автоисправления
 исчерпан — PR остался красным, задача «зависла» в done без шансов на
-починку. /ci <task_id> отправляет логи последнего упавшего прогона агенту
-и перезапускает GHA-вотчер.
+починку. Кнопка «📤 Подтолкнуть» в карточке отправляет логи последнего
+упавшего прогона агенту и перезапускает GHA-вотчер.
 """
 
 from __future__ import annotations
@@ -15,14 +15,14 @@ from orchestrator.core.scheduler import Scheduler
 from orchestrator.core.task import Task, TaskSource, TaskStatus
 
 
-def make_task() -> Task:
+def make_task(status=TaskStatus.DONE) -> Task:
     return Task(
         id="tk-ci",
         source=TaskSource.GITHUB,
         source_id="54",
         title="e2e на ios",
         description="",
-        status=TaskStatus.DONE,
+        status=status,
         pr_url="https://github.com/o/r/pull/54",
         conversation_id="conv-1",
     )
@@ -32,6 +32,26 @@ def _coro(result):
     async def _fn(*args, **kwargs):
         return result
     return _fn
+
+
+def test_can_resume_ci():
+    s = object.__new__(Scheduler)
+    t = make_task()
+    assert s._can_resume_ci(t)
+    # ci_pending — вотчер уже жив, кнопка не нужна
+    t.ci_pending = True
+    assert not s._can_resume_ci(t)
+    t.ci_pending = False
+    # без PR / без разговора — нельзя
+    t.pr_url = None
+    assert not s._can_resume_ci(t)
+    t.pr_url = "https://github.com/o/r/pull/54"
+    t.conversation_id = None
+    assert not s._can_resume_ci(t)
+    # выполняющаяся задача — не для этой кнопки
+    t.conversation_id = "conv-1"
+    t.status = TaskStatus.RUNNING
+    assert not s._can_resume_ci(t)
 
 
 def test_resume_skips_without_pr():
@@ -92,3 +112,28 @@ def test_resume_spawns_watcher_on_failure():
     assert locs["branch"] == "ai-task-tk-ci-r1"
     assert locs["comment_id"] == 77
     spawned[0].close()
+
+
+def test_resume_and_report_notifies_author():
+    """Результат возобновления уходит автору задачи."""
+    s = object.__new__(Scheduler)
+    s._resume_ci_loop = _coro("🔄 CI-цикл возобновлён")  # type: ignore
+    notified: list = []
+    s._notify_author = lambda task, text: notified.append(text)  # type: ignore
+    s._notify_admin = lambda text: None  # type: ignore
+    s._repo_full = lambda task: "o/r"
+    t = make_task()
+    asyncio.run(s._resume_ci_and_report(t))
+    assert notified == ["🔄 CI-цикл возобновлён"]
+
+
+def test_keyboard_shows_nudge_for_red_pr_task():
+    """У задачи с PR и красным CI есть кнопка «📤 Подтолкнуть»."""
+    s = object.__new__(Scheduler)
+    s._pending_agent_questions = {}
+    s._killed_by_openhands = lambda task: False
+    s.telegram = types.SimpleNamespace(build_keyboard=lambda rows: rows)
+    t = make_task()
+    kb = s._task_actions_keyboard(t)
+    texts = [btn[0] for row in kb for btn in row]
+    assert "📤 Подтолкнуть" in texts

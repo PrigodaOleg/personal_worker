@@ -1351,7 +1351,6 @@ class Scheduler:
                 "🧠 Модель — модель LLM по умолчанию\n"
                 "🗂 Репозитории — какие репозитории опрашиваю на задачи\n"
                 "/repo add|check|del <owner/name> — подключить/проверить/убрать репозиторий (админ)\n"
-                "/ci <task_id> — возобновить CI-автофикс у задачи с красным PR (админ)\n"
                 "🚫 Отмена — отменить текущую задачу\n"
                 "❓ Помощь — эта справка\n"
                 "\nПросто напишите задачу в свободной форме — и я начну её выполнять.",
@@ -1400,35 +1399,6 @@ class Scheduler:
 
         if cmd in ("/repo", "/repo_add", "/repo_check", "/repo_del"):
             await self._handle_repo_command(chat_id_int, cmd, parts, username)
-            return
-
-        if cmd == "/ci":
-            # /ci <task_id|issue#> — возобновить CI-автофикс у задачи с PR
-            # (лимит раундов исчерпан, PR остался красным).
-            if not self._is_admin(username):
-                await self.telegram.send_message(
-                    chat_id_int, "⛔ Команда доступна только админу."
-                )
-                return
-            key = (parts[1] if len(parts) > 1 else "").lstrip("#")
-            task = self.state.get(key) if key else None
-            if not task and key.isdigit():
-                for t in self.state.list_recent(limit=100):
-                    if t.source_id == key:
-                        task = t
-                        break
-            if not task:
-                await self.telegram.send_message(
-                    chat_id_int,
-                    "❓ Задача не найдена. Укажи ID задачи (или номер issue): "
-                    "/ci <task_id>.",
-                )
-                return
-            await self.telegram.send_message(
-                chat_id_int, f"⏳ Возобновляю CI-цикл задачи {task.id}…"
-            )
-            result = await self._resume_ci_loop(task)
-            await self.telegram.send_message(chat_id_int, result)
             return
 
         await self.telegram.send_message(
@@ -1556,7 +1526,7 @@ class Scheduler:
         if self._has_pending_question(task.id):
             rows.append([("✍️ Ответить на вопрос", f"qask:{task.id}")])
         # Упавшая после работы агента задача: подтолкнуть дешевле, чем перезапускать.
-        if self._can_nudge_finalization(task):
+        if self._can_nudge_finalization(task) or self._can_resume_ci(task):
             rows.append([("📤 Подтолкнуть", f"nudge:{task.id}")])
         rows += [
             [("🔄 Обновить", f"refresh:{task.id}")],
@@ -1725,6 +1695,21 @@ class Scheduler:
             return False
         log_text = "\n".join(task.log)
         return any(marker in log_text for marker in cls._FINALIZE_FAILURE_MARKERS)
+
+    def _can_resume_ci(self, task: Task) -> bool:
+        """Задача с PR, у которой CI-хвост можно возобновить.
+
+        Сценарий: PR создан, но сборка красная, лимит раундов автоисправления
+        исчерпан — задача «зависла» (PR #53/#54). «Подтолкнуть» здесь отправит
+        логи упавшего прогона агенту и запустит GHA-вотчер заново.
+        """
+        if not task.pr_url or "github.com" not in task.pr_url:
+            return False
+        if task.status not in (TaskStatus.FAILED, TaskStatus.DONE):
+            return False
+        if not task.conversation_id:
+            return False
+        return not task.ci_pending
 
     def _start_nudge(self, task: Task) -> None:
         """Включить режим подталкивания: финализация без перезапуска агента.
@@ -1942,9 +1927,16 @@ class Scheduler:
             task = self.state.get(data.split(":", 1)[1])
             if task:
                 cqid = query.get("callback_query_id", "")
-                if task.status == TaskStatus.RUNNING:
+                if task.status == TaskStatus.RUNNING and not task.finalize_only:
                     await self.telegram.answer_callback_query(
                         cqid, "⚠️ Задача уже выполняется")
+                elif self._can_resume_ci(task):
+                    # Задача с красным PR: «подтолкнуть» = возобновить цикл
+                    # CI-автоисправления (логи → агент → допуш → новый прогон).
+                    await self.telegram.answer_callback_query(
+                        cqid, "📤 Возобновляю CI-цикл: логи → агенту")
+                    self._spawn(self._resume_ci_and_report(task))
+                    await self._send_task_detail(query, task)
                 elif self._get_any_active_task(exclude_id=task.id):
                     await self.telegram.answer_callback_query(
                         cqid, "⚠️ Занята другая задача — дождитесь")
@@ -4043,6 +4035,21 @@ class Scheduler:
     # ------------------------------------------------------------------ #
     # Ручной перезапуск CI-цикла для задачи с красным PR
     # ------------------------------------------------------------------ #
+    async def _resume_ci_and_report(self, task: Task) -> None:
+        """«Подтолкнуть» для задачи с красным PR: возобновить CI-цикл.
+
+        Результат операции уходит автору задачи (и админу при сбое).
+        """
+        try:
+            result = await self._resume_ci_loop(task)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("[nudge] resume CI failed for %s: %s", task.id, exc)
+            result = f"❌ Возобновить CI-цикл не удалось: {exc}"
+        self._notify_author(task, result)
+        if result.startswith("❌") and task.source == TaskSource.GITHUB:
+            self._notify_admin(f"📤 Подталкивание задачи {self._repo_full(task)}"
+                               f"#{task.source_id}: {result}")
+
     async def _resume_ci_loop(self, task: Task) -> str:
         """Возобновить цикл автоисправления CI у done/failed задачи.
 
@@ -4086,7 +4093,7 @@ class Scheduler:
                 "❌ Логи падения агенту доставить не удалось "
                 "(разговор закрыт?). Перезапусти задачу."
             )
-        task.add_log(f"CI-цикл возобновлён командой /ci ({conclusion}): {run_url}")
+        task.add_log(f"CI-цикл возобновлён кнопкой «Подтолкнуть» ({conclusion}): {run_url}")
         task.ci_pending = True
         self.state.save(task)
         client_dir = os.path.join(self._ensure_workspace(task), "social_mind")
