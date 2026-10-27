@@ -2992,10 +2992,13 @@ class Scheduler:
         # агента за зацикливание (AgentStuckInLoopError): один ретрай —
         # свежий старт того же разговора, обычно модель не повторяет цикл.
         stuck_retries = 0
-        # «Рабочие» события траектории на момент последней паузы агента.
-        # Рост этого числа между паузами = агент реально работал (команды,
-        # правки) — значит это нормальный рабочий ритм, а не зацикливание.
-        last_pause_work: Optional[int] = None
+        # Исполненные команды на момент последней паузы — реальный прогресс
+        # для сброса счётчика авто-продолжений (work_events OpenHands
+        # обнуляет при каждом запуске агента и прогрессу не соответствует).
+        last_pause_cmds: Optional[int] = None
+        # Подряд идущие паузы с сырым вызовом инструмента текстом
+        # (<function=...>) — признак сломанного tool-calling у провайдера.
+        raw_tool_pauses = 0
         # Build-секреты: повторяем установку, пока OpenHands не склонировал
         # репозиторий в /workspace (покрывает и старт, и recovery).
         secrets_done = not self._has_build_secrets()
@@ -3138,18 +3141,60 @@ class Scheduler:
                 # промежуточное сообщение агента («теперь пишу тест…»)
                 # навсегда пересылалось автору как «вопрос» — задача зависала,
                 # пока автор не отвечал фейковыми «да» (issue #38).
-                work_events = info.get("work_events") or 0
-                # Сброс счётчика только при ЗАМЕТНОМ прогрессе (>=5 рабочих
-                # событий с прошлой паузы): агент работает почти непрерывно,
-                # и рост на 1-2 события между частыми паузами обнулял счётчик
-                # каждый раз — авто-продолжения становились бесконечными,
-                # лог спамился «(1/4)» (разбор задачи #46).
-                if (
-                    last_pause_work is not None
-                    and work_events - last_pause_work >= 5
-                ):
+                # Прогресс = рост РЕАЛЬНО исполненных команд с прошлой паузы
+                # (get_events), а не work_events: OpenHands обнуляет
+                # work_events при каждом запуске агента, поэтому сброс
+                # срабатывал в каждом цикле «пауза → подталкивание» и
+                # авто-продолжения становились бесконечными — лог спамился
+                # «(1/4)» (разбор задачи #46, attempt 3).
+                try:
+                    pause_events = await self.openhands.get_events(
+                        conversation_id
+                    )
+                except Exception:  # noqa: BLE001 — события недоступны, не падаем
+                    pause_events = []
+                cmd_count = sum(
+                    1
+                    for e in pause_events or []
+                    if isinstance(e, dict) and e.get("action") == "run"
+                )
+                if last_pause_cmds is not None and cmd_count > last_pause_cmds:
                     auto_continues = 0
-                last_pause_work = work_events
+                last_pause_cmds = cmd_count
+                # Сырой вызов инструмента текстом (<function=...>) — модель
+                # выдала сломанный tool-calling: провайдер не разобрал вызов.
+                # Единичные случаи лечатся подталкиванием, но серия таких пауз
+                # БЕЗ ни одной исполненной команды за весь разговор — деградация
+                # провайдера (задача #46, attempt 3: 17 сырых вызовов, 0 команд,
+                # 4 часа бесполезных подталкиваний). Роняем задачу сразу.
+                if "<function=" in message:
+                    raw_tool_pauses += 1
+                else:
+                    raw_tool_pauses = 0
+                if raw_tool_pauses >= self._RAW_TOOL_PAUSE_LIMIT and cmd_count == 0:
+                    task.status = TaskStatus.FAILED
+                    task.add_log(
+                        "LLM-провайдер отдаёт сломанный tool-calling: "
+                        f"{raw_tool_pauses} пауз подряд с сырым вызовом "
+                        f"инструмента текстом, исполненных команд: 0"
+                    )
+                    await self._finalize_cost(task)
+                    self.state.save(task)
+                    self._notify_author(
+                        task,
+                        "❌ Агент не смог выполнить ни одной команды: LLM-провайдер "
+                        "отдаёт сломанный tool-calling (вызовы инструментов приходят "
+                        "обычным текстом и не исполняются). Задача остановлена — "
+                        "перезапусти её позже, обычно это временный сбой провайдера.",
+                    )
+                    if task.source == TaskSource.GITHUB:
+                        self._notify_admin(
+                            f"⚠️ LLM-провайдер ({self._effective_model(task)}): "
+                            "сломанный tool-calling — агент не исполнил ни одной "
+                            f"команды. Задача {self._repo_full(task)}#"
+                            f"{task.source_id} «{task.title[:60]}» остановлена."
+                        )
+                    return
                 kind = self._classify_agent_pause(message)
 
                 if kind == "report":
@@ -3440,6 +3485,11 @@ class Scheduler:
             )
             for i, entry in enumerate(task.log)
         )
+
+    # Серия пауз с сырым вызовом инструмента текстом (<function=...) без ни
+    # одной исполненной команды = сломанный tool-calling у LLM-провайдера.
+    # Подталкиванием не лечится — роняем задачу, чтобы не жечь часы и токены.
+    _RAW_TOOL_PAUSE_LIMIT = 3
 
     # Подталкивание агенту, вставшему на паузу без вопроса (объявил намерение
     # и замолчал): даём ему ясный протокол — работать, спросить или отчитаться.
