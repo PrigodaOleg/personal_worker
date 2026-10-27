@@ -192,6 +192,43 @@ def test_killed_flag_ignores_old_attempt():
     assert s._killed_by_openhands(t2) is True
 
 
+def test_killed_flag_false_after_auto_recovery():
+    """Авторекавери после смерти задача «отживляет»: маркеры — прошлые попытки.
+
+    Реальный случай (social_mind#46): сервис перезапускался, задача
+    восстанавливалась автоматически («продолжаю автоматически»), маркеры
+    AgentStuckInLoopError остались в логе — карточка навсегда показывала
+    «убита», хотя попытка 5 успешно завершилась и PR создан.
+    """
+    s, _, _ = make_scheduler()
+    t = make_task(TaskStatus.DONE)
+    t.pr_url = "https://github.com/o/r/pull/53"
+    t.log = [
+        "[2026-10-26T12:35:21] OpenHands killed task: агент зациклился "
+        "(AgentStuckInLoopError) — ретрай не помог",
+        "[2026-10-26T06:49:05] ⚠️ Сервис был перезапущен (сбой или "
+        "перезагрузка машины). Задача была прервана — продолжаю автоматически.",
+        "[2026-10-27T08:49:48] OpenHands completed (final report, no question)",
+        "[2026-10-27T08:50:02] PR создан: https://github.com/o/r/pull/53",
+    ]
+    assert s._killed_by_openhands(t) is False
+
+    # Без авторекавери и без PR — по-прежнему убита.
+    t2 = make_task(TaskStatus.FAILED)
+    t2.pr_url = None
+    t2.log = ["[x] OpenHands killed task: агент зациклился"]
+    assert s._killed_by_openhands(t2) is True
+
+    # Смерть ПОСЛЕ авторекавери (без перезапуска) — снова убита.
+    t3 = make_task(TaskStatus.FAILED)
+    t3.pr_url = None
+    t3.log = [
+        "[x] продолжаю автоматически.",
+        "[y] OpenHands killed task: агент зациклился",
+    ]
+    assert s._killed_by_openhands(t3) is True
+
+
 def test_cleanup_skipped_for_pr_tasks():
     """Задача с PR не чистится в finally: контейнер нужен CI-вотчеру."""
     s, _, _ = make_scheduler()
