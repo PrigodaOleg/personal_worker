@@ -2478,6 +2478,11 @@ class Scheduler:
         if task.pr_url:
             return
         container = f"openhands-runtime-{task.conversation_id}"
+        # Перед удалением — вытащить хвосты логов из /tmp контейнера в лог
+        # задачи: после rm расследовать падение будет не по чему (разбор
+        # смерти #46 attempt 4 занял время именно из-за отсутствия логов —
+        # контейнер был удалён раньше, чем успели посмотреть /tmp/*.log).
+        await self._collect_container_logs(task, container)
         try:
             code, _, _ = await self._docker(
                 "rm", "-f", container, timeout=60
@@ -2488,6 +2493,28 @@ class Scheduler:
                 self.state.save(task)
         except Exception as exc:  # noqa: BLE001 — чистка не должна падать
             logger.warning("[cleanup] %s remove failed: %s", container, exc)
+
+    async def _collect_container_logs(
+        self, task: Task, container: str, max_chars: int = 3000
+    ) -> None:
+        """Хвосты /tmp/*.log контейнера — в лог задачи (best-effort).
+
+        Контейнер может быть остановлен (задача убита/упала): стартуем его
+        на время чтения. Ошибки игнорируем — это только диагностика.
+        """
+        try:
+            await self._docker("start", container, timeout=30)
+            code, logs, _ = await self._docker(
+                "exec", container, "bash", "-lc",
+                'for f in /tmp/*.log; do [ -f "$f" ] || continue; '
+                'echo "=== $f ==="; tail -c 1500 "$f"; echo; done',
+                timeout=60,
+            )
+            if code == 0 and logs.strip():
+                task.add_log(f"Логи контейнера перед удалением:\n{logs[-max_chars:]}")
+                self.state.save(task)
+        except Exception as exc:  # noqa: BLE001 — диагностика не должна падать
+            logger.warning("[cleanup] %s log collection failed: %s", container, exc)
 
     async def _gc_runtime_containers(self) -> None:
         """Чистка осиротевших ЗАПУЩЕННЫХ runtime-контейнеров (раз в час).
