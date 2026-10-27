@@ -3568,14 +3568,28 @@ class Scheduler:
         for i, entry in enumerate(task.log):
             if "Перезапуск #" in entry:
                 last_restart = i
-        return any(
-            i > last_restart
-            and (
-                "AgentStuckInLoopError" in entry
-                or "OpenHands killed task" in entry
-            )
-            for i, entry in enumerate(task.log)
-        )
+        # Задача, дошедшая до PR / после смерти продолженная авторекавери
+        # («продолжаю автоматически»), уже пережила своё убийство: текущая
+        # попытка жива и работала (PR #46: маркеры смерти остались от
+        # прошлых попыток, восстановление шло не через «Перезапуск #»).
+        if task.pr_url:
+            return False
+        kill_idx = [
+            i for i, entry in enumerate(task.log)
+            if "AgentStuckInLoopError" in entry
+            or "OpenHands killed task" in entry
+        ]
+        if not kill_idx:
+            return False
+        last_kill = kill_idx[-1]
+        # Продолжение ПОСЛЕ последней смерти (перезапуск или авторекавери)
+        # означает: убитая попытка — в прошлом.
+        for i, entry in enumerate(task.log):
+            if i > last_kill and (
+                "Перезапуск #" in entry or "продолжаю автоматически" in entry
+            ):
+                return False
+        return last_kill > last_restart
 
     # Серия пауз с сырым вызовом инструмента текстом (<function=...) без ни
     # одной исполненной команды = сломанный tool-calling у LLM-провайдера.
@@ -4149,7 +4163,13 @@ class Scheduler:
         прогон; возвращаем dict нового запуска или None.
         """
         client_dir = os.path.join(self._ensure_workspace(task), "social_mind")
+        # Удалённая ветка — источник истины: рабочая копия могла разойтись
+        # с ней (допуши агента, ручные правки) — тогда обычный пуш упадёт с
+        # non-fast-forward (реальный случай, PR #46/#53). Сбрасываем на
+        # origin-ветку и делаем пустой коммит поверх.
         git_cmds = (
+            ["fetch", "origin", branch],
+            ["reset", "--hard", f"origin/{branch}"],
             ["commit", "--allow-empty", "-m",
              "retrigger CI after cancelled run"],
             ["push", "origin", f"HEAD:{branch}"],
