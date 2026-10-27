@@ -4087,6 +4087,35 @@ class Scheduler:
         run_url = run.get("html_url") or (
             f"https://github.com/{self._repo_full(task)}/actions/runs/{run_id}"
         )
+        if conclusion == "cancelled":
+            # Прогон отменён (рестарт/деплой), а исправления агента уже в
+            # ветке — логи слать некому/нечего. Просто перезапускаем сборку:
+            # пустой коммит → новый прогон, вотчер следит за ним.
+            new_run = await self._retrigger_ci(task, branch, run_url)
+            if not new_run:
+                return (
+                    "❌ Не удалось перезапустить сборку (пустой коммит не "
+                    f"создал новый прогон). Проверь ветку `{branch}` вручную."
+                )
+            task.add_log(
+                f"CI-цикл возобновлён кнопкой «Подтолкнуть»: прогон был "
+                f"отменён, запущен новый {new_run.get('html_url')}"
+            )
+            task.ci_pending = True
+            self.state.save(task)
+            client_dir = os.path.join(self._ensure_workspace(task), "social_mind")
+            self._spawn(self._watch_gha_artifacts(
+                task,
+                comment_id=gh.last_bot_comment_id(int(task.source_id)) or 0,
+                comment_body="",
+                run_id=new_run["id"],
+                client_dir=client_dir,
+                branch=branch,
+            ))
+            return (
+                f"🔄 Прогон был отменён (рестарт/деплой) — перезапустил сборку: "
+                f"{new_run.get('html_url')}"
+            )
         sent = await self._send_ci_failure_to_agent(task, run_id)
         if not sent:
             return (
@@ -4109,6 +4138,49 @@ class Scheduler:
             f"🔄 CI-цикл возобновлён: логи прогона ({conclusion}) отправлены "
             f"агенту, жду исправление и новый прогон.\n{run_url}"
         )
+
+    async def _retrigger_ci(
+        self, task: Task, branch: str, prev_run_url: str
+    ) -> Optional[dict]:
+        """Перезапустить CI у ветки с уже исправленным кодом.
+
+        Прогон был отменён (рестарт/деплой), а правки агента уже запушены —
+        пересылать логи агенту нечего. Пустой коммит в ветку триггерит новый
+        прогон; возвращаем dict нового запуска или None.
+        """
+        client_dir = os.path.join(self._ensure_workspace(task), "social_mind")
+        git_cmds = (
+            ["commit", "--allow-empty", "-m",
+             "retrigger CI after cancelled run"],
+            ["push", "origin", f"HEAD:{branch}"],
+        )
+        try:
+            for git_cmd in git_cmds:
+                proc = await asyncio.create_subprocess_exec(
+                    "git", "-C", client_dir,
+                    *self._git_auth_args(task.repo), *git_cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                _, err = await asyncio.wait_for(proc.communicate(), timeout=300)
+                if proc.returncode != 0:
+                    raise RuntimeError(
+                        f"git {' '.join(git_cmd)}: "
+                        + err.decode("utf-8", errors="replace").strip()
+                    )
+        except Exception as exc:  # noqa: BLE001
+            logger.error("[nudge] retrigger push failed: %s", exc)
+            return None
+        sha = await self._git_head_sha(client_dir)
+        if not sha:
+            return None
+        try:
+            return await asyncio.to_thread(
+                self.github_for(task.repo).find_workflow_run, sha, 40, 8.0
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[nudge] find retriggered run failed: %s", exc)
+            return None
 
     async def _find_latest_ci_run(
         self, task: Task, branch: str

@@ -114,7 +114,70 @@ def test_resume_spawns_watcher_on_failure():
     spawned[0].close()
 
 
-def test_resume_and_report_notifies_author():
+def test_resume_retriggers_on_cancelled_run():
+    """Отменённый прогон: правки уже в ветке → пустой коммит → новый прогон."""
+    s = object.__new__(Scheduler)
+    spawned: list = []
+    s.github_for = lambda repo=None: types.SimpleNamespace(
+        fetch_pr_head_branch=lambda url: "ai-task-tk-ci-r1",
+        last_bot_comment_id=lambda issue: 77,
+        find_workflow_run=lambda sha, t=40, p=8.0: {
+            "id": 43, "html_url": "https://ci/43", "conclusion": None,
+        },
+        get_git_credentials=lambda: ("pw-bot", "fake-token"),
+    )
+    s._repo_full = lambda task: "o/r"
+    s._find_latest_ci_run = _coro(  # type: ignore[attr-defined]
+        {"id": 42, "html_url": "https://ci/42", "conclusion": "cancelled"}
+    )
+    s._git_head_sha = _coro("abc123")  # type: ignore[attr-defined]
+    s.config = types.SimpleNamespace(
+        git_author_name="pw", git_author_email="pw@x",
+    )
+    saved: list = []
+    s.state = types.SimpleNamespace(save=lambda task: saved.append(task.id))
+    s._ensure_workspace = lambda task: "/tmp/pw-ws"
+    s._spawn = spawned.append
+
+    ran: list = []
+
+    class FakeProc:
+        returncode = 0
+        stderr = b""
+
+        async def communicate(self, timeout=None):
+            return (b"", b"")
+
+    async def fake_exec(*cmd, **kwargs):
+        ran.append(cmd)
+        return FakeProc()
+
+    import orchestrator.core.scheduler as sched
+    orig_exec = sched.asyncio.create_subprocess_exec
+    orig_wait = sched.asyncio.wait_for
+
+    async def fake_wait_for(proc, timeout=None):
+        # git-команды _retrigger_ci — FakeProc; корутины (_git_head_sha) —
+        # пробрасываем в настоящий wait_for.
+        if isinstance(proc, FakeProc):
+            return await proc.communicate()
+        return await orig_wait(proc, timeout)
+
+    sched.asyncio.create_subprocess_exec = fake_exec
+    sched.asyncio.wait_for = fake_wait_for
+    try:
+        result = asyncio.run(s._resume_ci_loop(make_task()))
+    finally:
+        sched.asyncio.create_subprocess_exec = orig_exec
+        sched.asyncio.wait_for = orig_wait
+    assert "отменён" in result
+    # пустой коммит + пуш в ветку PR
+    assert any("commit" in c for c in ran) and any("push" in c for c in ran)
+    assert spawned
+    locs = spawned[0].cr_frame.f_locals
+    assert locs["run_id"] == 43
+    spawned[0].close()
+
     """Результат возобновления уходит автору задачи."""
     s = object.__new__(Scheduler)
     s._resume_ci_loop = _coro("🔄 CI-цикл возобновлён")  # type: ignore
