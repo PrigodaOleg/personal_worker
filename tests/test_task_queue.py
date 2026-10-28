@@ -150,6 +150,7 @@ def test_process_task_reconnects_live_conversation():
 
         s.openhands = OH()
         s._ensure_workspace = lambda t: "/tmp/ws"
+        s._repo_dirname = lambda t: "r"
         monitored = []
 
         async def fake_monitor(t, cid, cdir):

@@ -9,7 +9,7 @@ import asyncio
 import types
 
 from orchestrator.core.scheduler import Scheduler
-from orchestrator.core.task import TaskSource
+from orchestrator.core.task import Task, TaskSource
 
 DEFAULT_REPO = "PrigodaOleg/social_mind"
 OTHER_REPO = "PrigodaOleg/other_app"
@@ -251,3 +251,33 @@ class TestRepoCommands:
         assert s._is_admin("@boss")
         assert not s._is_admin("someone")
         assert not s._is_admin(None)
+
+
+class TestRepoDirname:
+    """Имя каталога репо на хосте и в контейнере (issue #48)."""
+
+    @staticmethod
+    def _task(repo: str | None) -> Task:
+        t = Task(id="t1", source=TaskSource.GITHUB, source_id="1",
+                 title="x", description="d")
+        t.repo = repo
+        return t
+
+    def test_default_and_explicit(self):
+        s, _ = make_scheduler({})
+        t = self._task(None)
+        assert s._repo_dirname(t) == "social_mind"
+        t.repo = "PrigodaOleg/zmk-config-hillside46"
+        assert s._repo_dirname(t) == "zmk-config-hillside46"
+
+    def test_container_ws(self):
+        s, _ = make_scheduler({})
+        t = self._task("PrigodaOleg/zmk-config-hillside46")
+        assert s._container_ws(t) == "/workspace/zmk-config-hillside46"
+
+    def test_workspace_layout_uses_repo_name(self):
+        s, _ = make_scheduler({})
+        t = self._task("PrigodaOleg/zmk-config-hillside46")
+        s._ensure_workspace = lambda task: "/tmp/pw-ws"
+        client_dir = s._ensure_workspace(t) + "/" + s._repo_dirname(t)
+        assert client_dir == "/tmp/pw-ws/zmk-config-hillside46"

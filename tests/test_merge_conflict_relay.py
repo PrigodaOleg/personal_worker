@@ -178,4 +178,4 @@ def test_merge_conflict_message_contains_instructions():
     src = inspect.getsource(Scheduler._send_merge_conflict_to_agent)
     assert "ПУШИТЬ НЕ НУЖНО" in src
     assert "<<<<<<<" in src
-    assert "/workspace/social_mind" in src
+    assert "_container_ws(task)" in src

@@ -110,6 +110,44 @@ def test_markup_only_message_skipped():
     assert out == "— агент ещё не выполнял команд и не писал реплик"
 
 
+def test_think_markup_revealed_as_remark():
+    """Легитимный <function=think>: содержимое thought — это реплика агента.
+
+    Реальный кейс (issue #48, zmk-config-hillside46): модель оборачивает
+    статусы и финальный отчёт в think — раньше после вырезания разметки
+    оставалась пустая строка, реплики пропадали из карточек, а «Работа
+    завершена» классифицировалась как announce (4 авто-продолжения).
+    """
+    events = [
+        {"source": "agent", "action": "message",
+         "message": ("<function=think>\n<parameter=thought>\n\nОбе половины "
+                     "собраны успешно (left + right, по 88576 байт uf2)")},
+        {"source": "agent", "action": "message",
+         "message": ("<function=think>\n<parameter=thought>\nРабота завершена. "
+                     "## Сделанные изменения (коммит 27d5867)")},
+    ]
+    out = run(make_scheduler(events), make_task())
+    assert "💬 Обе половины собраны успешно" in out
+    assert "💬 Работа завершена." in out
+    assert "<function=" not in out
+    # Классификация паузы: финальный отчёт внутри thought — report, не announce.
+    assert Scheduler._classify_agent_pause(
+        "<function=think>\n<parameter=thought>\nРабота завершена. Все проверки пройдены."
+    ) == "report"
+
+
+def test_non_think_markup_still_hidden():
+    """Обычные tool-calls (не think) в реплики по-прежнему не попадают."""
+    events = [
+        {"source": "agent", "action": "message",
+         "message": "<function=think><parameter=thought>посредственная заметка</parameter></function>"
+                    " <function=execute_bash><parameter=command>rm -rf /</parameter></function>"},
+    ]
+    out = run(make_scheduler(events), make_task())
+    assert "посредственная" in out
+    assert "rm -rf" not in out
+
+
 def test_long_remark_truncated():
     events = [
         {"source": "agent", "action": "message", "message": "x" * 500},
