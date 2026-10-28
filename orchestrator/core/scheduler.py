@@ -1412,7 +1412,27 @@ class Scheduler:
             return
 
         if cmd in ("/repo", "/repo_add", "/repo_check", "/repo_del"):
-            await self._handle_repo_command(chat_id_int, cmd, parts, username)
+            # Формы: /repo add|check|del <owner/name> и /repo_add|check|del <owner/name>.
+            # Раньше parts[1] («add») принимался за имя репозитория — команда
+            # вечно отвечала «Формат: …» и до проверки доступа не доходила.
+            if cmd == "/repo":
+                sub = (parts[1].lower() if len(parts) > 1 else "")
+                cmd = {
+                    "add": "/repo_add",
+                    "check": "/repo_check",
+                    "del": "/repo_del",
+                }.get(sub)
+                name = parts[2] if len(parts) > 2 else ""
+                if cmd is None:
+                    await self.telegram.send_message(
+                        chat_id_int,
+                        "Формат: /repo add|check|del <owner/name>, "
+                        "например /repo add PrigodaOleg/social_mind",
+                    )
+                    return
+            else:
+                name = parts[1] if len(parts) > 1 else ""
+            await self._handle_repo_command(chat_id_int, cmd, parts, username, name)
             return
 
         await self.telegram.send_message(
@@ -1443,14 +1463,16 @@ class Scheduler:
         await self.telegram.send_message(chat_id_int, "\n".join(lines))
 
     async def _handle_repo_command(
-        self, chat_id_int: int, cmd: str, parts: list[str], username: Optional[str]
+        self, chat_id_int: int, cmd: str, parts: list[str],
+        username: Optional[str], name: str = "",
     ) -> None:
         if not self._is_admin(username):
             await self.telegram.send_message(
                 chat_id_int, "🔒 Управление репозиториями доступно только админу."
             )
             return
-        name = parts[1] if len(parts) > 1 else ""
+        if not name:
+            name = parts[1] if len(parts) > 1 else ""
         if not re.fullmatch(r"[\w.-]+/[\w.-]+", name):
             await self.telegram.send_message(
                 chat_id_int,
@@ -4487,13 +4509,20 @@ class Scheduler:
                 run_id, run_url, conclusion, artifacts, self._repo_full(task)
             )
             comment_body = self.replace_marker_section(comment_body, new_section)
+            if not comment_body.strip():
+                # Возобновлённый цикл стартует с пустым телом комментария —
+                # update_comment с blank body отбивается GitHub (422), а раньше
+                # этот сбой убивал весь цикл фиксов (return), и «Подтолкнуть»
+                # ничего не делало. Кладём секцию как новое тело.
+                comment_body = new_section
             try:
                 await asyncio.to_thread(
                     self.github_for(task.repo).update_comment, comment_id, comment_body
                 )
             except Exception as exc:
-                logger.error("[gha] update_comment failed: %s", exc)
-                return
+                # Сбой обновления комментария не фатален: главное — цикл
+                # фиксов (логи → агент → допуш), а не красота комментария.
+                logger.error("[gha] update_comment failed: %s — продолжаю", exc)
             task.add_log(
                 f"Ссылки на артефакты GHA добавлены в комментарий "
                 f"(сборка: {conclusion}, артефактов: {len(artifacts)})"
