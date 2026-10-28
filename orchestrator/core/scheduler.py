@@ -26,6 +26,7 @@ import logging
 import os
 import re
 import shutil
+import subprocess
 import tempfile
 import time
 from datetime import datetime, timedelta
@@ -126,12 +127,23 @@ class Scheduler:
         # период опроса статуса запуска и общий лимит ожидания.
         self.gha_watch_poll_seconds: int = int(os.getenv("GHA_WATCH_POLL_SECONDS", "60"))
         self.gha_watch_timeout_seconds: int = int(os.getenv("GHA_WATCH_TIMEOUT_SECONDS", "5400"))
+        # Merge-конфликты PR: воркер не видит GitHub, поэтому оркестратор сам
+        # периодически проверяет mergeable_state и доставляет конфликт воркеру.
+        self.merge_conflict_poll_seconds: int = int(
+            os.getenv("MERGE_CONFLICT_POLL_SECONDS", "300")
+        )
+        self.max_merge_fix_rounds: int = int(os.getenv("MERGE_FIX_MAX_ROUNDS", "5"))
         # Очередь задач: выполняется строго одна за раз (слабое железо —
         # локальные docker-сборки и один iMac параллельную работу не тянут).
         self._task_queue: "asyncio.Queue[Task]" = asyncio.Queue()
         self._queue_worker_started: bool = False
         # Адаптеры GitHub по репозиториям (мульти-репо): имя → клон self.github.
         self._repo_adapters: dict[str, GitHubAdapter] = {}
+        # Идущие циклы разрешения merge-конфликтов (task.id → True):
+        # защита от повторного запуска поллером/вотчером.
+        self._merge_cycles: dict[str, bool] = {}
+        # Сколько раундов резолва уже сделано по задаче (task.id → n).
+        self._merge_rounds: dict[str, int] = {}
 
     # ------------------------------------------------------------------ #
     # Вспомогательные
@@ -520,6 +532,8 @@ class Scheduler:
         """
         if task.ci_pending and task.status is TaskStatus.DONE:
             return ("⏳", "CI-проверка PR")
+        if task.merge_conflict and task.status is TaskStatus.DONE:
+            return ("🔀", "разрешение конфликта с main")
         return (
             self._task_status_emoji(task.status),
             self._task_status_label(task.status),
@@ -4486,6 +4500,17 @@ class Scheduler:
             )
             self.state.save(task)
             if conclusion == "success":
+                # CI зелёный, но PR всё ещё может не мержиться (конфликт с
+                # base-веткой или behind): воркер не видит GitHub — доставкой
+                # занимается оркестратор. Поллер тоже подхватит, но здесь
+                # реагируем сразу.
+                info = await asyncio.to_thread(
+                    self.github_for(task.repo).get_pr_merge_info, task.pr_url
+                ) if task.pr_url else None
+                if info and not info.get("merged") and info.get(
+                    "mergeable_state"
+                ) in self._MERGE_DIRTY_STATES and task.id not in self._merge_cycles:
+                    self._spawn(self._resolve_merge_conflict(task))
                 return
             # Сборка провалилась. Раньше — только уведомление; теперь цикл
             # замкнут: логи упавших джоб → агенту → допуш → новый прогон.
@@ -4565,6 +4590,7 @@ class Scheduler:
     async def _sync_and_push_ci_fix(
         self, task: Task, client_dir: Optional[str],
         branch: Optional[str], old_sha: Optional[str],
+        commit_message: Optional[str] = None,
     ) -> Optional[dict]:
         """Забрать правки агента из контейнера и допушить в ветку PR.
 
@@ -4591,7 +4617,8 @@ class Scheduler:
                 ["add", "-A", "--", ".",
                  ":(exclude,glob)**/build.env",
                  ":(exclude,glob)**/google-services.json"],
-                ["commit", "-m", f"AI task: {task.title} (CI fix)"],
+                ["commit", "-m", commit_message
+                 or f"AI task: {task.title} (CI fix)"],
                 ["push", "-u", "origin", branch],
             ):
                 proc = await asyncio.create_subprocess_exec(
@@ -4767,6 +4794,334 @@ class Scheduler:
         return None
 
     # ------------------------------------------------------------------ #
+    # Merge-конфликты PR: оркестратор доносит их воркеру
+    # ------------------------------------------------------------------ #
+    # Воркер не видит GitHub (нет токена и сети к API в контейнере): ни
+    # mergeable_state, ни список конфликтных файлов, ни изменения base-ветки
+    # он сам получить не может. Поэтому оркестратор:
+    #   1) периодически проверяет mergeable_state у PR задач;
+    #   2) при «dirty» локально сливает base-ветку в ветку PR (на хосте);
+    #   3) конфликтные файлы с маркерами копирует в контейнер воркера и
+    #      отправляет ему список + инструкцию;
+    #   4) после резолва воркером забирает правки, завершает merge-коммит
+    #      и пушит (воркер не пушит — как и в обычном цикле CI-фикса).
+    # «behind» без конфликтов оркестратор разруливает сам, воркера не дёргая.
+
+    _MERGE_DIRTY_STATES = ("dirty", "behind")
+
+    async def _poll_pr_merge_conflicts(self) -> None:
+        """Обход задач с PR: конфликт с base-веткой? (периодический поллер)"""
+        for task in self.state.list_by_status(TaskStatus.DONE):
+            if not task.pr_url or "github.com" not in (task.pr_url or ""):
+                continue
+            if task.id in self._merge_cycles:
+                continue  # резолв уже идёт
+            info = await asyncio.to_thread(
+                self.github_for(task.repo).get_pr_merge_info, task.pr_url
+            )
+            if not info or info.get("merged") or info.get("state") == "closed":
+                continue
+            mstate = info.get("mergeable_state")
+            if mstate not in self._MERGE_DIRTY_STATES:
+                # Конфликт разрулили (руками или циклом) — снять флаг и
+                # обнулить счётчик раундов.
+                if task.merge_conflict:
+                    task.merge_conflict = False
+                    self.state.save(task)
+                self._merge_rounds.pop(task.id, None)
+                continue
+            if self._merge_rounds.get(task.id, 0) >= self.max_merge_fix_rounds:
+                continue  # лимит исчерпан: ждём ручного разбора
+            self._spawn(self._resolve_merge_conflict(task))
+
+    async def _resolve_merge_conflict(self, task: Task) -> None:
+        """Довести PR до мержа: локальный merge base-ветки, конфликт — воркеру."""
+        self._merge_cycles[task.id] = True
+        client_dir = os.path.join(self._ensure_workspace(task), "social_mind")
+        try:
+            await self._resolve_merge_conflict_impl(task, client_dir)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("[merge] resolve failed for %s: %s", task.id, exc)
+            task.add_log(f"Разрешение merge-конфликта не удалось: {exc}")
+            self.state.save(task)
+            await self._abort_local_merge(client_dir)
+            self._notify_author(
+                task,
+                "⚠️ У PR конфликт с основной веткой, но автоматически "
+                f"разрулить не получилось: {exc}\n"
+                "Разберись вручную или нажми «Подтолкнуть».",
+            )
+        finally:
+            self._merge_cycles.pop(task.id, None)
+
+    async def _resolve_merge_conflict_impl(
+        self, task: Task, client_dir: str
+    ) -> None:
+        info = await asyncio.to_thread(
+            self.github_for(task.repo).get_pr_merge_info, task.pr_url
+        )
+        if not info or info.get("merged") or info.get("state") == "closed":
+            task.merge_conflict = False
+            self.state.save(task)
+            return
+        base_ref = info.get("base_ref") or "main"
+        task.merge_conflict = True
+        self.state.save(task)
+
+        base_sha = await self._git_fetch_base(client_dir, base_ref, task.repo)
+        # После рестарта сервиса незавершённый merge мог остаться на хосте:
+        # начинаем заново с чистого состояния.
+        await self._abort_local_merge(client_dir)
+        conflicts = await self._git_start_merge(client_dir, base_sha, task.repo)
+        if not conflicts:
+            # Конфликтов нет (ветка просто behind) — оркестратор справится сам.
+            await self._git_commit_and_push_merge(
+                task, client_dir,
+                f"Merge {base_ref} into PR branch (branch was behind)",
+            )
+            task.merge_conflict = False
+            task.add_log(
+                f"Ветка отстала от {base_ref} — оркестратор сам смержил "
+                f"{base_ref} в ветку PR и запушил"
+            )
+            self.state.save(task)
+            return
+
+        # Реальный конфликт: доставляем воркеру.
+        rounds = self._merge_rounds.get(task.id, 0) + 1
+        self._merge_rounds[task.id] = rounds
+        if rounds > 1:
+            task.add_log(
+                f"Повторный резолв merge-конфликта (раунд {rounds}/"
+                f"{self.max_merge_fix_rounds}) — воркер не решил в прошлый раз"
+            )
+        task.add_log(
+            f"PR конфликтует с {base_ref}: конфликтные файлы — "
+            f"{', '.join(conflicts[:10])}{'…' if len(conflicts) > 10 else ''}"
+        )
+        self.state.save(task)
+        sent = await self._send_merge_conflict_to_agent(
+            task, base_ref, conflicts, client_dir
+        )
+        if not sent:
+            await self._abort_local_merge(client_dir)
+            self._notify_author(
+                task,
+                f"⚠️ У PR конфликт с {base_ref} (файлы: "
+                f"{', '.join(conflicts[:5])}…), но передать его воркеру не "
+                "удалось (разговор закрыт?). Разреши вручную.",
+            )
+            return
+        # Воркер правит маркеры — забираем резолв, завершаем merge, пушим.
+        branch = info.get("head_ref") or await asyncio.to_thread(
+            self.github_for(task.repo).fetch_pr_head_branch, task.pr_url
+        )
+        pushed = await self._sync_and_push_ci_fix(
+            task, client_dir, branch, old_sha=None,
+            commit_message=f"Merge {base_ref} into PR branch "
+                           f"(resolve conflicts: {', '.join(conflicts[:5])})",
+        )
+        if pushed:
+            task.merge_conflict = False
+            task.add_log(
+                "Резолв merge-конфликта воркером запушен в ветку PR"
+            )
+            self.state.save(task)
+        else:
+            await self._abort_local_merge(client_dir)
+            if self._merge_rounds.get(task.id, 0) >= self.max_merge_fix_rounds:
+                self._notify_admin(
+                    f"🔀 Merge-конфликт {self._repo_full(task)}"
+                    f"#{task.source_id} не решён за "
+                    f"{self.max_merge_fix_rounds} раундов — нужен ручной разбор."
+                )
+            self._notify_author(
+                task,
+                f"⚠️ Воркер не вернул резолв конфликта с {base_ref} "
+                "(нет правок, разговор закрыт или допуш не удался). "
+                "Проверь задачу или разреши конфликт вручную.",
+            )
+
+    async def _git_fetch_base(
+        self, client_dir: str, base_ref: str, repo: Optional[str] = None
+    ) -> str:
+        """Забрать свежую base-ветку; вернуть её sha.
+
+        Рабочая копия — shallow-клон: merge требует общего предка, поэтому
+        после фетча проверяем merge-base и при необходимости углубляем/ unshallow.
+        """
+        def _run(*args: str) -> subprocess.CompletedProcess:
+            return subprocess.run(
+                ["git", "-C", client_dir, *self._git_auth_args(repo), *args],
+                capture_output=True, text=True, timeout=300,
+            )
+
+        r = _run("fetch", "origin", base_ref)
+        if r.returncode != 0:
+            raise RuntimeError(f"git fetch {base_ref}: {r.stderr.strip()[:200]}")
+        sha = _run("rev-parse", "FETCH_HEAD").stdout.strip()
+        mb = _run("merge-base", "HEAD", sha)
+        if mb.returncode != 0:
+            # Общего предка нет в shallow-истории — углубляем.
+            _run("fetch", "--unshallow", "origin", base_ref)
+            sha = _run("rev-parse", "FETCH_HEAD").stdout.strip()
+        return sha
+
+    async def _git_start_merge(
+        self, client_dir: str, base_sha: str, repo: Optional[str] = None
+    ) -> list[str]:
+        """Начать merge base-ветки в ветку PR (без коммита).
+
+        Возвращает список конфликтных файлов (пустой — merge чистый).
+        Рабочая копия остаётся в состоянии merge до коммита/abort.
+        """
+        def _run(*args: str) -> subprocess.CompletedProcess:
+            return subprocess.run(
+                ["git", "-C", client_dir, *self._git_auth_args(repo), *args],
+                capture_output=True, text=True, timeout=300,
+            )
+
+        r = _run("merge", "--no-commit", "--no-ff", base_sha)
+        if r.returncode == 0:
+            return []
+        conflicts = _run(
+            "diff", "--name-only", "--diff-filter=U"
+        ).stdout.split()
+        if not conflicts:
+            raise RuntimeError(f"git merge: {r.stderr.strip()[:200]}")
+        return conflicts
+
+    async def _git_commit_and_push_merge(
+        self, task: Task, client_dir: str, message: str
+    ) -> None:
+        branch = await asyncio.to_thread(
+            self.github_for(task.repo).fetch_pr_head_branch, task.pr_url
+        )
+        if not branch:
+            raise RuntimeError("не удалось получить head-ветку PR")
+        for git_cmd in (
+            ["add", "-A", "--", ".",
+             ":(exclude,glob)**/build.env",
+             ":(exclude,glob)**/google-services.json"],
+            ["commit", "-m", message],
+            ["push", "-u", "origin", f"HEAD:{branch}"],
+        ):
+            proc = await asyncio.create_subprocess_exec(
+                "git", "-C", client_dir, *self._git_auth_args(task.repo), *git_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, err = await asyncio.wait_for(proc.communicate(), timeout=300)
+            if proc.returncode != 0:
+                msg = err.decode("utf-8", errors="replace").strip()
+                if git_cmd[0] == "commit" and "nothing to commit" in msg:
+                    continue
+                raise RuntimeError(f"git {' '.join(git_cmd)}: {msg}")
+
+    async def _abort_local_merge(self, client_dir: str) -> None:
+        """Откатить незавершённый merge (воркер не ответил / сбой)."""
+        if not os.path.isdir(os.path.join(client_dir, ".git")):
+            return
+        proc = await asyncio.create_subprocess_exec(
+            "git", "-C", client_dir, "merge", "--abort",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        await proc.communicate()
+
+    async def _copy_conflicts_to_runtime(
+        self, task: Task, client_dir: str, conflicts: list[str]
+    ) -> bool:
+        """Скопировать конфликтные файлы (с маркерами) в контейнер воркера.
+
+        Воркер правит их прямо в /workspace/social_mind: резолв не требует
+        доступа к GitHub — вся информация доставлена оркестратором.
+        """
+        conversation_id = task.conversation_id
+        if not conversation_id:
+            return False
+        container = f"openhands-runtime-{conversation_id}"
+        root = "/workspace/social_mind"
+        # В контейнер кладём только файлы, существующие на хосте (add/add,
+        # both modified). Удалённые одной из сторон воркеру придёт списком.
+        for rel in conflicts:
+            src = os.path.join(client_dir, rel)
+            if not os.path.isfile(src):
+                continue
+            dname = os.path.dirname(rel)
+            if dname:
+                code, _, err = await self._run_in_container(
+                    container, f"mkdir -p '{root}/{dname}'"
+                )
+                if code != 0:
+                    logger.warning(
+                        "[merge] mkdir %s failed: %s", dname, err.strip()[:100]
+                    )
+            proc = await asyncio.create_subprocess_exec(
+                "docker", "cp", src, f"{container}:{root}/{rel}",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, err = await asyncio.wait_for(proc.communicate(), timeout=120)
+            if proc.returncode != 0:
+                logger.warning(
+                    "[merge] docker cp %s failed: %s",
+                    rel, err.decode("utf-8", errors="replace").strip()[:100],
+                )
+                return False
+        return True
+
+    async def _send_merge_conflict_to_agent(
+        self, task: Task, base_ref: str, conflicts: list[str], client_dir: str
+    ) -> bool:
+        """Сообщить воркеру о конфликте и попросить разрешить его.
+
+        True — сообщение доставлено (и конфликтные файлы уложены в контейнер).
+        """
+        copied = await self._copy_conflicts_to_runtime(task, client_dir, conflicts)
+        files_txt = "\n".join(f"  - {p}" for p in conflicts[:20])
+        prepared = (
+            "- конфликтные файлы сейчас содержат маркеры "
+            "<<<<<<< / ======= / >>>>>>>."
+            if copied else
+            "- оркестратору не удалось уложить файлы в рабочее окружение: "
+            "маркеров может не быть, тогда сообщи об этом владельцу задачи "
+            "(я передам) — резолв придётся делать вручную."
+        )
+        message = (
+            f"⚠️ Твой PR конфликтует с веткой {base_ref} — GitHub не даст "
+            "его смержить, пока конфликт не разрешён. Ты не видишь GitHub, "
+            "поэтому оркестратор уже подготовил всё в твоём рабочем "
+            "окружении (/workspace/social_mind):\n"
+            f"- ветка {base_ref} слита в твою ветку ЛОКАЛЬНО (без коммита);\n"
+            f"{prepared}\n\n"
+            "Конфликтные файлы:\n"
+            f"{files_txt}\n\n"
+            "Что делать:\n"
+            "1. Открой каждый файл, разберись в конфликте и оставь "
+            "правильный код (учти изменения обеих сторон, маркеры убери).\n"
+            "2. ПУШИТЬ НЕ НУЖНО: просто внеси правки и сообщи, что готово. "
+            "Оркестратор сам заберёт изменения, закоммитит merge и запушит "
+            "в ветку PR — CI перезапустится.\n"
+            "3. Если конфликт требует решения владельца (например, непонятно, "
+            "чью версию считать правильной) — задай вопрос со знаком вопроса."
+        )
+        conversation_id = task.conversation_id
+        if not conversation_id:
+            return False
+        res = await self.openhands.send_message(conversation_id, message)
+        if res.get("status") == "error" or res.get("success") is False:
+            # Разговор мог погаснуть после завершения задачи — будим.
+            await self.openhands.start_conversation(conversation_id)
+            res = await self.openhands.send_message(conversation_id, message)
+            if res.get("status") == "error" or res.get("success") is False:
+                logger.error(
+                    "[merge] не удалось доставить конфликт агенту: %s", res
+                )
+                return False
+        return True
+
+    # ------------------------------------------------------------------ #
     # Главный цикл
     # ------------------------------------------------------------------ #
     async def _recover_interrupted_tasks(self) -> None:
@@ -4872,6 +5227,7 @@ class Scheduler:
         price_refresh_interval = 6 * 3600  # обновлять цены/бенчмарки раз в 6 часов
         last_price_refresh = time.time()
         last_container_gc = time.time()  # чистка runtime-контейнеров — раз в час
+        last_merge_check = time.time()  # проверка merge-конфликтов PR
 
         while True:
             try:
@@ -4891,6 +5247,16 @@ class Scheduler:
             if time.time() - last_price_refresh > price_refresh_interval:
                 await self._refresh_prices_and_benchmarks()
                 last_price_refresh = time.time()
+
+            # Периодически проверяем PR задач на merge-конфликты: воркер не
+            # видит GitHub, конфликты доносит оркестратор (dirty → воркеру,
+            # behind → авто-мерж своими руками).
+            if time.time() - last_merge_check > self.merge_conflict_poll_seconds:
+                try:
+                    await self._poll_pr_merge_conflicts()
+                except Exception as exc:
+                    logger.error("[loop] merge conflict poll error: %s", exc)
+                last_merge_check = time.time()
 
             # Обрабатываем задачи в статусе CLARIFYING (ожидание уточнений)
             for task in self.state.list_by_status(TaskStatus.CLARIFYING):

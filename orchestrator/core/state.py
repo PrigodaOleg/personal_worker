@@ -68,6 +68,11 @@ class StateStore:
             self._conn.execute(
                 "ALTER TABLE tasks ADD COLUMN ci_pending INTEGER NOT NULL DEFAULT 0"
             )
+        if "merge_conflict" not in existing:
+            # PR конфликтует с base-веткой (воркер разруливает).
+            self._conn.execute(
+                "ALTER TABLE tasks ADD COLUMN merge_conflict INTEGER NOT NULL DEFAULT 0"
+            )
         # Ключ-значение для настроек UI (например, модель по умолчанию).
         self._conn.execute(
             "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)"
@@ -174,8 +179,8 @@ class StateStore:
              clarification_question, clarification_answer, created_at, pr_url, log,
              conversation_id, model, attempt, tokens_prompt, tokens_completion,
              tokens_cache_read, cost_rub, ui_message_id, finalize_only, repo,
-             agent_summary, ci_pending)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             agent_summary, ci_pending, merge_conflict)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 task.id,
@@ -201,6 +206,7 @@ class StateStore:
                 task.repo,
                 task.agent_summary,
                 int(task.ci_pending),
+                int(task.merge_conflict),
             ),
         )
         self._conn.commit()
@@ -280,6 +286,7 @@ class StateStore:
             repo=row["repo"],
             agent_summary=row["agent_summary"],
             ci_pending=bool(_num("ci_pending")),
+            merge_conflict=bool(_num("merge_conflict")),
         )
 
     def close(self) -> None:

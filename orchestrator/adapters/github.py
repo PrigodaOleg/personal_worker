@@ -429,6 +429,40 @@ class GitHubAdapter:
         except Exception:  # noqa: BLE001 — PR могли удалить
             return None
 
+    def get_pr_merge_info(self, pr_url: str) -> Optional[dict]:
+        """Состояние мержа PR: mergeable, mergeable_state, base-ветка.
+
+        mergeable_state:
+          dirty   — merge-конфликт с base-веткой, нужен резолв;
+          behind  — ветка отстала от base (мержится, но надо обновить);
+          blocked — ждём обязательные проверки;
+          clean/unstable — мерж доступен.
+        None — PR недоступен или GitHub ещё считает (mergeable is None).
+        """
+        self._ensure_auth()
+        assert self._repo is not None
+        m = re.search(r"/pull/(\d+)", pr_url)
+        if not m:
+            return None
+        try:
+            pr = self._repo.get_pull(number=int(m.group(1)))
+            if pr.state == "closed" or pr.merged:
+                return {"state": pr.state, "merged": bool(pr.merged)}
+            if pr.mergeable is None:  # GitHub ещё пересчитывает
+                return None
+            return {
+                "state": pr.state,
+                "merged": False,
+                "mergeable": bool(pr.mergeable),
+                "mergeable_state": pr.mergeable_state,
+                "base_ref": pr.base.ref,
+                "head_ref": pr.head.ref,
+                "head_sha": pr.head.sha,
+                "number": int(m.group(1)),
+            }
+        except Exception:  # noqa: BLE001 — PR могли удалить
+            return None
+
     def fetch_pr_feedback(
         self, pr_url: str, after_comment_id: int = 0
     ) -> list[dict]:
