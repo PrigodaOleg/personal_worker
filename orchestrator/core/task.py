@@ -69,6 +69,9 @@ class Task:
     # «зелёной» её показываем только после снятия этого флага — иначе
     # ✅ появляется за долго до реального окончания работ (PR #53/#54).
     ci_pending: bool = False
+    # PR конфликтует с base-веткой: воркер разрешает конфликт (оркестратор
+    # доставил ему конфликтные файлы с маркерами и ждёт резолв).
+    merge_conflict: bool = False
 
     def add_log(self, message: str) -> None:
         self.log.append(f"[{datetime.utcnow().isoformat()}] {message}")
