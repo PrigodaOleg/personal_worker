@@ -200,3 +200,66 @@ def test_keyboard_shows_nudge_for_red_pr_task():
     kb = s._task_actions_keyboard(t)
     texts = [btn[0] for row in kb for btn in row]
     assert "📤 Подтолкнуть" in texts
+
+
+def test_retrigger_resets_to_origin_branch():
+    """Перед пустым коммитом — reset на origin-ветку (non-fast-forward).
+
+    Реальный случай (social_mind#46/#53): рабочая копия разошлась с веткой
+    (допуши агента), push отклонён — сборка не перезапустилась.
+    """
+    s = object.__new__(Scheduler)
+    s.github_for = lambda repo=None: types.SimpleNamespace(
+        find_workflow_run=lambda sha, t=40, p=8.0: {
+            "id": 43, "html_url": "https://ci/43", "conclusion": None,
+        },
+        get_git_credentials=lambda: ("pw-bot", "fake-token"),
+    )
+    s.config = types.SimpleNamespace(git_author_name="pw", git_author_email="pw@x")
+    s.state = types.SimpleNamespace(save=lambda task: None)
+    s._ensure_workspace = lambda task: "/tmp/pw-ws"
+    s._git_head_sha = _coro("abc123")
+    ran: list = []
+
+    class FakeProc:
+        returncode = 0
+        stderr = b""
+
+        async def communicate(self, timeout=None):
+            return (b"", b"")
+
+    async def fake_exec(*cmd, **kwargs):
+        ran.append(list(cmd))
+        return FakeProc()
+
+    import orchestrator.core.scheduler as sched
+    orig_exec = sched.asyncio.create_subprocess_exec
+    orig_wait = sched.asyncio.wait_for
+
+    async def fake_wait_for(proc, timeout=None):
+        if isinstance(proc, FakeProc):
+            return await proc.communicate()
+        return await orig_wait(proc, timeout)
+
+    sched.asyncio.create_subprocess_exec = fake_exec
+    sched.asyncio.wait_for = fake_wait_for
+    try:
+        result = asyncio.run(s._retrigger_ci(make_task(), "br", "u"))
+    finally:
+        sched.asyncio.create_subprocess_exec = orig_exec
+        sched.asyncio.wait_for = orig_wait
+    ops = [c[-1] for c in ran]  # последний аргумент: ветка/сообщение/HEAD:br
+    heads = [c for c in ops if c.startswith("HEAD:")]
+    assert len(heads) == 1, ran
+    cmds = []
+    for c in ran:
+        it = iter(c)
+        for t in it:
+            if t == "-c":  # пара авторства
+                next(it, None)
+                continue
+            if t not in ("git", "-C") and not t.startswith("/tmp"):
+                cmds.append(t)
+                break
+    assert cmds == ["fetch", "reset", "commit", "push"], ran
+    assert result == {"id": 43, "html_url": "https://ci/43", "conclusion": None}
