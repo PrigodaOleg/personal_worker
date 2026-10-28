@@ -123,6 +123,82 @@ def test_poll_skips_merged_and_closed_prs():
     assert not spawned
 
 
+def test_poll_clears_stale_ci_pending_on_merged_pr():
+    """Смерженный PR + зависший ci_pending (мертвый GHA-вотчер):
+    флаг снимается, задача уведомляется, резолвер не запускается."""
+    s = _bare_scheduler()
+    task = _mk_task()
+    task.ci_pending = True
+    saved: list = []
+    notified: list = []
+    spawned: list = []
+
+    def fake_spawn(coro):
+        spawned.append(coro)
+        coro.close()
+
+    s._spawn = fake_spawn
+    s._notify_author = lambda t, msg: notified.append(msg)
+    s.state = types.SimpleNamespace(
+        save=lambda t: saved.append(t),
+        list_by_status=lambda st: [task] if st is TaskStatus.DONE else [],
+    )
+    s.github_for = lambda repo: types.SimpleNamespace(
+        get_pr_merge_info=lambda u: {"state": "open", "merged": True}
+    )
+
+    asyncio.run(s._poll_pr_merge_conflicts())
+    assert not spawned
+    assert not task.ci_pending
+    assert saved == [task]
+    assert notified and "смержен" in notified[0]
+
+    # Повторный обход: уведомление не дублируется.
+    asyncio.run(s._poll_pr_merge_conflicts())
+    assert len(notified) == 1
+    assert saved == [task]
+
+
+def test_poll_clears_stale_ci_pending_on_closed_pr_silently():
+    """Закрытый без мержа PR: ci_pending снимается, но без поздравления."""
+    s = _bare_scheduler()
+    task = _mk_task()
+    task.ci_pending = True
+    notified: list = []
+    s._notify_author = lambda t, msg: notified.append(msg)
+    s.state = types.SimpleNamespace(
+        save=lambda t: None,
+        list_by_status=lambda st: [task] if st is TaskStatus.DONE else [],
+    )
+    s.github_for = lambda repo: types.SimpleNamespace(
+        get_pr_merge_info=lambda u: {"state": "closed", "merged": False}
+    )
+
+    asyncio.run(s._poll_pr_merge_conflicts())
+    assert not task.ci_pending
+    assert not notified
+
+
+def test_poll_keeps_ci_pending_when_pr_still_open():
+    """Открытый PR: флаг ci_pending не трогаем — им владеет GHA-вотчер."""
+    s = _bare_scheduler()
+    task = _mk_task()
+    task.ci_pending = True
+    saved: list = []
+    s.state = types.SimpleNamespace(
+        save=lambda t: saved.append(t),
+        list_by_status=lambda st: [task] if st is TaskStatus.DONE else [],
+    )
+    s.github_for = lambda repo: types.SimpleNamespace(
+        get_pr_merge_info=lambda u: {"state": "open", "merged": False,
+                                     "mergeable_state": "clean"}
+    )
+
+    asyncio.run(s._poll_pr_merge_conflicts())
+    assert task.ci_pending
+    assert not saved
+
+
 def test_git_start_merge_reports_conflicts(tmp_path):
     """_git_start_merge: чистый merge → [], конфликт → список файлов."""
     repo = tmp_path / "repo"
