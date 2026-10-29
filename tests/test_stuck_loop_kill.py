@@ -82,6 +82,7 @@ def make_monitor_scheduler(source: TaskSource):
         imac_user=None,
         imac_ssh_key="",
         secrets_dir="/nonexistent-secrets",
+        model_fallbacks=lambda: [],  # старые ветки тестов: fallback отключён
     )
     s.state = types.SimpleNamespace(
         save=lambda t: None,

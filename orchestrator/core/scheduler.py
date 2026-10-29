@@ -576,6 +576,61 @@ class Scheduler:
         """Модель задачи: своя, либо модель по умолчанию."""
         return self._strip_provider(task.model) or self._default_model()
 
+    # ------------------------------------------------------------------ #
+    # Автосмена модели при сломанном tool-calling
+    # ------------------------------------------------------------------ #
+    _FALLBACK_LOG_MARK = "🎯 fallback"
+
+    def _fallbacks_used(self, task: Task) -> list[str]:
+        """Модели, на которых задача уже пыталась работать (по маркерам лога).
+
+        В маркере записано «{old} → {new} (причина)»: использованы ОБЕ —
+        и старая, и новая (на новой задача сейчас работает).
+        """
+        used: list[str] = []
+        for entry in task.log or []:
+            text = entry if isinstance(entry, str) else str(entry)
+            if self._FALLBACK_LOG_MARK not in text:
+                continue
+            tail = text.split(self._FALLBACK_LOG_MARK, 1)[-1].lstrip(": ").strip()
+            parts = tail.split("→")
+            if len(parts) == 2:
+                used.append(parts[0].strip())
+                used.append(parts[1].split("(", 1)[0].strip())
+        return used
+
+    def _next_fallback_model(self, task: Task) -> Optional[str]:
+        """Следующая модель из цепочки, на которой задача ещё не работала.
+
+        None — цепочка исчерпана (текущая модель тоже считается использованной).
+        """
+        chain = self.config.model_fallbacks()
+        current = self._effective_model(task)
+        tried = {current, *self._fallbacks_used(task)}
+        for model in chain:
+            if model not in tried:
+                return model
+        return None
+
+    def _switch_model_fallback(self, task: Task, reason: str) -> Optional[str]:
+        """Переключить задачу на следующую модель цепочки.
+
+        Возвращает новую модель или None, если цепочка исчерпана — тогда
+        вызывающий код роняет задачу по-старому.
+        """
+        model = self._next_fallback_model(task)
+        if not model:
+            return None
+        old = self._effective_model(task)
+        task.model = model
+        task.add_log(
+            f"{self._FALLBACK_LOG_MARK}: {old} → {model} ({reason})"
+        )
+        self.state.save(task)
+        logger.info("[fallback] task %s model %s -> %s (%s)",
+                    task.id, old, model, reason)
+        return model
+
     async def _finalize_cost(self, task: Task) -> None:
         """Посчитать стоимость работы модели (токены × сохранённые цены) в задаче.
 
@@ -1831,6 +1886,31 @@ class Scheduler:
             f"продолжаю с этапа коммита/пуша, агента заново НЕ запускаю.\n"
             f"{queue_note}Сообщу о результате.{fallback_note}",
         )
+        self._enqueue_task(task)
+
+    async def _restart_with_fallback_model(
+        self, task: Task, new_model: str, reason: str
+    ) -> None:
+        """Полный перезапуск задачи на новой модели (в обход очереди статусов).
+
+        По образцу _restart_task: свежий разговор и свежий клон — старый
+        workspace с веткой прошлого прогона мешает коммиту. Уведомление
+        автору уже отправляет вызывающий код.
+        """
+        task.attempt += 1
+        task.status = TaskStatus.READY
+        task.pr_url = None
+        task.conversation_id = None
+        task.finalize_only = False
+        task.clarification_question = None
+        task.clarification_answer = None
+        self.state.save(task)
+        shutil.rmtree(self._workspace_for(task), ignore_errors=True)
+        logger.info(
+            "[fallback] task %s restarting with model %s (attempt %d)",
+            task.id, new_model, task.attempt,
+        )
+        task.add_log(f"Перезапуск #{task.attempt} на модели {new_model}")
         self._enqueue_task(task)
 
     async def _restart_task(self, task: Task, query: dict) -> None:
@@ -3332,11 +3412,38 @@ class Scheduler:
                 else:
                     raw_tool_pauses = 0
                 if raw_tool_pauses >= self._RAW_TOOL_PAUSE_LIMIT and cmd_count == 0:
+                    broken_model = self._effective_model(task)
+                    fb_model = self._switch_model_fallback(
+                        task,
+                        "сломанный tool-calling: сырые вызовы текстом, "
+                        "команды не исполняются",
+                    )
+                    if fb_model:
+                        self._notify_author(
+                            task,
+                            f"⚠️ Модель {broken_model} не смогла выполнить ни "
+                            "одной команды (сломанный tool-calling: вызовы "
+                            "инструментов приходят текстом и не исполняются).\n"
+                            f"🔄 Автоматически переключаюсь на {fb_model} "
+                            "и перезапускаю задачу.",
+                        )
+                        if task.source == TaskSource.GITHUB:
+                            self._notify_admin(
+                                f"⚠️ {self._repo_full(task)}#"
+                                f"{task.source_id}: модель {broken_model} — "
+                                "сломанный tool-calling, авто-fallback на "
+                                f"{fb_model}."
+                            )
+                        await self._restart_with_fallback_model(
+                            task, fb_model, "broken tool-calling"
+                        )
+                        return
                     task.status = TaskStatus.FAILED
                     task.add_log(
                         "LLM-провайдер отдаёт сломанный tool-calling: "
                         f"{raw_tool_pauses} пауз подряд с сырым вызовом "
-                        f"инструмента текстом, исполненных команд: 0"
+                        f"инструмента текстом, исполненных команд: 0; "
+                        "цепочка fallback-моделей исчерпана"
                     )
                     await self._finalize_cost(task)
                     self.state.save(task)
@@ -3344,14 +3451,13 @@ class Scheduler:
                         task,
                         "❌ Агент не смог выполнить ни одной команды: LLM-провайдер "
                         "отдаёт сломанный tool-calling (вызовы инструментов приходят "
-                        "обычным текстом и не исполняются). Задача остановлена — "
-                        "перезапусти её позже, обычно это временный сбой провайдера.",
+                        "обычным текстом и не исполняются). Авто-смена модели не "
+                        "помогла — вся цепочка проверена. Перезапусти задачу позже.",
                     )
                     if task.source == TaskSource.GITHUB:
                         self._notify_admin(
-                            f"⚠️ LLM-провайдер ({self._effective_model(task)}): "
-                            "сломанный tool-calling — агент не исполнил ни одной "
-                            f"команды. Задача {self._repo_full(task)}#"
+                            f"⚠️ LLM-провайдер: сломанный tool-calling на ВСЕХ "
+                            f"fallback-моделях. Задача {self._repo_full(task)}#"
                             f"{task.source_id} «{task.title[:60]}» остановлена."
                         )
                     return
@@ -3500,9 +3606,31 @@ class Scheduler:
                     continue
                 task.status = TaskStatus.FAILED
                 if stuck_killed:
+                    # Зацикливание после ретрая — часто та же деградация
+                    # провайдера. Пробуем следующую модель цепочки.
+                    stuck_failed_model = self._effective_model(task)
+                    fb_model = self._switch_model_fallback(
+                        task, "зацикливание агента (AgentStuckInLoopError), "
+                        "ретрай не помог"
+                    )
+                    if fb_model:
+                        task.status = TaskStatus.READY
+                        self.state.save(task)
+                        self._notify_author(
+                            task,
+                            "🪓 OpenHands остановил агента: зацикливание, ретрай "
+                            f"не помог.\n🔄 Автоматически переключаюсь с "
+                            f"{stuck_failed_model} на {fb_model} и "
+                            "перезапускаю задачу.",
+                        )
+                        await self._restart_with_fallback_model(
+                            task, fb_model, "stuck in loop"
+                        )
+                        return
                     task.add_log(
                         "OpenHands killed task: агент зациклился "
-                        "(AgentStuckInLoopError) — ретрай не помог"
+                        "(AgentStuckInLoopError) — ретрай и fallback-модели "
+                        "не помогли"
                     )
                 else:
                     task.add_log(f"OpenHands failed: {error_msg}")
@@ -3516,10 +3644,10 @@ class Scheduler:
                     kill_text = (
                         "🪓 OpenHands остановил и убил задачу: агент зациклился "
                         "(AgentStuckInLoopError).\n\n"
-                        "Ретрай с перезапуском разговора не помог. Написанная "
-                        "работа сохранена в контейнере; после перезапуска задачи "
-                        "можно продолжить с того же места или изменить формулировку "
-                        "задачи, чтобы выйти из цикла.\n\n"
+                        "Ретрай и авто-смена модели не помогли (вся цепочка "
+                        "fallback-моделей проверена). После перезапуска задачи "
+                        "можно продолжить с того же места или изменить "
+                        "формулировку задачи, чтобы выйти из цикла.\n\n"
                         f"Лог выполнения:\n{log_text}"
                     )
                     self._notify_author(task, kill_text)
