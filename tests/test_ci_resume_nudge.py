@@ -100,6 +100,7 @@ def test_resume_spawns_watcher_on_failure():
     saved: list = []
     s.state = types.SimpleNamespace(save=lambda task: saved.append(task.id))
     s._ensure_workspace = lambda task: "/tmp/pw-ws"
+    s._repo_dirname = lambda task: "r"  # имя каталога из _repo_full
     s._spawn = spawned.append
     t = make_task()
     result = asyncio.run(s._resume_ci_loop(t))
@@ -108,7 +109,7 @@ def test_resume_spawns_watcher_on_failure():
     assert spawned, "вотчер должен быть заспавнен"
     locs = spawned[0].cr_frame.f_locals
     assert locs["run_id"] == 42
-    assert locs["client_dir"].endswith("social_mind")
+    assert locs["client_dir"].endswith("/r")
     assert locs["branch"] == "ai-task-tk-ci-r1"
     assert locs["comment_id"] == 77
     spawned[0].close()
@@ -218,6 +219,7 @@ def test_retrigger_resets_to_origin_branch():
     s.config = types.SimpleNamespace(git_author_name="pw", git_author_email="pw@x")
     s.state = types.SimpleNamespace(save=lambda task: None)
     s._ensure_workspace = lambda task: "/tmp/pw-ws"
+    s._repo_dirname = lambda task: "r"
     s._git_head_sha = _coro("abc123")
     ran: list = []
 

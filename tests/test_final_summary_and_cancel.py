@@ -148,6 +148,35 @@ def test_cancel_button_handler():
     assert done.status == TaskStatus.DONE  # завершённую не трогает
 
 
+def test_cancel_menu_button_cancels_github_task_for_admin():
+    """/cancel (кнопка меню «🚫 Отмена»): админ отменяет задачу из GitHub issue.
+
+    Раньше /cancel находил только Telegram-задачи своего чата — кнопка
+    отвечала «Нет активных задач», пока шла задача из issue (issue #48).
+    """
+    s, gh, tg = make_scheduler()
+    s.config = types.SimpleNamespace(
+        github_repo="PrigodaOleg/social_mind",
+        telegram_admin_chat_id="999",
+        telegram_admin_username="boss",
+        state_db="/tmp/pw-test-state/orchestrator.sqlite",
+    )
+    s._spawn = lambda coro: None
+    task = make_task(TaskStatus.RUNNING)  # source=GITHUB
+    s.state.save(task)
+
+    asyncio.run(s._handle_telegram_command("999", "/cancel", username="boss"))
+    assert task.status == TaskStatus.CANCELLED
+    assert any("отменена" in text and "social_mind#46" in text
+               for _, text in tg.sent)
+
+    # Не-админ GitHub-задачу через /cancel не отменяет.
+    other = make_task(TaskStatus.RUNNING)
+    s.state.save(other)
+    asyncio.run(s._handle_telegram_command("999", "/cancel", username=None))
+    assert other.status == TaskStatus.RUNNING
+
+
 def test_task_keyboard_has_cancel_for_active():
     """В клавиатуре активной задачи есть кнопка отмены; у завершённой — нет."""
     s, _, _ = make_scheduler()

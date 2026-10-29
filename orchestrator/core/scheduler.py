@@ -231,6 +231,23 @@ class Scheduler:
     def _workspace_for(self, task: Task) -> str:
         return os.path.join(self.config.work_dir, task.id)
 
+    def _repo_dirname(self, task: Task) -> str:
+        """Имя каталога репозитория: в workspace на хосте и /workspace в контейнере.
+
+        OpenHands клонирует репозиторий в /workspace/<имя-репо>; раньше путь
+        был захардкожен как social_mind — задачи из других репозиториев
+        падали на синке ("cd: /workspace/social_mind: No such file or
+        directory", zmk-config-hillside46).
+        """
+        name = (self._repo_full(task) or "").rstrip("/").rsplit("/", 1)[-1]
+        if name.endswith(".git"):
+            name = name[:-4]
+        return name or "social_mind"
+
+    def _container_ws(self, task: Task) -> str:
+        """Путь к репозиторию ВНУТРИ runtime-контейнера."""
+        return f"/workspace/{self._repo_dirname(task)}"
+
     async def _git_ahead_count(self, client_dir: str) -> int:
         """Сколько коммитов в ветке задачи сверх базовой (origin/main)."""
         proc = await asyncio.create_subprocess_exec(
@@ -607,6 +624,7 @@ class Scheduler:
         imac_item: str,
         tail_items: str,
         secrets_note: str,
+        repo_ws: str = "/workspace/social_mind",
     ) -> str:
         """Инструкция агенту из описания задачи и стандартных требований.
 
@@ -617,8 +635,8 @@ class Scheduler:
         instruction = (
             f"{description}\n\n"
             "ТРЕБОВАНИЯ:\n"
-            "1. Работай в папке /workspace/social_mind/domains/client "
-            "(внутри контейнера проект лежит в /workspace/social_mind)\n"
+            f"1. Работай в папке {repo_ws} "
+            f"(внутри контейнера репозиторий склонирован в {repo_ws})\n"
             "2. После внесения изменений запусти:\n"
             "   - flutter test\n"
             "   - flutter build linux\n"
@@ -972,7 +990,7 @@ class Scheduler:
             "💬 По твоему PR появились комментарии ревью. Ниже — замечания "
             "людей к твоим изменениям.\n\n"
             "Разберись в каждом замечании и внеси правки в своём рабочем "
-            "окружении (/workspace/social_mind). ПУШИТЬ НЕ НУЖНО: просто "
+            f"окружении ({self._container_ws(task)}). ПУШИТЬ НЕ НУЖНО: просто "
             "исправь код и сообщи, что готово — оркестратор сам допушит в "
             "ветку PR. Если замечание кажется спорным — объясни свою "
             "позицию текстом, я передам его ревьюеру. Если замечания "
@@ -1012,7 +1030,7 @@ class Scheduler:
                 "[pr-review] не удалось получить ветку PR для %s", task.id
             )
             return
-        client_dir = os.path.join(self._ensure_workspace(task), "social_mind")
+        client_dir = os.path.join(self._ensure_workspace(task), self._repo_dirname(task))
         new_run = await self._sync_and_push_ci_fix(
             task, client_dir, branch, old_sha=None
         )
@@ -1394,16 +1412,25 @@ class Scheduler:
 
         if cmd == "/cancel":
             active = self._get_active_task_for_chat(chat_id)
+            if not active and self._is_admin(username):
+                # Задачи из GitHub issues не привязаны к chat_id (issue #48):
+                # для админа отменяем текущую активную задачу любого источника.
+                active = self._get_any_active_task()
             if not active:
                 await self.telegram.send_message(
                     chat_id_int,
                     "🆕 Нет активных задач для отмены.",
                 )
                 return
+            src = (
+                f"{self._repo_full(active)}#{active.source_id}"
+                if active.source != TaskSource.TELEGRAM
+                else f"«{active.title[:50]}…»"
+            )
             self._cancel_task(active, "Отменено пользователем через /cancel")
             await self.telegram.send_message(
                 chat_id_int,
-                f"🚫 Задача «{active.title[:50]}…» отменена.",
+                f"🚫 Задача {src} отменена.",
             )
             return
 
@@ -2087,7 +2114,7 @@ class Scheduler:
             task.finalize_only = False  # one-shot: сбрасываем до финализации
             self.state.save(task)
             ws = self._ensure_workspace(task)
-            client_dir = os.path.join(ws, "social_mind")
+            client_dir = os.path.join(ws, self._repo_dirname(task))
             task.add_log("Финализация без агента: ветка → пуш → PR")
             self.state.save(task)
             try:
@@ -2130,7 +2157,7 @@ class Scheduler:
                 info = await self.openhands.get_agent_state(task.conversation_id)
                 if info.get("agent_state") is not None:
                     ws = self._ensure_workspace(task)
-                    client_dir = os.path.join(ws, "social_mind")
+                    client_dir = os.path.join(ws, self._repo_dirname(task))
                     task.add_log("Восстановление: переподключение к разговору OpenHands")
                     self.state.save(task)
                     await self._monitor_openhands(task, task.conversation_id, client_dir)
@@ -2374,7 +2401,7 @@ class Scheduler:
 
         Агент сам ходит на iMac по SSH и интерпретирует результаты сборки —
         от них зависят его дальнейшие действия. Ключ кладём ТОЛЬКО в
-        /tmp/pw-imac-key: в /workspace/social_mind нельзя — он оказался бы
+        /tmp/pw-imac-key: в /workspace/<repo> нельзя — он оказался бы
         в git-репозитории и уехал бы в PR.
 
         True — ключ установлен (или iMac не настроен). False — контейнер ещё
@@ -2434,16 +2461,16 @@ class Scheduler:
         )
 
     async def _ensure_build_secrets_in_runtime(
-        self, conversation_id: str, wait_for_container: bool = False
+        self, task: Task, conversation_id: str, wait_for_container: bool = False
     ) -> bool:
         """Прокинуть build-секреты внутрь runtime-контейнера.
 
         Контейнер ничего не монтирует (Mounts: []), а агент работает в
-        /workspace/social_mind ВНУТРИ контейнера — хост-копия ему не видна.
+        /workspace/<repo> ВНУТРИ контейнера — хост-копия ему не видна.
         Поэтому кладём файлы через docker cp в два места:
         - /tmp/pw-secrets/ — как только контейнер запущен (каталог создаётся
           всегда; запасной путь для агента);
-        - /workspace/social_mind/... — когда OpenHands уже склонировал
+        - /workspace/<repo>/... — когда OpenHands уже склонировал
           репозиторий (основное место для сборки).
 
         True — установлено (или нечего ставить). False — контейнер или
@@ -2483,10 +2510,11 @@ class Scheduler:
                 logger.warning("[secrets] docker cp %s failed: %s", name, err.strip())
 
         # 3. Основное место: /workspace/..., когда репозиторий уже склонирован.
+        ws_root = self._container_ws(task)
         code, out, _ = await self._run_in_container(
             container,
-            "c=0; [ -d /workspace/social_mind/domains/client ] && c=1; "
-            "a=0; [ -d /workspace/social_mind/domains/client/android/app ] && a=1; "
+            f"c=0; [ -d {ws_root}/domains/client ] && c=1; "
+            f"a=0; [ -d {ws_root}/domains/client/android/app ] && a=1; "
             'echo "$c $a"',
         )
         if code != 0:
@@ -2498,7 +2526,7 @@ class Scheduler:
         if not (client_ok or android_ok):
             return False  # репозиторий ещё не склонирован — повторим позже
 
-        dst = "/workspace/social_mind/domains/client"
+        dst = f"{ws_root}/domains/client"
         targets: list[tuple[str, str]] = []
         if client_ok and os.path.exists(os.path.join(src, "build.env")):
             targets.append(("build.env", f"{dst}/build.env"))
@@ -2522,8 +2550,8 @@ class Scheduler:
             f"for f in {dst}/build.env {dst}/android/app/google-services.json; do "
             '  [ -f "$f" ] && chmod 600 "$f" || true; '
             "done; "
-            "ex=/workspace/social_mind/.git/info/exclude; "
-            "if [ -d /workspace/social_mind/.git ]; then "
+            f"ex={ws_root}/.git/info/exclude; "
+            f"if [ -d {ws_root}/.git ]; then "
             '  mkdir -p "$(dirname "$ex")"; touch "$ex"; '
             "  for f in build.env google-services.json "
             "domains/client/build.env domains/client/android/app/google-services.json; do "
@@ -2682,7 +2710,7 @@ class Scheduler:
         self.state.save(task)
 
         ws = self._ensure_workspace(task)
-        client_dir = os.path.join(ws, "social_mind")
+        client_dir = os.path.join(ws, self._repo_dirname(task))
         repo_url = f"https://github.com/{self._repo_full(task)}.git"
 
         # Клонируем репозиторий в рабочую директорию
@@ -2717,6 +2745,7 @@ class Scheduler:
         # Инструкция для агента: внести изменения + запустить тесты и сборки внутри контейнера.
         # Путь — ВНУТРИ runtime-контейнера: там проект лежит в /workspace/<repo>.
         # (Путь /opt/openhands/workspace/... из хоста в контейнере не существует.)
+        repo_ws = self._container_ws(task)
         #
         # Проверка iOS: агент сам ходит на iMac по SSH (ключ кладёт
         # _ensure_imac_ssh_in_runtime в /tmp/pw-imac-key) и интерпретирует
@@ -2735,7 +2764,7 @@ class Scheduler:
                 "а на отдельном macOS-хосте по SSH. После успешных проверок из "
                 "пункта 2 сделай:\n"
                 "   a) скопируй проект на iMac (без build-артефактов):\n"
-                "      tar -C /workspace/social_mind/domains/client "
+                f"      tar -C {repo_ws} "
                 "--exclude=build --exclude=.dart_tool -cf - . | \\\n"
                 f"      {ssh} 'mkdir -p {imac_workdir}/client && "
                 f"tar -xf - -C {imac_workdir}/client'\n"
@@ -2796,6 +2825,7 @@ class Scheduler:
             imac_item=imac_item,
             tail_items=tail_items,
             secrets_note=secrets_note,
+            repo_ws=self._container_ws(task),
         )
         # Настраиваем LLM провайдера (provod.ai) перед каждым разговором —
         # модель берём из задачи (либо модель по умолчанию).
@@ -2855,7 +2885,9 @@ class Scheduler:
         if self._has_build_secrets():
             try:
                 staged = await self._ensure_build_secrets_in_runtime(
-                    conversation_id, wait_for_container=True
+                    task,
+                    conversation_id,
+                    wait_for_container=True,
                 )
             except Exception as exc:  # noqa: BLE001 — не мешаем старту агента
                 logger.warning("[secrets] ensure failed: %s", exc)
@@ -3160,7 +3192,7 @@ class Scheduler:
                 secrets_tries += 1
                 try:
                     secrets_done = await self._ensure_build_secrets_in_runtime(
-                        conversation_id
+                        task, conversation_id
                     )
                 except Exception as exc:  # noqa: BLE001 — не роняем мониторинг
                     logger.warning("[secrets] ensure failed: %s", exc)
@@ -3294,7 +3326,8 @@ class Scheduler:
                 # БЕЗ ни одной исполненной команды за весь разговор — деградация
                 # провайдера (задача #46, attempt 3: 17 сырых вызовов, 0 команд,
                 # 4 часа бесполезных подталкиваний). Роняем задачу сразу.
-                if "<function=" in message:
+                # <function=think> — легитимный инструмент агента, не считаем.
+                if "<function=" in message and "<function=think>" not in message:
                     raw_tool_pauses += 1
                 else:
                     raw_tool_pauses = 0
@@ -3691,6 +3724,14 @@ class Scheduler:
 
     _TOOL_CALL_RE = re.compile(r"<function=[^>]*>.*?(?:</function>|$)", re.DOTALL)
 
+    # Легитимный вызов инструмента think: модель оборачивает реплику в
+    # <function=think><parameter=thought>...</parameter></function> —
+    # содержимое thought и есть текстовая реплика агента (пропадали 💬
+    # в карточках задач и «Работа завершена» классифицировалась как announce).
+    _THOUGHT_RE = re.compile(
+        r"<parameter=thought>(.*?)(?:</parameter>|$)", re.DOTALL
+    )
+
     # Служебные сообщения агента, дублирующие команды/мысли — в реплики
     # для Telegram их не показываем (команды видны отдельно как $ ...).
     _AGENT_NOISE_RE = re.compile(
@@ -3708,8 +3749,18 @@ class Scheduler:
         вопросительные фразы ("which would break current clients"),
         которые ломали классификацию: объявление намерения считалось
         вопросом, задача уходила в ожидание ответа на два суток (issue #43).
+
+        Исключение — легитимный вызов `think`: это реплика агента
+        («Работа завершена…»), из неё достаём содержимое thought, а не
+        выбрасываем целиком (issue #47: реплики агента пропали из карточек,
+        отчёты классифицировались как announce → 4 бесполезных
+        авто-продолжения).
         """
-        return cls._TOOL_CALL_RE.sub(" ", message).strip()
+        return cls._TOOL_CALL_RE.sub(
+            lambda m: cls._THOUGHT_RE.search(m.group(0)).group(1)
+            if cls._THOUGHT_RE.search(m.group(0)) else " ",
+            message,
+        ).strip()
 
     @classmethod
     def _classify_agent_pause(cls, message: str) -> str:
@@ -3757,7 +3808,7 @@ class Scheduler:
     ) -> dict:
         """Перенести правки агента из runtime-контейнера на хост.
 
-        Агент работает в /workspace/social_mind внутри контейнера, а шаг PR
+        Агент работает в /workspace/<repo> внутри контейнера, а шаг PR
         смотрит в рабочую копию на хосте. Контейнер ничего не монтирует
         (Mounts: []), поэтому без копирования в PR попадает пустая ветка.
 
@@ -3768,7 +3819,7 @@ class Scheduler:
             return {"status": "skipped", "reason": "нет conversation_id"}
 
         container = f"openhands-runtime-{task.conversation_id}"
-        root = "/workspace/social_mind"
+        root = self._container_ws(task)
 
         # База — origin/main: это коммит, с которого начинался клон. Смотрим на
         # ВСЕ изменения с базы, включая те, что агент успел закоммитить внутри
@@ -4153,7 +4204,7 @@ class Scheduler:
             )
             task.ci_pending = True
             self.state.save(task)
-            client_dir = os.path.join(self._ensure_workspace(task), "social_mind")
+            client_dir = os.path.join(self._ensure_workspace(task), self._repo_dirname(task))
             self._spawn(self._watch_gha_artifacts(
                 task,
                 comment_id=gh.last_bot_comment_id(int(task.source_id)) or 0,
@@ -4175,7 +4226,7 @@ class Scheduler:
         task.add_log(f"CI-цикл возобновлён кнопкой «Подтолкнуть» ({conclusion}): {run_url}")
         task.ci_pending = True
         self.state.save(task)
-        client_dir = os.path.join(self._ensure_workspace(task), "social_mind")
+        client_dir = os.path.join(self._ensure_workspace(task), self._repo_dirname(task))
         self._spawn(self._watch_gha_artifacts(
             task,
             comment_id=gh.last_bot_comment_id(int(task.source_id)) or 0,
@@ -4198,7 +4249,7 @@ class Scheduler:
         пересылать логи агенту нечего. Пустой коммит в ветку триггерит новый
         прогон; возвращаем dict нового запуска или None.
         """
-        client_dir = os.path.join(self._ensure_workspace(task), "social_mind")
+        client_dir = os.path.join(self._ensure_workspace(task), self._repo_dirname(task))
         # Удалённая ветка — источник истины: рабочая копия могла разойтись
         # с ней (допуши агента, ручные правки) — тогда обычный пуш упадёт с
         # non-fast-forward (реальный случай, PR #46/#53). Сбрасываем на
@@ -4755,7 +4806,7 @@ class Scheduler:
             "⚠️ CI на GitHub провалился для твоего PR. Ниже хвосты логов "
             "упавших джоб.\n\n"
             "Разберись в причине и исправь код или workflow в своём рабочем "
-            "окружении (/workspace/social_mind). ПУШИТЬ НЕ НУЖНО: просто "
+            f"окружении ({self._container_ws(task)}). ПУШИТЬ НЕ НУЖНО: просто "
             "внеси правки (можно закоммитить) и сообщи, что готово. "
             "Оркестратор сам заберёт изменения и допушит в ветку PR — CI "
             "перезапустится, о результате сообщу отдельно. Если проблема "
@@ -4881,7 +4932,7 @@ class Scheduler:
     async def _resolve_merge_conflict(self, task: Task) -> None:
         """Довести PR до мержа: локальный merge base-ветки, конфликт — воркеру."""
         self._merge_cycles[task.id] = True
-        client_dir = os.path.join(self._ensure_workspace(task), "social_mind")
+        client_dir = os.path.join(self._ensure_workspace(task), self._repo_dirname(task))
         try:
             await self._resolve_merge_conflict_impl(task, client_dir)
         except Exception as exc:  # noqa: BLE001
@@ -5085,7 +5136,7 @@ class Scheduler:
         if not conversation_id:
             return False
         container = f"openhands-runtime-{conversation_id}"
-        root = "/workspace/social_mind"
+        root = self._container_ws(task)
         # В контейнер кладём только файлы, существующие на хосте (add/add,
         # both modified). Удалённые одной из сторон воркеру придёт списком.
         for rel in conflicts:
@@ -5136,7 +5187,7 @@ class Scheduler:
             f"⚠️ Твой PR конфликтует с веткой {base_ref} — GitHub не даст "
             "его смержить, пока конфликт не разрешён. Ты не видишь GitHub, "
             "поэтому оркестратор уже подготовил всё в твоём рабочем "
-            "окружении (/workspace/social_mind):\n"
+            f"окружении ({self._container_ws(task)}):\n"
             f"- ветка {base_ref} слита в твою ветку ЛОКАЛЬНО (без коммита);\n"
             f"{prepared}\n\n"
             "Конфликтные файлы:\n"
