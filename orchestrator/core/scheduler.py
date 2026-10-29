@@ -4849,6 +4849,21 @@ class Scheduler:
                 self.github_for(task.repo).get_pr_merge_info, task.pr_url
             )
             if not info or info.get("merged") or info.get("state") == "closed":
+                # PR смержен или закрыт: снять «⏳ CI-проверка PR» (GHA-вотчер
+                # мог умереть до финала и не снять флаг) и попрощаться.
+                if task.ci_pending:
+                    task.ci_pending = False
+                    task.add_log(
+                        "PR смержен" if info and info.get("merged")
+                        else "PR закрыт без мержа"
+                    )
+                    self.state.save(task)
+                    self._merge_rounds.pop(task.id, None)
+                    if info and info.get("merged"):
+                        self._notify_author(
+                            task,
+                            "✅ PR смержен в основную ветку — задача полностью завершена.",
+                        )
                 continue
             mstate = info.get("mergeable_state")
             if mstate not in self._MERGE_DIRTY_STATES:
