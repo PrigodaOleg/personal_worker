@@ -134,6 +134,33 @@ class Config:
             self._raw_get("openhands", "llm_model", default="gpt-4o"),
         )
 
+    def model_fallbacks(self) -> list[str]:
+        """Цепочка автосмены модели при сломанном tool-calling.
+
+        Порядок — по возрастанию цены среди моделей, прошедших пробу в
+        реальном OpenHands (окт 2026): gpt-5.6-luna ($0.20/$1.20, SWE ~93),
+        glm-5.3-flashx ($0.37/$1.25, SWE 90), kimi-k2.7-code ($0.95/$4.0 —
+        подтверждена реальной задачей), glm-5.3 ($1.40/$4.40, SWE 95.4),
+        grok-4.6 ($2.00/$6.00, SWE 95.6). Модели, сломавшиеся даже на
+        мини-пробе (qwen3.8-flash, minimax-m2.7, deepseek-v4-pro, gpt-5.4),
+        в цепочку не входят.
+        """
+        raw = self._env(
+            "MODEL_FALLBACKS",
+            self._raw_get("openhands", "model_fallbacks", default=None),
+        )
+        if isinstance(raw, str) and raw.strip():
+            return [m.strip() for m in raw.split(",") if m.strip()]
+        if isinstance(raw, list) and raw:
+            return [str(m).strip() for m in raw if str(m).strip()]
+        return [
+            "gpt-5.6-luna",
+            "glm-5.3-flashx",
+            "kimi-k2.7-code",
+            "glm-5.3",
+            "grok-4.6",
+        ]
+
     # --- iMac ---
     @staticmethod
     def _placeholder(value: str | None) -> str | None:
