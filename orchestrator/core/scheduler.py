@@ -3547,6 +3547,34 @@ class Scheduler:
                 error_msg = (info.get("message") or f"агент в состоянии {state_val}")
                 reason = info.get("error_reason") or ""
                 stuck_killed = self._is_stuck_loop_error(reason)
+                access_problem = self._provider_access_error(reason or error_msg)
+                if state_val == "error" and access_problem:
+                    # Отказ провайдера по балансу/ключу: ретраи бессмысленны —
+                    # каждый запрос будет отклонён. Роняем сразу с диагнозом.
+                    task.status = TaskStatus.FAILED
+                    task.add_log(
+                        f"LLM-провайдер отклонил запрос: {access_problem}; "
+                        f"причина: {reason or error_msg}"
+                    )
+                    await self._finalize_cost(task)
+                    self.state.save(task)
+                    log_text = "\n".join(task.log[-15:]) if task.log else ""
+                    self._notify_author(
+                        task,
+                        f"❌ Задача остановлена: {access_problem}.\n\n"
+                        f"Ошибка провайдера: {(reason or error_msg)[:300]}\n\n"
+                        "Ретраи не выполнялись — запросы будут отклоняться, "
+                        "пока проблема не устранена.\n\n"
+                        f"Лог выполнения:\n{log_text}",
+                    )
+                    # Это влияет на ВСЕ задачи — админу отдельно и сразу.
+                    self._notify_admin(
+                        f"⚠️ LLM-провайдер: {access_problem}. Задача "
+                        f"{self._repo_full(task)}#{task.source_id} "
+                        f"«{task.title[:60]}» остановлена. Новые задачи будут "
+                        "падать, пока баланс/ключ не восстановят."
+                    )
+                    return
                 if state_val == "error" and stuck_killed and stuck_retries < 1:
                     # OpenHands сам остановил агента (зацикливание). Один ретрай:
                     # свежий старт разговора — обычно модель не повторяет цикл.
@@ -3737,6 +3765,44 @@ class Scheduler:
         "connection error", "Connection error", "ConnectionError",
         "APIConnectionError", "connect", "unreachable", "reset by peer",
     )
+
+    # Ошибки доступа к LLM-провайдеру: ноль на балансе или отклонённый ключ.
+    # LiteLLM заворачивает их в непонятные исключения (например, 402 от
+    # провайдера приходит как APIConnectionError) и без специального
+    # разбора задача ретраится до исчерпания и падает с невнятным текстом.
+    # Ретраи при таких ошибках бессмысленны — запрос будет отклонён, пока
+    # баланс/ключ не восстановят. «Rate limit»/«quota» от rate-limiting тут
+    # НЕ входят: это временные ошибки, их ловит _TRANSIENT_ERROR_MARKERS.
+    _BILLING_ERROR_MARKERS = (
+        "402", "insufficient", "payment required", "billing",
+        "недостаточно средств", "недостаточно денег", "ноль на балансе",
+        "пополните баланс", "余额不足", "no credits", "credit balance",
+        "arrears", "debt",
+    )
+    _AUTH_ERROR_MARKERS = (
+        "401", "unauthorized", "forbidden", "invalid api key",
+        "invalid_api_key", "incorrect api key", "authentication",
+        "authenticationerror", "unauthenticated", "api key not valid",
+        "отклонён ключ", "неверный ключ",
+    )
+
+    @classmethod
+    def _provider_access_error(cls, reason: str) -> Optional[str]:
+        """Класс ошибки доступа к LLM-провайдеру или None.
+
+        Возвращает человекочитаемый диагноз («ноль на балансе провайдера»,
+        «ключ провайдера отклонён»), если причина — отказ провайдера по
+        балансу или авторизации. Такие ошибки НЕ временные: ретраить
+        бессмысленно, задачу нужно ронять сразу.
+        """
+        lowered = (reason or "").lower()
+        if not lowered:
+            return None
+        if any(m.lower() in lowered for m in cls._AUTH_ERROR_MARKERS):
+            return "ключ провайдера отклонён (401/403)"
+        if any(m.lower() in lowered for m in cls._BILLING_ERROR_MARKERS):
+            return "ноль на балансе провайдера"
+        return None
 
     @classmethod
     def _is_transient_agent_error(cls, reason: str) -> bool:

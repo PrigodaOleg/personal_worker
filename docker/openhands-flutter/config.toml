@@ -13,3 +13,17 @@
 # docker_runtime_kwargs передаётся напрямую в docker containers.run().
 [sandbox]
 docker_runtime_kwargs = { devices = ["/dev/kvm"] }
+
+# Нативный function calling для ВСЕХ моделей.
+#
+# Без этого OpenHands доверяет нативные tool-calls только моделям из
+# зашитого списка (openhands/llm/model_features.py: gpt-5*, claude-*,
+# qwen3-coder, ...). Для «неизвестных» (glm, kimi, minimax, grok,
+# deepseek-v4) включается ТЕКСТОВЫЙ формат: модель учится писать
+# <function=...><parameter=...> обычным текстом, и на длинных задачах
+# метается между форматами — забывает security_risk, выдаёт сырую
+# разметку, исполняет пустые команды. Провайдер (provod.ai) при этом
+# отдаёт полноценные нативные tool_calls — что подтверждают probes через
+# raw API и стабильная работа тех же моделей в kilocode.
+[llm]
+native_tool_calling = true
