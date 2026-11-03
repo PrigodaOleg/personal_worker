@@ -339,3 +339,45 @@ def test_fetch_pr_feedback_sees_inline_comments():
     assert fb[0]["kind"] == "inline"
     assert fb[0]["path"] == "domains/client/web/isar.wasm"
     assert "блоб" in fb[0]["body"]
+
+
+# ------------------------------------------------------------------ #
+# ci_pending: пока хвост ревью активен (агент правит замечания), карточка
+# задачи не должна висеть «✅ завершена» (PR #36).
+# ------------------------------------------------------------------ #
+
+def test_review_tail_sets_ci_pending_flag():
+    feedback = [{"id": 10, "author": "alice", "kind": "issue_comment",
+                 "body": "fix"}]
+    s = make_scheduler(feedback)
+    task = make_done_task()
+    s.state.save(task)
+
+    async def ok(cid, message):
+        return {"success": True}
+
+    async def pushed(*a, **kw):
+        return {"id": 123}
+
+    s.openhands.send_message = ok
+    s._sync_and_push_ci_fix = pushed
+    asyncio.run(s._handle_pr_feedback(task, feedback, 10))
+    # Правки запушены, вотчер заспавнен — флаг остаётся до конца хвоста
+    # (снимет _watch_gha_artifacts в finally).
+    assert task.ci_pending is True
+
+
+def test_review_tail_clears_flag_when_no_fixes():
+    feedback = [{"id": 10, "author": "alice", "kind": "issue_comment",
+                 "body": "fix"}]
+    s = make_scheduler(feedback)
+    task = make_done_task()
+    s.state.save(task)
+
+    async def ok(cid, message):
+        return {"success": True}
+
+    # _sync_and_push_ci_fix из make_scheduler возвращает None (правок нет).
+    s.openhands.send_message = ok
+    asyncio.run(s._handle_pr_feedback(task, feedback, 10))
+    assert task.ci_pending is False
