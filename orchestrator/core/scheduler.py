@@ -1038,10 +1038,39 @@ class Scheduler:
             if not feedback:
                 continue
             max_id = max(f["id"] for f in feedback)
-            self.state.set_setting(key, str(max_id))
-            self._spawn(self._handle_pr_feedback(task, feedback))
+            # Маркер продвигаем ТОЛЬКО после успешной доставки (внутри
+            # _handle_pr_feedback): иначе неудачная доставка терялась
+            # навсегда — комментарий ревью так и не доходил до агента.
+            self._spawn(self._handle_pr_feedback(task, feedback, max_id))
 
-    async def _handle_pr_feedback(self, task: Task, feedback: list[dict]) -> None:
+    async def _wait_conversation_ready(
+        self, conversation_id: str, timeout_s: int = 180
+    ) -> bool:
+        """Дождаться готовности разговора OpenHands к приёму сообщений.
+
+        После start_conversation разговор ещё STARTING: рантайм-контейнер
+        создаётся десятки секунд, и немедленный send_message падает
+        (404/таймаут). Готовность — runtime_status == STATUS$READY
+        (поле status при этом RUNNING/IDLE). Таймаут и интервал опроса —
+        атрибуты conversation_ready_timeout / conversation_ready_poll_s
+        (переопределяются в тестах).
+        """
+        timeout_s = int(getattr(self, "conversation_ready_timeout", 180))
+        poll_s = float(getattr(self, "conversation_ready_poll_s", 5))
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            info = await self.openhands.get_status(conversation_id)
+            if info.get("runtime_status") == "STATUS$READY":
+                return True
+            # 404 — разговор удалён, ждать бессмысленно.
+            if "404" in str(info.get("error", "")):
+                return False
+            await asyncio.sleep(poll_s)
+        return False
+
+    async def _handle_pr_feedback(
+        self, task: Task, feedback: list[dict], max_id: int
+    ) -> None:
         """Переслать замечания ревью агенту и допушить исправления."""
         parts = []
         for f in feedback:
@@ -1070,22 +1099,77 @@ class Scheduler:
                 "[pr-review] нет conversation_id у задачи %s", task.id
             )
             return
+        key = f"pr_review_last_id:{task.id}"
+        attempts_key = f"pr_review_attempts:{task.id}"
         res = await self.openhands.send_message(conversation_id, message)
         if res.get("status") == "error" or res.get("success") is False:
-            # Разговор погас после завершения задачи — будим и повторяем.
-            await self.openhands.start_conversation(conversation_id)
-            res = await self.openhands.send_message(conversation_id, message)
-            if res.get("status") == "error" or res.get("success") is False:
+            # Разговор погас после завершения задачи — будим, ждём
+            # готовности рантайма и повторяем. Немедленный ретрай не
+            # работает: после start_conversation разговор ещё STARTING,
+            # send_message падает (404/таймаут), и фидбэк терялся.
+            started = await self.openhands.start_conversation(conversation_id)
+            if "404" in str(started.get("error", "")):
+                # Разговор удалён из OpenHands — доставить некуда.
                 logger.error(
-                    "[pr-review] не удалось доставить ревью агенту: %s", res
+                    "[pr-review] разговор %s удалён — фидбэк задачи %s "
+                    "доставить невозможно", conversation_id, task.id,
                 )
+                self.state.set_setting(key, str(max_id))
+                self.state.set_setting(attempts_key, "0")
                 self._notify_author(
                     task,
                     "💬 По твоему PR есть новые комментарии ревью, но "
-                    "передать их агенту не удалось (разговор закрыт?). "
-                    "Разберись вручную или перезапусти задачу.",
+                    "разговор агента уже удалён из OpenHands — передать "
+                    "их некому. Разберись вручную или создай новую "
+                    "задачу.",
                 )
                 return
+            if not await self._wait_conversation_ready(conversation_id):
+                # Транзиентный сбой: маркер НЕ продвигаем — следующий
+                # опрос ретрайнет доставку. Ограничиваем число попыток.
+                attempts = int(self.state.get_setting(attempts_key, "0") or 0) + 1
+                self.state.set_setting(attempts_key, str(attempts))
+                if attempts >= 5:
+                    logger.error(
+                        "[pr-review] разговор %s так и не готов после %d "
+                        "попыток — сдаёмся", conversation_id, attempts,
+                    )
+                    self.state.set_setting(key, str(max_id))
+                    self.state.set_setting(attempts_key, "0")
+                    self._notify_author(
+                        task,
+                        "💬 По твоему PR есть комментарии ревью, но "
+                        "разговор агента не удаётся поднять — передать "
+                        "их не удалось. Разберись вручную.",
+                    )
+                else:
+                    logger.warning(
+                        "[pr-review] разговор %s не готов (попытка %d) — "
+                        "ретрай в следующем опросе", conversation_id, attempts,
+                    )
+                return
+            res = await self.openhands.send_message(conversation_id, message)
+            if res.get("status") == "error" or res.get("success") is False:
+                # Ретрай в следующем опросе (маркер не продвинут).
+                attempts = int(self.state.get_setting(attempts_key, "0") or 0) + 1
+                self.state.set_setting(attempts_key, str(attempts))
+                logger.warning(
+                    "[pr-review] доставка не удалась (попытка %d): %s",
+                    attempts, res.get("error"),
+                )
+                if attempts >= 5:
+                    self.state.set_setting(key, str(max_id))
+                    self.state.set_setting(attempts_key, "0")
+                    self._notify_author(
+                        task,
+                        "💬 По твоему PR есть комментарии ревью, но "
+                        "передать их агенту не удаётся несколько раз. "
+                        "Разберись вручную или перезапусти задачу.",
+                    )
+                return
+        # Доставлено — продвигаем маркер и сбрасываем счётчик попыток.
+        self.state.set_setting(key, str(max_id))
+        self.state.set_setting(attempts_key, "0")
         # Агент получил замечания — ждём правки и допушиваем.
         branch = self.github_for(task.repo).fetch_pr_head_branch(task.pr_url)
         if not branch:

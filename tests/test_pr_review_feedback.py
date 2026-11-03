@@ -69,6 +69,10 @@ def make_scheduler(feedback=None) -> Scheduler:
     s._background_tasks = set()
     s._pending_notifications = set()
     s._notify_author_calls: list = []
+    # Для тестов: ожидание готовности разговора выключено (переопределяется
+    # в тестах, где оно проверяется).
+    s.conversation_ready_timeout = 0
+    s.conversation_ready_poll_s = 0.01
     # Для тестов: троттлинг опроса отключён.
     s.review_poll_min_interval = 0
     # Допуш в тестах не выполняем: правок в контейнере нет.
@@ -122,14 +126,14 @@ def test_poll_forwards_feedback_to_agent():
     s.openhands.send_message = capture
     s._poll_pr_review_feedback()
     # _spawn заглушён — вызовем хендлер вручную.
-    asyncio.run(s._handle_pr_feedback(task, feedback))
+    asyncio.run(s._handle_pr_feedback(task, feedback, 11))
 
     assert "ПУШИТЬ НЕ НУЖНО" in s.captured
     assert "добавь тест на пустой ввод" in s.captured
 
 
 def test_feedback_state_tracked_in_settings():
-    """После обработки «после какого id» сохранён — повторный poll пуст."""
+    """Маркер «после какого id» продвигается только после доставки."""
     feedback = [
         {"id": 10, "author": "alice", "kind": "issue_comment", "body": "fix"},
     ]
@@ -140,12 +144,108 @@ def test_feedback_state_tracked_in_settings():
 
     s._poll_pr_review_feedback()
     key = "pr_review_last_id:tk9"
+    # Доставки ещё не было (_spawn заглушён) — маркер НЕ продвинут.
+    assert s.state.get_setting(key) is None
+
+    # Успешная доставка → маркер продвинут.
+    async def ok(cid, message):
+        return {"success": True}
+
+    s.openhands.send_message = ok
+    asyncio.run(s._handle_pr_feedback(task, feedback, 10))
     assert s.state.get_setting(key) == "10"
 
-    # Новых комментариев нет → после первого опроса feedback отдаётся пустой.
+    # Новых комментариев нет → после доставки feedback отдаётся пустой.
     s.github._feedback = []
     s._poll_pr_review_feedback()
     assert s.github.feedback_calls[-1] == (task.pr_url, 10)
+
+
+def test_failed_delivery_not_consumed_and_retried():
+    """Неудачная доставка не продвигает маркер — ретрай в след. опросе."""
+    feedback = [{"id": 10, "author": "alice", "kind": "issue_comment",
+                 "body": "fix"}]
+    s = make_scheduler(feedback)
+    task = make_done_task()
+    s.state.save(task)
+
+    async def fail(cid, message):
+        return {"status": "error", "error": "boom"}
+
+    async def not_ready(cid):
+        return {"status": "error", "error": "timeout"}
+
+    async def start_ok(cid):
+        return {"status": "ok"}
+
+    s.openhands.send_message = fail
+    s.openhands.get_status = not_ready
+    s.openhands.start_conversation = start_ok
+    s._poll_pr_review_feedback()
+    asyncio.run(s._handle_pr_feedback(task, feedback, 10))
+    assert s.state.get_setting("pr_review_last_id:tk9") is None
+    assert s.state.get_setting("pr_review_attempts:tk9") == "1"
+    assert s._notify_author_calls == []
+
+
+def test_deleted_conversation_notifies_and_consumes():
+    """Разговор удалён (404 на start) — уведомление, маркер продвинут."""
+    feedback = [{"id": 10, "author": "alice", "kind": "issue_comment",
+                 "body": "fix"}]
+    s = make_scheduler(feedback)
+    task = make_done_task()
+    s.state.save(task)
+
+    async def fail(cid, message):
+        return {"status": "error", "error": "404 Not Found"}
+
+    async def start_404(cid):
+        return {"status": "error", "error": "404 Not Found"}
+
+    s.openhands.send_message = fail
+    s.openhands.start_conversation = start_404
+    s._poll_pr_review_feedback()
+    asyncio.run(s._handle_pr_feedback(task, feedback, 10))
+    # Маркер продвинут — вечных ретраев по мёртвому разговору не будет.
+    assert s.state.get_setting("pr_review_last_id:tk9") == "10"
+    assert len(s._notify_author_calls) == 1
+    assert "удалён" in s._notify_author_calls[0]
+
+
+def test_wakes_stopped_conversation_and_waits_for_ready():
+    """Погасший разговор: start → ожидание STATUS$READY → повторная отправка."""
+    feedback = [{"id": 10, "author": "alice", "kind": "issue_comment",
+                 "body": "fix"}]
+    s = make_scheduler(feedback)
+    task = make_done_task()
+    s.state.save(task)
+    calls: list[str] = []
+
+    async def send(cid, message):
+        calls.append("send")
+        # Первая попытка — разговор ещё спит; вторая — доставлено.
+        return ({"status": "error", "error": "404"} if len(calls) == 1
+                else {"success": True})
+
+    statuses = iter([
+        {"status": "STARTING", "runtime_status": "STATUS$STARTING"},
+        {"status": "RUNNING", "runtime_status": "STATUS$READY"},
+    ])
+
+    async def get_status(cid):
+        return next(statuses)
+
+    async def start_ok(cid):
+        calls.append("start")
+        return {"status": "ok"}
+
+    s.openhands.send_message = send
+    s.openhands.get_status = get_status
+    s.openhands.start_conversation = start_ok
+    s.conversation_ready_timeout = 5  # разрешаем цикл ожидания
+    asyncio.run(s._handle_pr_feedback(task, feedback, 10))
+    assert calls == ["send", "start", "send"]
+    assert s.state.get_setting("pr_review_last_id:tk9") == "10"
 
 
 def test_review_message_contains_author_path_and_instruction():
@@ -163,7 +263,7 @@ def test_review_message_contains_author_path_and_instruction():
         return {"success": True}
 
     s.openhands.send_message = capture
-    asyncio.run(s._handle_pr_feedback(task, feedback))
+    asyncio.run(s._handle_pr_feedback(task, feedback, 11))
     msg = s.captured
     assert "review:changes_requested от @alice" in msg
     assert "inline от @bob (a/b.dart)" in msg
