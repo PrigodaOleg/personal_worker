@@ -1211,8 +1211,50 @@ class Scheduler:
                 branch=branch,
             ))
         else:
-            # Правок нет — хвост ревью закончен, снимаем ⏳. Агент всё же
-            # отвечал (разбор замечаний/пояснение) — пересчитываем стоимость.
+            # Правок нет — но это не значит, что хвоста нет: пуш мог быть
+            # сделан вне цикла (руками/другим источником) с уже запущенным
+            # CI-прогоном. Если прогон текущего head жив или совсем свежий
+            # (успех менее часа назад) — продолжаем хвост вотчером, а не
+            # бросаем его без присмотра.
+            head_sha = await asyncio.to_thread(
+                self.github_for(task.repo).get_pr_head_sha, task.pr_url
+            )
+            resumed: Optional[dict] = None
+            if head_sha:
+                for run in await asyncio.to_thread(
+                    self.github_for(task.repo).list_workflow_runs, head_sha
+                ):
+                    if run["status"] != "completed":
+                        resumed = run
+                        break
+                    if run.get("conclusion") == "success":
+                        fresh = await asyncio.to_thread(
+                            self.github_for(task.repo).find_workflow_run,
+                            head_sha,
+                            timeout_s=0,
+                        )
+                        resumed = fresh or run
+                        break
+            if resumed:
+                task.add_log(
+                    f"Правок нет, но CI head уже идёт/завершился — "
+                    f"продолжаю хвост: {resumed['html_url']}"
+                )
+                self.state.save(task)
+                self._spawn(self._watch_gha_artifacts(
+                    task,
+                    comment_id=self.github_for(task.repo).last_bot_comment_id(
+                        int(task.source_id)
+                    ) or 0,
+                    comment_body="",
+                    run_id=resumed["id"],
+                    client_dir=client_dir,
+                    branch=branch,
+                ))
+                return
+            # Действительно правок нет и CI нет: хвост ревью закончен.
+            # Агент всё же отвечал (разбор замечаний/пояснение) —
+            # пересчитываем стоимость.
             task.ci_pending = False
             self.state.save(task)
             await self._finalize_cost(task)
