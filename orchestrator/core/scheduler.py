@@ -1170,17 +1170,30 @@ class Scheduler:
         # Доставлено — продвигаем маркер и сбрасываем счётчик попыток.
         self.state.set_setting(key, str(max_id))
         self.state.set_setting(attempts_key, "0")
+        # Хвост ревью активен: агент правит замечания (десятки минут до
+        # допуша и вотчера). Ставим ci_pending сразу — иначе карточка всё
+        # это время висит «✅ завершена» (PR #36).
+        task.ci_pending = True
+        self.state.save(task)
         # Агент получил замечания — ждём правки и допушиваем.
         branch = self.github_for(task.repo).fetch_pr_head_branch(task.pr_url)
         if not branch:
             logger.error(
                 "[pr-review] не удалось получить ветку PR для %s", task.id
             )
+            task.ci_pending = False
+            self.state.save(task)
             return
         client_dir = os.path.join(self._ensure_workspace(task), self._repo_dirname(task))
-        new_run = await self._sync_and_push_ci_fix(
-            task, client_dir, branch, old_sha=None
-        )
+        try:
+            new_run = await self._sync_and_push_ci_fix(
+                task, client_dir, branch, old_sha=None
+            )
+        except Exception as exc:  # noqa: BLE001 — не оставлять вечный ⏳
+            logger.error("[pr-review] sync/push failed for %s: %s", task.id, exc)
+            task.ci_pending = False
+            self.state.save(task)
+            return
         if new_run:
             task.add_log(
                 f"Правки по ревью запушены — прогон CI: "
@@ -1198,6 +1211,9 @@ class Scheduler:
                 branch=branch,
             ))
         else:
+            # Правок нет — хвост ревью закончен, снимаем ⏳.
+            task.ci_pending = False
+            self.state.save(task)
             self._notify_author(
                 task,
                 "💬 Комментарии ревью отправлены агенту, но правок он не "
