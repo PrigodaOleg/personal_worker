@@ -8,7 +8,7 @@ from __future__ import annotations
 import logging
 import re
 import time
-from typing import Optional
+from typing import Any, Optional
 
 import requests
 from github import Github
@@ -232,15 +232,25 @@ class GitHubAdapter:
             input={"body": body},
         )
 
-    def _gh_api(self, method: str, path: str, input: Optional[dict] = None) -> dict:
-        """Вызов GitHub API от имени установки, возвращает JSON-ответ."""
+    def _gh_api(
+        self, method: str, path: str, input: Optional[dict] = None
+    ) -> Any:
+        """Вызов GitHub API от имени установки, возвращает JSON-ответ.
+
+        ВАЖНО: для списковых эндпоинтов (комментарии PR, ревью) GitHub
+        возвращает JSON-МАССИВ — возвращаем его как есть. Раньше здесь
+        было `return data if isinstance(data, dict) else {}`, и массивы
+        молча превращались в пустой dict: fetch_pr_feedback всегда был
+        пуст, хвост ревью не работал (PR #67: 2 инлайн-комментария не
+        доставлялись агенту).
+        """
         self._ensure_auth()
         assert self._repo is not None
         kw = {"input": input} if input is not None else {}
         _h, data = self._repo.requester.requestJsonAndCheck(
             method, f"{self._repo.url}{path}", **kw
         )
-        return data if isinstance(data, dict) else {}
+        return data
 
     def find_workflow_run(
         self, head_sha: str, timeout_s: int = 40, poll_every_s: float = 8.0

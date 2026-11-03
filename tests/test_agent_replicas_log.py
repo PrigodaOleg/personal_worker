@@ -172,3 +172,53 @@ def test_no_conversation_placeholder():
     s = make_scheduler([])
     out = asyncio.run(s._collect_task_logs(None))
     assert "не запускалась" in out
+
+
+# ------------------------------------------------------------------ #
+# Нативный tool-calling: реплики приходят в args.thought action-событий,
+# а не отдельными message-событиями (issue #47 повторился).
+# ------------------------------------------------------------------ #
+
+def test_thought_in_action_events_shown_as_remark():
+    events = [
+        {"source": "agent", "action": "run",
+         "args": {"thought": "Проверю workflows на уровне репозитория.",
+                  "command": "ls .github/workflows"}},
+        {"observation": "run", "extras": {
+            "command": "ls .github/workflows",
+            "metadata": {"exit_code": 0},
+        }},
+        {"source": "agent", "action": "edit",
+         "args": {"thought": "Правлю storage: убираю блоб из репозитория."}},
+    ]
+    out = run(make_scheduler(events), make_task())
+    assert "💬 Проверю workflows на уровне репозитория." in out
+    assert "💬 Правлю storage: убираю блоб из репозитория." in out
+    assert "$ ls .github/workflows" in out
+    assert out.index("💬 Проверю") < out.index("$ ls") < out.index("💬 Правлю")
+
+
+def test_thought_without_text_not_shown():
+    # У большинства action-событий thought пуст — реплика не дублируется.
+    events = [
+        {"source": "agent", "action": "run",
+         "args": {"command": "flutter test", "thought": ""}},
+        {"observation": "run", "extras": {
+            "command": "flutter test", "metadata": {"exit_code": 0}}},
+    ]
+    out = run(make_scheduler(events), make_task())
+    assert out.count("💬") == 0
+    assert "$ flutter test" in out
+
+
+def test_thought_noise_and_finish_hidden():
+    # Служебные thoughts (Running command...) и финальный отчёт finish
+    # репликами не считаются.
+    events = [
+        {"source": "agent", "action": "run",
+         "args": {"thought": "Running command: ls", "command": "ls"}},
+        {"source": "agent", "action": "finish",
+         "args": {"message": "Работа завершена. Всё сделано."}},
+    ]
+    out = run(make_scheduler(events), make_task())
+    assert out.count("💬") == 0
