@@ -381,3 +381,53 @@ def test_review_tail_clears_flag_when_no_fixes():
     s.openhands.send_message = ok
     asyncio.run(s._handle_pr_feedback(task, feedback, 10))
     assert task.ci_pending is False
+
+
+# ------------------------------------------------------------------ #
+# Стоимость задачи должна учитываться с работой агента в хвостах
+# (автофикс CI, правки по ревью) — токены копятся в разговоре.
+# ------------------------------------------------------------------ #
+
+def test_replace_cost_line_updates_existing():
+    s = make_scheduler([])
+    task = make_done_task()
+    task.tokens_prompt, task.tokens_completion, task.cost_rub = 100, 50, 12.5
+    body = (
+        "✅ Задача выполнена! PR создан: https://github.com/x/y/pull/1\n"
+        "Стоимость: 1.00 ₽ (вход 10 / выход 5 ток.)\n"
+        "<!-- artifacts -->"
+    )
+    out = s._replace_cost_line(body, task)
+    assert "Стоимость: 12.50 ₽ (вход 100 / выход 50 ток.)" in out
+    assert out.count("Стоимость:") == 1
+    assert "<!-- artifacts -->" in out
+
+
+def test_replace_cost_line_without_line_noop():
+    s = make_scheduler([])
+    task = make_done_task()
+    task.cost_rub = 3.0
+    body = "Просто текст без стоимости"
+    assert s._replace_cost_line(body, task) == body
+
+
+def test_no_fixes_branch_recomputes_cost():
+    """Агент отвечал пояснением (без правок) — стоимость пересчитывается."""
+    feedback = [{"id": 10, "author": "alice", "kind": "issue_comment",
+                 "body": "fix"}]
+    s = make_scheduler(feedback)
+    task = make_done_task()
+    s.state.save(task)
+    cost_calls: list[str] = []
+
+    async def ok(cid, message):
+        return {"success": True}
+
+    async def record_cost(t):
+        cost_calls.append(t.id)
+
+    s.openhands.send_message = ok
+    s._finalize_cost = record_cost
+    asyncio.run(s._handle_pr_feedback(task, feedback, 10))
+    assert cost_calls == [task.id]
+    assert task.ci_pending is False
