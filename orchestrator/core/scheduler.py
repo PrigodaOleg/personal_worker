@@ -1211,9 +1211,11 @@ class Scheduler:
                 branch=branch,
             ))
         else:
-            # Правок нет — хвост ревью закончен, снимаем ⏳.
+            # Правок нет — хвост ревью закончен, снимаем ⏳. Агент всё же
+            # отвечал (разбор замечаний/пояснение) — пересчитываем стоимость.
             task.ci_pending = False
             self.state.save(task)
+            await self._finalize_cost(task)
             self._notify_author(
                 task,
                 "💬 Комментарии ревью отправлены агенту, но правок он не "
@@ -1863,6 +1865,20 @@ class Scheduler:
             f"(вход {task.tokens_prompt:,} / выход {task.tokens_completion:,} ток.)"
             .replace(",", " ")
         )
+
+    _COST_LINE_RE = re.compile(r"^Стоимость: .*$", re.MULTILINE)
+
+    def _replace_cost_line(self, text: str, task: Task) -> str:
+        """Обновить строку «Стоимость:» в финальном комментарии задачи.
+
+        Хвосты (автофикс CI, ревью) гоняют агента ПОСЛЕ завершения задачи —
+        токены копятся в разговоре, и строка стоимости в комментарии,
+        написанная при завершении, устаревает.
+        """
+        new_line = f"Стоимость: {self._cost_line(task)}"
+        if not self._COST_LINE_RE.search(text):
+            return text
+        return self._COST_LINE_RE.sub(lambda _m: new_line, text, count=1)
 
     async def _send_task_list(self, chat_id_int: int, chat_id: str, page: int,
                               message_id: Optional[int] = None) -> None:
@@ -4186,9 +4202,28 @@ class Scheduler:
         container = f"openhands-runtime-{task.conversation_id}"
         root = self._container_ws(task)
 
-        # База — origin/main: это коммит, с которого начинался клон. Смотрим на
-        # ВСЕ изменения с базы, включая те, что агент успел закоммитить внутри
-        # контейнера (git status показал бы только рабочее дерево и пропустил их).
+        # База — merge-base HEAD с origin/main, а не origin/main: файл,
+        # добавленный коммитами задачи в PR-ветке и затем удалённый агентом
+        # (isar.wasm в PR #67), на фоне origin/main «невидим» — добавлено и
+        # удалено в одной сессии, diff пуст, и удаление не переносилось на
+        # хост. Merge-base — точный предок, с которого начинался клон.
+        # Смотрим на ВСЕ изменения с базы, включая те, что агент успел
+        # закоммитить внутри контейнера (git status показал бы только рабочее
+        # дерево и пропустил их).
+        code, base_out, base_err = await self._run_in_container(
+            container,
+            f"cd {root} && git fetch -q origin main && "
+            f"git merge-base HEAD origin/main",
+        )
+        if code != 0 or not base_out.strip():
+            logger.warning(
+                "[sync] merge-base не удался (%s), fallback на origin/main",
+                (base_err or "").strip()[:120],
+            )
+            base = "origin/main"
+        else:
+            base = base_out.strip().splitlines()[0]
+
         async def _paths(cmd: str) -> list[str]:
             code, out, err = await self._run_in_container(container, f"cd {root} && {cmd}")
             if code != 0:
@@ -4197,10 +4232,10 @@ class Scheduler:
 
         try:
             changed = await _paths(
-                "git diff --name-only -z --diff-filter=ACMR origin/main"
+                f"git diff --name-only -z --diff-filter=ACMR {base}"
             )
             deleted = await _paths(
-                "git diff --name-only -z --diff-filter=D origin/main"
+                f"git diff --name-only -z --diff-filter=D {base}"
             )
             # Новые (не отслеживаемые и не в .gitignore) файлы.
             changed += await _paths("git ls-files --others --exclude-standard -z")
@@ -4872,6 +4907,10 @@ class Scheduler:
             # задачи снова честный: ✅/❌ по итогу последнего прогона.
             task.ci_pending = False
             self.state.save(task)
+            # Финальный пересчёт стоимости: раунды хвоста (автофикс CI,
+            # правки по ревью) расходовали токены ПОСЛЕ завершения задачи.
+            # get_usage возвращает накопленные метрики всего разговора.
+            await self._finalize_cost(task)
 
     async def _watch_gha_artifacts_loop(
         self, task: Task, comment_id: int, comment_body: str, run_id: int,
@@ -4921,10 +4960,16 @@ class Scheduler:
                     )
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("[gha] list_run_artifacts failed: %s", exc)
+            # Раунды хвоста гоняли агента (автофикс/ревью) — пересчитываем
+            # стоимость по накопленным метрикам разговора, чтобы строка
+            # «Стоимость:» в комментарии и карточка были актуальными.
+            await self._finalize_cost(task)
             new_section = self.format_artifacts_section(
                 run_id, run_url, conclusion, artifacts, self._repo_full(task)
             )
-            comment_body = self.replace_marker_section(comment_body, new_section)
+            comment_body = self._replace_cost_line(
+                self.replace_marker_section(comment_body, new_section), task
+            )
             if not comment_body.strip():
                 # Возобновлённый цикл стартует с пустым телом комментария —
                 # update_comment с blank body отбивается GitHub (422), а раньше
