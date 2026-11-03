@@ -20,6 +20,9 @@ github:
 
 telegram:
   admin_username: prigodaoleg
+  # Chat ID админа для служебных уведомлений (новый issue, смена статуса,
+  # вопросы агента). Без него _notify_admin молча пропускает отправку.
+  admin_chat_id: 91741245
   allowed_usernames: []  # пусто = все разрешены
 
 openhands:

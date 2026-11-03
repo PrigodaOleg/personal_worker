@@ -1375,6 +1375,26 @@ class Scheduler:
             action = event.get("action")
             obs = event.get("observation")
 
+            # Нативный tool-calling (config.toml: native_tool_calling):
+            # реплика агента приходит не отдельным message-событием, а в
+            # args.thought action-события (run/edit/browse/...). Без этого
+            # 💬-реплики пропадают из логов (issue #47 снова).
+            # finish/condensation/task_tracking не считаем репликами: у
+            # finish это финальный отчёт (дублирует саммари), у остальных —
+            # служебные внутренние тексты.
+            if (
+                event.get("source") == "agent"
+                and action not in (None, "message", "finish",
+                                   "condensation", "task_tracking")
+            ):
+                thought = str((args.get("thought") or "")).strip()
+                if thought:
+                    cleaned_t = self._strip_tool_markup(thought).strip()
+                    if cleaned_t and not self._AGENT_NOISE_RE.match(cleaned_t):
+                        done.append(
+                            f"💬 {self._short_cmd(cleaned_t, max_len=160)}"
+                        )
+
             if action == "run" and obs is None:
                 # команда стартовала, но ещё не завершилась
                 cmd = (args.get("command") or extras.get("command")

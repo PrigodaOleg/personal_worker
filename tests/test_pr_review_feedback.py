@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import types
 
+from orchestrator.adapters.github import GitHubAdapter
 from orchestrator.core.scheduler import Scheduler
 from orchestrator.core.task import Task, TaskSource, TaskStatus
 
@@ -177,3 +178,64 @@ def test_tasks_without_pr_skipped():
     s.state.save(t)
     s._poll_pr_review_feedback()
     assert s.github.feedback_calls == []
+
+
+# ------------------------------------------------------------------ #
+# Адаптер: _gh_api не должен отбрасывать JSON-массивы.
+#
+# Регрессия: `return data if isinstance(data, dict) else {}` молча
+# превращал списковые ответы GitHub (/pulls/{n}/comments и т.п.) в
+# пустой dict — fetch_pr_feedback всегда был пуст, хвост ревью не
+# работал (PR #67: 2 инлайн-комментария не доставлялись агенту).
+# ------------------------------------------------------------------ #
+
+class FakeRequester:
+    """Отдаёт данные по префиксу пути, как разные эндпоинты GitHub."""
+
+    def __init__(self, by_prefix: dict[str, object]):
+        self._by_prefix = by_prefix
+
+    def requestJsonAndCheck(self, method, url, **kw):
+        for prefix, data in self._by_prefix.items():
+            if prefix in url:
+                return ({}, data)
+        return ({}, [])
+
+
+class FakeRepo:
+    url = "https://api.github.com/repos/PrigodaOleg/social_mind"
+
+
+def make_raw_gh(by_prefix: dict[str, object]) -> GitHubAdapter:
+    gh = object.__new__(GitHubAdapter)
+    gh._gh = object()
+    gh._repo = FakeRepo()
+    gh._repo.requester = FakeRequester(by_prefix)
+    return gh
+
+
+def test_gh_api_returns_list_endpoints():
+    gh = make_raw_gh({"/pulls/67/comments": [
+        {"id": 1, "body": "инлайн"}, {"id": 2, "body": "второй"},
+    ]})
+    data = gh._gh_api("GET", "/pulls/67/comments")
+    assert isinstance(data, list) and len(data) == 2
+
+
+def test_fetch_pr_feedback_sees_inline_comments():
+    gh = make_raw_gh({
+        "/issues/67/comments": [],
+        "/pulls/67/reviews": [],
+        "/pulls/67/comments": [
+            {"id": 4454673885, "user": {"login": "PrigodaOleg", "type": "User"},
+             "body": "не нужно лить блоб в репозиторий",
+             "path": "domains/client/web/isar.wasm"},
+        ],
+    })
+    fb = gh.fetch_pr_feedback(
+        "https://github.com/PrigodaOleg/social_mind/pull/67", after_comment_id=0
+    )
+    assert len(fb) == 1
+    assert fb[0]["kind"] == "inline"
+    assert fb[0]["path"] == "domains/client/web/isar.wasm"
+    assert "блоб" in fb[0]["body"]
