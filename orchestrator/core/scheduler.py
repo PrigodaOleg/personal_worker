@@ -4202,9 +4202,28 @@ class Scheduler:
         container = f"openhands-runtime-{task.conversation_id}"
         root = self._container_ws(task)
 
-        # База — origin/main: это коммит, с которого начинался клон. Смотрим на
-        # ВСЕ изменения с базы, включая те, что агент успел закоммитить внутри
-        # контейнера (git status показал бы только рабочее дерево и пропустил их).
+        # База — merge-base HEAD с origin/main, а не origin/main: файл,
+        # добавленный коммитами задачи в PR-ветке и затем удалённый агентом
+        # (isar.wasm в PR #67), на фоне origin/main «невидим» — добавлено и
+        # удалено в одной сессии, diff пуст, и удаление не переносилось на
+        # хост. Merge-base — точный предок, с которого начинался клон.
+        # Смотрим на ВСЕ изменения с базы, включая те, что агент успел
+        # закоммитить внутри контейнера (git status показал бы только рабочее
+        # дерево и пропустил их).
+        code, base_out, base_err = await self._run_in_container(
+            container,
+            f"cd {root} && git fetch -q origin main && "
+            f"git merge-base HEAD origin/main",
+        )
+        if code != 0 or not base_out.strip():
+            logger.warning(
+                "[sync] merge-base не удался (%s), fallback на origin/main",
+                (base_err or "").strip()[:120],
+            )
+            base = "origin/main"
+        else:
+            base = base_out.strip().splitlines()[0]
+
         async def _paths(cmd: str) -> list[str]:
             code, out, err = await self._run_in_container(container, f"cd {root} && {cmd}")
             if code != 0:
@@ -4213,10 +4232,10 @@ class Scheduler:
 
         try:
             changed = await _paths(
-                "git diff --name-only -z --diff-filter=ACMR origin/main"
+                f"git diff --name-only -z --diff-filter=ACMR {base}"
             )
             deleted = await _paths(
-                "git diff --name-only -z --diff-filter=D origin/main"
+                f"git diff --name-only -z --diff-filter=D {base}"
             )
             # Новые (не отслеживаемые и не в .gitignore) файлы.
             changed += await _paths("git ls-files --others --exclude-standard -z")
