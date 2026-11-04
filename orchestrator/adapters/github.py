@@ -439,6 +439,39 @@ class GitHubAdapter:
         except Exception:  # noqa: BLE001 — PR могли удалить
             return None
 
+    def get_pr_head_sha(self, pr_url: str) -> Optional[str]:
+        """SHA head-коммита PR (для поиска уже запущенных прогонов CI)."""
+        self._ensure_auth()
+        assert self._repo is not None
+        m = re.search(r"/pull/(\d+)", pr_url)
+        if not m:
+            return None
+        try:
+            pr = self._repo.get_pull(number=int(m.group(1)))
+            return pr.head.sha
+        except Exception:  # noqa: BLE001 — PR могли удалить
+            return None
+
+    def list_workflow_runs(self, head_sha: str) -> list[dict]:
+        """Прогоны CI для коммита: [{id, html_url, status, conclusion}].
+
+        Не блокирующий (в отличие от find_workflow_run): для проверки,
+        не начался ли уже прогон без участия оркестратора (пуш руками /
+        из другого источника).
+        """
+        data = self._gh_api(
+            "GET", f"/actions/runs?head_sha={head_sha}&per_page=10"
+        )
+        return [
+            {
+                "id": r["id"],
+                "html_url": r["html_url"],
+                "status": r.get("status"),
+                "conclusion": r.get("conclusion"),
+            }
+            for r in (data.get("workflow_runs") or [])
+        ]
+
     def get_pr_merge_info(self, pr_url: str) -> Optional[dict]:
         """Состояние мержа PR: mergeable, mergeable_state, base-ветка.
 
